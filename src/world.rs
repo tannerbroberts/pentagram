@@ -759,7 +759,10 @@ impl World {
             .u64(self.stats.deposit_clipped)
             .u64(self.stats.deposit_forced)
             .u64(self.stats.feedings)
-            .u64(self.stats.starved);
+            .u64(self.stats.starved)
+            .u64(self.stats.grazed)
+            .u64(self.stats.hunted)
+            .u64(self.stats.fled);
         h.finish()
     }
 }
@@ -947,6 +950,30 @@ mod tests {
     // had a "retuned" coverage test; `retune` (the race table itself) did
     // not, despite `races` being exactly the field S3.1 rekeys to `PerRace`.
     // Closing this gap now, before that change lands, is the point of S3.0.
+    // S3.4: `phase_movement` increments `stats.grazed`/`hunted`/`fled` every
+    // tick an Animal's FSM drive resolves to that branch, but those counters
+    // live outside every hashed sub-struct (`races`, `ecology`, `behavior`,
+    // ...) — they are only reachable through the hand-curated `stats.u64(..)`
+    // chain at the tail of `state_hash`. Guard each one directly so a future
+    // edit that drops one of the three lines fails loudly instead of
+    // compiling clean and passing every other test silently.
+    #[test]
+    fn state_hash_notices_grazed_hunted_and_fled() {
+        let a = world();
+
+        let mut b = a.clone();
+        b.stats.grazed += 1;
+        assert_ne!(a.state_hash(), b.state_hash(), "grazed not hashed");
+
+        let mut c = a.clone();
+        c.stats.hunted += 1;
+        assert_ne!(a.state_hash(), c.state_hash(), "hunted not hashed");
+
+        let mut d = a.clone();
+        d.stats.fled += 1;
+        assert_ne!(a.state_hash(), d.state_hash(), "fled not hashed");
+    }
+
     #[test]
     fn state_hash_notices_a_retuned_races() {
         let a = world();
