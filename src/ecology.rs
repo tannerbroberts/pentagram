@@ -29,6 +29,22 @@
 //! (`phase_movement` skipping `Kind::Plant`) are S3.2/S3.3's job — see
 //! `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4, §5, §12.
 //!
+//! **Update, S3.2** — the paragraph above is itself now partly superseded:
+//! ~~a Plant is, today, still exactly as mobile and exactly as eligible to
+//! be predator or prey as its Animal twin~~. Two of the three gaps it named
+//! are closed. `World::phase_feeding`'s pairing derivation now refuses a
+//! Plant as predator (kind-gated on `entities[pred].kind == Kind::Animal`,
+//! `world.rs`); `World::phase_movement` now skips `Kind::Plant` entirely,
+//! before step/jitter/reflect/clamp run — rooted is a structural guarantee,
+//! not just a `speed: Fx::ZERO` number nothing reads. What is **not** closed:
+//! `apply_attrition`/`apply_suppression` below remain deliberately
+//! unconditional on `Kind` — plants still take terrain-based ring/star
+//! damage exactly like animals, on purpose, so a future reader should not
+//! "helpfully" add a kind exemption here, it was never intended. And the
+//! hunt-weight gate on Animal-vs-Animal predation (a satiated, in-reach
+//! Animal predator still always eats Animal prey today, same as before) is
+//! still S3.3's job, not shipped yet.
+//!
 //! Every number below is a first guess, in the same spirit `race.rs` and
 //! `terrain.rs` state of their own tables: a starting point for the live
 //! tuning loop, not a derived constant.
@@ -162,6 +178,8 @@ impl Hashable for EcologyTuning {
 /// same one-tick lag starvation's own drain already has.
 pub fn apply_attrition(entities: &mut [Entity], terrain: &Terrain, tuning: &EcologyTuning) {
     for e in entities.iter_mut() {
+        // Deliberately unconditional on `e.kind` — plants take terrain-based
+        // ring damage exactly like animals. See the module doc's S3.2 note.
         if !e.alive {
             continue;
         }
@@ -182,6 +200,8 @@ pub fn apply_attrition(entities: &mut [Entity], terrain: &Terrain, tuning: &Ecol
 /// `starve_rate` already implement, not as a new kind of damage.
 pub fn apply_suppression(entities: &mut [Entity], terrain: &Terrain, tuning: &EcologyTuning) {
     for e in entities.iter_mut() {
+        // Deliberately unconditional on `e.kind` — plants take terrain-based
+        // star damage exactly like animals. See the module doc's S3.2 note.
         if !e.alive {
             continue;
         }

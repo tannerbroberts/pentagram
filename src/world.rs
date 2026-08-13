@@ -22,9 +22,7 @@ use crate::fx::{Fx, V2};
 use crate::governor::{Governor, Grant};
 use crate::hash::{Hashable, Hasher};
 use crate::input::{CmdKind, Command, InputLog};
-#[cfg(test)]
-use crate::race::Kind;
-use crate::race::{attrs, Channel as DepChannel, PerRace, Race, RaceAttrs, MILLI, RACES, TERRAIN_PERIOD};
+use crate::race::{attrs, Channel as DepChannel, Kind, PerRace, Race, RaceAttrs, MILLI, RACES, TERRAIN_PERIOD};
 use crate::rand::{rand_signed, Channel};
 use crate::terrain::{Occupancy, Terrain, TerrainTuning};
 
@@ -314,6 +312,12 @@ impl World {
             if !e.alive {
                 continue;
             }
+            if e.kind == Kind::Plant {
+                // Rooted: a structural skip, not `speed == 0` alone — the
+                // jitter term below would still random-walk a zero-speed
+                // body if this ran. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4.
+                continue;
+            }
             let race = e.race();
             let step = e.heading.scale(races[race].speed);
             let jitter = V2::new(
@@ -446,12 +450,9 @@ impl World {
                 if !self.entities[j].alive || eaten[j] {
                     continue;
                 }
-                // S3.1 scaffold: pred/prey pairing is still purely
-                // element-based, exactly as before `Kind` existed — a Plant
-                // is, today, exactly as eligible to predate or be predated
-                // as its Animal twin. Kind-gating this (a Plant is never a
-                // predator; hunting Animal prey needs a hunt-weight roll) is
-                // S3.2/S3.3's job — see `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
+                // Pairing derivation is still purely element-based (the ring
+                // edge, `Element::eats`) — Kind only gates *who is allowed to
+                // be the predator side* of that edge, below.
                 let a = self.entities[i].element;
                 let b = self.entities[j].element;
                 let (pred, prey) = if a.eats() == b {
@@ -461,6 +462,14 @@ impl World {
                 } else {
                     continue;
                 };
+                // A Plant is never a predator. Animal-vs-Animal predation
+                // stays exactly as eligible as it is today (ring edge +
+                // satiation + forage_radius, nothing more) — gating that with
+                // a tunable hunt-weight roll is S3.3's job, not this one. See
+                // `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
+                if self.entities[pred].kind != Kind::Animal {
+                    continue;
+                }
                 // `eaten[pred]` matters even though the outer loop's
                 // `eaten[i]` guard looks like it should already cover this:
                 // that guard runs once, before this inner loop starts, but
@@ -734,10 +743,12 @@ mod tests {
             w.step(&log);
         }
         let pop = w.population();
-        // `population()` aggregates by element, across both kinds — S3.1's
-        // Plant rows are literal copies of their Animal twin, so both
-        // Earth-Plant and Earth-Animal outlive the run (12 = 6 per_race × 2
-        // kinds) and both Fire variants burn out identically.
+        // `population()` aggregates by element, across both kinds — both
+        // Earth-Plant (6,048,000-tick lifespan) and Earth-Animal
+        // (2,016,000-tick lifespan) far outlive this 5000-tick run (12 = 6
+        // per_race × 2 kinds), and both Fire variants (2400- and 800-tick
+        // lifespans, well under 5000 even at max variance) burn out
+        // identically.
         assert_eq!(pop[Element::Earth], 12, "Earth should not have died at all");
         assert_eq!(pop[Element::Fire], 0, "Fire should have burned out entirely");
         assert!(w.stats.deaths >= 12, "expected turnover, saw {}", w.stats.deaths);
@@ -1023,6 +1034,49 @@ mod tests {
 
         assert_eq!(w.stats.feedings, 0, "Fire and Metal do not eat each other");
         assert_eq!(w.alive_count(), 2);
+    }
+
+    #[test]
+    fn a_plant_is_never_a_predator() {
+        // Same setup `feeding_kills_prey_feeds_the_predator_and_fires_on_
+        // consume` uses to prove a hungry predator in reach *does* eat — but
+        // the "predator" here is a Plant, so it must not, regardless of
+        // satiation or reach. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
+        let mut w = World::new(21, 32);
+        let center = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Plant }, center); // Fire eats Wood.
+        let prey_id = w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center); // Same cell: certainly in reach.
+        let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
+        w.entities[pi].hunger = w.ecology.satiation[Element::Fire];
+
+        let log = InputLog::new();
+        for _ in 0..10 {
+            w.step(&log);
+        }
+
+        assert!(
+            w.entities.iter().any(|e| e.id == prey_id && e.alive),
+            "prey must survive a Plant that would otherwise be a satiated, in-reach predator"
+        );
+        assert_eq!(w.stats.feedings, 0, "a Plant must never register a feeding as predator");
+    }
+
+    #[test]
+    fn a_plant_never_moves() {
+        // Structural, not "speed happens to be zero": jitter alone would
+        // perturb an unrooted body even at speed zero, so this pins down
+        // `phase_movement`'s early skip for `Kind::Plant`.
+        let mut w = World::new(22, 32);
+        let start = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let id = w.spawn(Race { element: Element::Earth, kind: Kind::Plant }, start);
+
+        let log = InputLog::new();
+        for _ in 0..50 {
+            w.step(&log);
+        }
+
+        let e = w.entities.iter().find(|e| e.id == id).expect("plant should still be alive");
+        assert_eq!(e.pos, start, "a rooted plant must never move, bit-for-bit");
     }
 
     #[test]

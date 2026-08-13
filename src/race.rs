@@ -369,6 +369,21 @@ impl RaceAttrs {
             && self.deposit_mix.is_valid()
             && self.consume_mix.is_valid()
             && self.lifespan > 0
+            && self.body_is_valid()
+    }
+
+    /// The kind-aware replacement for a universal "speed is always positive"
+    /// assumption: an Animal must actually move, a Plant must actually not —
+    /// `phase_movement`'s structural skip for `Kind::Plant` (`world.rs`) only
+    /// makes sense if the table itself is honest about which rows are rooted.
+    /// Both kinds still need a body that crowds neighbours, so `radius` is
+    /// unconditional. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4.
+    fn body_is_valid(&self) -> bool {
+        let speed_ok = match self.kind {
+            Kind::Animal => self.speed > Fx::ZERO,
+            Kind::Plant => self.speed == Fx::ZERO,
+        };
+        speed_ok && self.radius > Fx::ZERO
     }
 
     /// Tempo parity metric — deposit unit per 1000 ticks of life. Holding this
@@ -434,33 +449,55 @@ pub const MILLI: u64 = 1000;
 
 /// The table. Every number here is a knob, and every one is meant to be moved.
 ///
-/// **S3.1 scaffold state**: every Plant row below is a *literal copy* of its
-/// element's Animal row — identical lifespan/speed/radius/deposit/consume/
-/// mixes, differing only in `kind` and the `fantasy` label. Plants are not
-/// yet rooted (`phase_movement` does not skip them) and predation is not yet
-/// kind-gated, so a Plant is, today, still exactly as mobile and exactly as
-/// eligible to be predator or prey as its Animal twin. That is deliberate:
-/// this stage's whole job is standing the `Kind` axis up end-to-end
-/// (table → entity → governors → terrain → input log) without changing any
-/// simulated behaviour yet. Real, distinct plant numbers (and the mechanics
-/// that make "plant" mean something — rooting, kind-gated predation) are
-/// S3.2's job; see `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §2, §4, §12.
+/// **S3.2: real, distinct numbers.** Every Plant row below is now genuinely
+/// its own row, not a copy of its Animal twin. Four deliberate design moves
+/// produced them, all traceable back to `docs/S3_ECOLOGY_LAYERS_DESIGN.md`
+/// §2:
+///
+/// - Every Plant's `speed` is `Fx::ZERO` — rooted, structurally enforced by
+///   `phase_movement`'s `Kind::Plant` skip (`world.rs`), not just an unread
+///   number on the row.
+/// - Every Plant's `lifespan` is exactly 3x its Animal twin's (unchanged)
+///   lifespan. A uniform linear scale preserves both the Fire<Water<Wood
+///   <Metal<Earth ordering and the >2000x fire-to-earth spread *within* the
+///   Plant kind for free.
+/// - Every Animal's `deposit_unit`/`consume_unit` is exactly half its old
+///   (pre-Kind-split) value; every Plant's is exactly 1.5x that same old
+///   value. Combined with the 3x lifespan multiple, each row's
+///   `terraform_pressure()` lands at almost exactly half the original
+///   per-element figure, so a Plant+Animal pair's *combined* pressure comes
+///   out within about 1 part in 250 of the old single-race baseline for that
+///   element — the per-element tempo budget is *split* between the two
+///   kinds, not carried twice over (see §3's consequence note on the
+///   `apportion` floor doubling). All ten rows individually still cluster
+///   comfortably inside the existing 2x parity band.
+/// - Every Plant's `deposit_mix` is redesigned so `OnExistence` is strictly
+///   its largest channel — rooted, terraforms by merely persisting, the
+///   plant archetype. Every Animal's mixes are unchanged, with one deliberate
+///   exception: Wood-Animal's `deposit_mix` moves off `OnExistence` onto
+///   `OnConsume`, because Wood-Plant now owns the existence-dominant slot for
+///   Wood and a mobile, speed-0.09 animal being "grows in place" no longer
+///   made sense once it has a rooted sibling.
+///
+/// Radius and `lifespan_variance` are unchanged (shared by both kinds of an
+/// element) — nothing in this design needs them to differ per kind. See
+/// `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §2, §12 for the full account.
 pub const RACES: PerRace<RaceAttrs> = PerRace([
     // ---------------------------------------------------------------- WOOD
     RaceAttrs {
         element: Element::Wood,
         kind: Kind::Plant,
-        lifespan: TICKS_PER_HOUR * 5 / 2, // 2.5 hours
+        lifespan: TICKS_PER_HOUR * 15 / 2, // 7.5 hours — 3x its Animal twin
         lifespan_variance: 180,
-        speed: Fx::ratio(9, 100),
+        speed: Fx::ZERO,
         radius: Fx::ratio(60, 100),
-        deposit_unit: 38_000,
+        deposit_unit: 57_000,
         deposit: RateBand::new(500, 1000, 2000, 6),
-        deposit_mix: ChannelMix::new(100, 200, 50, 250, 400),
-        consume_unit: 22_000,
+        deposit_mix: ChannelMix::new(80, 120, 40, 180, 580),
+        consume_unit: 33_000,
         consume: RateBand::new(300, 900, 1800, 6),
-        consume_mix: ChannelMix::new(50, 50, 100, 500, 300),
-        fantasy: "S3.1 scaffold — literal copy of Wood-Animal, not yet rooted. Real numbers land in S3.2.",
+        consume_mix: ChannelMix::new(30, 70, 30, 120, 750),
+        fantasy: "Grows where it stands and draws through its roots — the map remembers a thicket long after any single stem is gone.",
     },
     RaceAttrs {
         element: Element::Wood,
@@ -469,31 +506,31 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 180,
         speed: Fx::ratio(9, 100),
         radius: Fx::ratio(60, 100),
-        deposit_unit: 38_000,
+        deposit_unit: 19_000,
         deposit: RateBand::new(500, 1000, 2000, 6),
-        // Grows where it stands and draws through its roots. Balanced between
-        // simply existing and what it takes in.
-        deposit_mix: ChannelMix::new(100, 200, 50, 250, 400),
-        consume_unit: 22_000,
+        // No longer existence-dominant now Wood-Plant owns that slot —
+        // terraforms by what it takes in, not by standing around.
+        deposit_mix: ChannelMix::new(100, 150, 100, 450, 200),
+        consume_unit: 11_000,
         consume: RateBand::new(300, 900, 1800, 6),
         consume_mix: ChannelMix::new(50, 50, 100, 500, 300),
-        fantasy: "Grows in place. Slow, patient, and very hard to remove once rooted.",
+        fantasy: "Ranges the thicket for a meal — what it takes in shapes the ground it leaves behind, no roots required to leave a mark.",
     },
     // ---------------------------------------------------------------- FIRE
     RaceAttrs {
         element: Element::Fire,
         kind: Kind::Plant,
-        lifespan: TICKS_PER_MINUTE * 8, // 8 minutes
+        lifespan: TICKS_PER_MINUTE * 24, // 24 minutes — 3x its Animal twin
         lifespan_variance: 300,
-        speed: Fx::ratio(46, 100),
+        speed: Fx::ZERO,
         radius: Fx::ratio(40, 100),
-        deposit_unit: 2_100,
+        deposit_unit: 3_150,
         deposit: RateBand::new(200, 1000, 6000, 20),
-        deposit_mix: ChannelMix::new(150, 700, 100, 50, 0),
-        consume_unit: 4_400,
+        deposit_mix: ChannelMix::new(50, 150, 50, 50, 700),
+        consume_unit: 6_600,
         consume: RateBand::new(150, 1100, 7000, 20),
-        consume_mix: ChannelMix::new(0, 100, 400, 500, 0),
-        fantasy: "S3.1 scaffold — literal copy of Fire-Animal, not yet rooted. Real numbers land in S3.2.",
+        consume_mix: ChannelMix::new(20, 60, 20, 100, 800),
+        fantasy: "Ember-moss, smouldering low and constant — it never dies spectacularly, it just keeps glowing where it took root.",
     },
     RaceAttrs {
         element: Element::Fire,
@@ -502,13 +539,13 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 300,
         speed: Fx::ratio(46, 100),
         radius: Fx::ratio(40, 100),
-        deposit_unit: 2_100,
+        deposit_unit: 1_050,
         // Spikiest band in the table: can go quiet, then spike sixfold.
         deposit: RateBand::new(200, 1000, 6000, 20),
         // Terraforms almost entirely by dying. A fire creature's corpse is the
         // scorch mark.
         deposit_mix: ChannelMix::new(150, 700, 100, 50, 0),
-        consume_unit: 4_400,
+        consume_unit: 2_200,
         consume: RateBand::new(150, 1100, 7000, 20),
         consume_mix: ChannelMix::new(0, 100, 400, 500, 0),
         fantasy: "Born from a lightning strike, burns hot, dies fast, and the ground remembers.",
@@ -517,17 +554,17 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
     RaceAttrs {
         element: Element::Earth,
         kind: Kind::Plant,
-        lifespan: TICKS_PER_DAY * 14, // a fortnight
+        lifespan: TICKS_PER_DAY * 42, // 42 days — 3x its Animal twin
         lifespan_variance: 120,
-        speed: Fx::ratio(4, 100),
+        speed: Fx::ZERO,
         radius: Fx::ratio(150, 100),
-        deposit_unit: 5_100_000,
+        deposit_unit: 7_650_000,
         deposit: RateBand::new(800, 1000, 1400, 2),
-        deposit_mix: ChannelMix::new(50, 50, 50, 100, 750),
-        consume_unit: 2_400_000,
+        deposit_mix: ChannelMix::new(40, 40, 40, 80, 800),
+        consume_unit: 3_600_000,
         consume: RateBand::new(600, 850, 1200, 2),
-        consume_mix: ChannelMix::new(0, 50, 50, 200, 700),
-        fantasy: "S3.1 scaffold — literal copy of Earth-Animal, not yet rooted. Real numbers land in S3.2.",
+        consume_mix: ChannelMix::new(10, 20, 20, 50, 900),
+        fantasy: "Older than the animal that shares its name — patience that outlasts even Earth's own long-lived fauna, terraforming by simply persisting the longest.",
     },
     RaceAttrs {
         element: Element::Earth,
@@ -536,13 +573,13 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 120,
         speed: Fx::ratio(4, 100),
         radius: Fx::ratio(150, 100),
-        deposit_unit: 5_100_000,
+        deposit_unit: 2_550_000,
         // Nearly a metronome. Barely bursts, barely rests.
         deposit: RateBand::new(800, 1000, 1400, 2),
         // Presence is the mechanism. An Earth body presses on the world simply
         // by continuing to be somewhere.
         deposit_mix: ChannelMix::new(50, 50, 50, 100, 750),
-        consume_unit: 2_400_000,
+        consume_unit: 1_200_000,
         consume: RateBand::new(600, 850, 1200, 2),
         consume_mix: ChannelMix::new(0, 50, 50, 200, 700),
         fantasy: "Ancient. Lives for a fortnight and terraforms by refusing to move.",
@@ -551,17 +588,17 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
     RaceAttrs {
         element: Element::Metal,
         kind: Kind::Plant,
-        lifespan: TICKS_PER_HOUR * 12,
+        lifespan: TICKS_PER_HOUR * 36, // 36 hours — 3x its Animal twin
         lifespan_variance: 90,
-        speed: Fx::ratio(21, 100),
+        speed: Fx::ZERO,
         radius: Fx::ratio(55, 100),
-        deposit_unit: 182_000,
+        deposit_unit: 273_000,
         deposit: RateBand::new(250, 1000, 2500, 12),
-        deposit_mix: ChannelMix::new(200, 150, 250, 400, 0),
-        consume_unit: 96_000,
+        deposit_mix: ChannelMix::new(100, 100, 150, 150, 500),
+        consume_unit: 144_000,
         consume: RateBand::new(200, 950, 2400, 12),
-        consume_mix: ChannelMix::new(100, 50, 250, 600, 0),
-        fantasy: "S3.1 scaffold — literal copy of Metal-Animal, not yet rooted. Real numbers land in S3.2.",
+        consume_mix: ChannelMix::new(60, 60, 100, 180, 600),
+        fantasy: "An ore-vein growth, embedded and slow — it forges nothing, it just sits in the seam and the seam changes around it.",
     },
     RaceAttrs {
         element: Element::Metal,
@@ -570,12 +607,12 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 90,
         speed: Fx::ratio(21, 100),
         radius: Fx::ratio(55, 100),
-        deposit_unit: 182_000,
+        deposit_unit: 91_000,
         deposit: RateBand::new(250, 1000, 2500, 12),
         // Deposits at the moment of refining. Nothing from mere existence —
         // Metal that is not working leaves no trace at all.
         deposit_mix: ChannelMix::new(200, 150, 250, 400, 0),
-        consume_unit: 96_000,
+        consume_unit: 48_000,
         consume: RateBand::new(200, 950, 2400, 12),
         consume_mix: ChannelMix::new(100, 50, 250, 600, 0),
         fantasy: "Precise and scheduled. Writes to the world only at the moment of forging.",
@@ -584,17 +621,17 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
     RaceAttrs {
         element: Element::Water,
         kind: Kind::Plant,
-        lifespan: TICKS_PER_MINUTE * 35,
+        lifespan: TICKS_PER_MINUTE * 105, // 105 minutes — 3x its Animal twin
         lifespan_variance: 220,
-        speed: Fx::ratio(33, 100),
+        speed: Fx::ZERO,
         radius: Fx::ratio(50, 100),
-        deposit_unit: 8_900,
+        deposit_unit: 13_350,
         deposit: RateBand::new(300, 1000, 3000, 10),
-        deposit_mix: ChannelMix::new(50, 250, 500, 150, 50),
-        consume_unit: 12_000,
+        deposit_mix: ChannelMix::new(50, 150, 150, 150, 500),
+        consume_unit: 18_000,
         consume: RateBand::new(250, 1000, 3200, 10),
-        consume_mix: ChannelMix::new(0, 100, 550, 300, 50),
-        fantasy: "S3.1 scaffold — literal copy of Water-Animal, not yet rooted. Real numbers land in S3.2.",
+        consume_mix: ChannelMix::new(20, 80, 100, 150, 650),
+        fantasy: "A reed-bed, rooted in the shallows — where the animal current tears through, this just sits and slowly silts the bank.",
     },
     RaceAttrs {
         element: Element::Water,
@@ -603,12 +640,12 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 220,
         speed: Fx::ratio(33, 100),
         radius: Fx::ratio(50, 100),
-        deposit_unit: 8_900,
+        deposit_unit: 4_450,
         deposit: RateBand::new(300, 1000, 3000, 10),
         // Erodes what it moves across. Action-dominant: standing still, Water
         // does almost nothing.
         deposit_mix: ChannelMix::new(50, 250, 500, 150, 50),
-        consume_unit: 12_000,
+        consume_unit: 6_000,
         consume: RateBand::new(250, 1000, 3200, 10),
         consume_mix: ChannelMix::new(0, 100, 550, 300, 50),
         fantasy: "Rhythmic and tidal. Terraforms by flowing, and stops when it stops.",
@@ -660,14 +697,11 @@ impl Hashable for RaceAttrs {
 }
 
 /// The one specific race every narrative test below reaches for when it
-/// needs "the" row for an element rather than every row — S3.1 ships Plant
-/// rows as literal copies of their Animal twin (see `RACES`'s own doc
-/// comment), so picking a `Kind` here does not change what any of these
-/// tests observe; `Kind::Animal` is chosen as the closest continuation of
-/// what these tests asserted before the `Kind` axis existed. Re-deciding
-/// these per-`Kind` (distinct plant numbers, `every_plant_is_existence_
-/// dominant`, etc.) is explicitly S3.2's job — see
-/// `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §10, §12.
+/// needs "the" row for an element's Animal variant rather than every row.
+/// Since S3.2, `Kind::Animal` is a genuine, deliberate choice of which row a
+/// given test examines — Plant and Animal rows are numerically distinct now
+/// (see `RACES`'s own doc comment) — not an "it doesn't matter which"
+/// shortcut left over from the S3.1 scaffold.
 #[cfg(test)]
 fn animal(e: Element) -> Race {
     Race { element: e, kind: Kind::Animal }
@@ -709,9 +743,13 @@ mod tests {
 
     #[test]
     fn lifespans_span_the_intended_three_orders_of_magnitude() {
-        let fire = attrs(animal(Element::Fire)).lifespan;
-        let earth = attrs(animal(Element::Earth)).lifespan;
-        assert!(earth / fire > 2000, "ratio is only {}", earth / fire);
+        // Holds independently within each Kind: Plant lifespans are a
+        // uniform 3x scale of Animal's, which preserves the ratio exactly.
+        for kind in [Kind::Plant, Kind::Animal] {
+            let fire = attrs(Race { element: Element::Fire, kind }).lifespan;
+            let earth = attrs(Race { element: Element::Earth, kind }).lifespan;
+            assert!(earth / fire > 2000, "{:?}: ratio is only {}", kind, earth / fire);
+        }
     }
 
     #[test]
@@ -723,24 +761,40 @@ mod tests {
             Element::Metal,
             Element::Earth,
         ];
-        for w in order.windows(2) {
-            assert!(
-                attrs(animal(w[0])).lifespan < attrs(animal(w[1])).lifespan,
-                "{} should be shorter-lived than {}",
-                w[0].name(),
-                w[1].name()
-            );
+        // Holds independently within each Kind — Plant lifespans are a
+        // uniform 3x scale of Animal's, which preserves ordering.
+        for kind in [Kind::Plant, Kind::Animal] {
+            for w in order.windows(2) {
+                assert!(
+                    attrs(Race { element: w[0], kind }).lifespan < attrs(Race { element: w[1], kind }).lifespan,
+                    "{:?}: {} should be shorter-lived than {}",
+                    kind,
+                    w[0].name(),
+                    w[1].name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plants_outlive_the_animal_of_their_own_element() {
+        // Long-lived-and-rooted vs. short-lived-and-mobile is close to the
+        // point of the split, so it should be a test, not a hope.
+        for e in Element::ALL {
+            let plant = attrs(Race { element: e, kind: Kind::Plant }).lifespan;
+            let animal = attrs(Race { element: e, kind: Kind::Animal }).lifespan;
+            assert!(plant > animal, "{}: plant lifespan {} should exceed animal lifespan {}", e.name(), plant, animal);
         }
     }
 
     #[test]
     fn terraform_pressure_is_within_parity_band() {
         // §3.1: deposit_unit / lifespan roughly equal across races, so no race
-        // reshapes the map faster than another. Allow a 2x spread. Looped
-        // over every race (not just every element): S3.1's Plant rows are
-        // literal copies of their Animal twin, so this trivially still
-        // holds — the point is the loop is now mechanically over
-        // `Race::ALL`, not that the numbers changed.
+        // reshapes the map faster than another. Allow a 2x spread. This no
+        // longer trivially holds now that Plant rows carry real, distinct
+        // numbers (S3.2) — it holds because the ten rows were deliberately
+        // designed to keep every one of them within a 2x band, per
+        // `RACES`'s own doc comment.
         let ps: Vec<u64> = Race::ALL.iter().map(|r| attrs(*r).terraform_pressure()).collect();
         let lo = *ps.iter().min().unwrap();
         let hi = *ps.iter().max().unwrap();
@@ -754,26 +808,94 @@ mod tests {
     }
 
     #[test]
-    fn channel_dominance_matches_the_stated_fantasy() {
-        let dominant = |e: Element| -> Channel {
-            let a = attrs(animal(e));
-            *Channel::ALL
-                .iter()
-                .max_by_key(|c| a.deposit_mix.permille(**c))
-                .unwrap()
-        };
-        // Short-lived races terraform by dying; long-lived ones by existing.
-        assert_eq!(dominant(Element::Fire), Channel::OnDeath);
-        assert_eq!(dominant(Element::Earth), Channel::OnExistence);
-        assert_eq!(dominant(Element::Water), Channel::OnAction);
-        assert_eq!(dominant(Element::Metal), Channel::OnConsume);
-        assert_eq!(dominant(Element::Wood), Channel::OnExistence);
+    fn combined_per_element_pressure_stays_near_the_s2_baseline() {
+        // The S2/S3.1 single-race pressure each element carried before the
+        // Kind split (deposit_unit * 1000 / lifespan, old single-race
+        // table). S3.2's Plant+Animal rows are designed to *split* this
+        // budget, not each independently carry it — see `RACES`'s doc
+        // comment and §3's "consequence to track" note in the design doc.
+        const WOOD_BASELINE: u64 = 2533;
+        const FIRE_BASELINE: u64 = 2625;
+        const EARTH_BASELINE: u64 = 2529;
+        const METAL_BASELINE: u64 = 2527;
+        const WATER_BASELINE: u64 = 2542;
+
+        for (e, baseline) in [
+            (Element::Wood, WOOD_BASELINE),
+            (Element::Fire, FIRE_BASELINE),
+            (Element::Earth, EARTH_BASELINE),
+            (Element::Metal, METAL_BASELINE),
+            (Element::Water, WATER_BASELINE),
+        ] {
+            let plant = attrs(Race { element: e, kind: Kind::Plant }).terraform_pressure();
+            let animal = attrs(Race { element: e, kind: Kind::Animal }).terraform_pressure();
+            let combined = plant + animal;
+            // Within 10%: tight enough to catch a real regression, loose
+            // enough not to be brittle to minor rebalancing.
+            let lo = baseline * 9 / 10;
+            let hi = baseline * 11 / 10;
+            assert!(
+                combined >= lo && combined <= hi,
+                "{}: combined pressure {} outside [{}, {}] (baseline {})",
+                e.name(),
+                combined,
+                lo,
+                hi,
+                baseline
+            );
+        }
+    }
+
+    fn dominant_deposit_channel(r: Race) -> Channel {
+        let a = attrs(r);
+        *Channel::ALL
+            .iter()
+            .max_by_key(|c| a.deposit_mix.permille(**c))
+            .unwrap()
     }
 
     #[test]
-    fn fire_leaves_nothing_by_merely_existing() {
+    fn every_plant_is_existence_dominant() {
+        // Rooted terraforming-by-being-there is close to the definition of
+        // "plant" in this design.
+        for e in Element::ALL {
+            assert_eq!(
+                dominant_deposit_channel(Race { element: e, kind: Kind::Plant }),
+                Channel::OnExistence,
+                "{}-Plant should be existence-dominant",
+                e.name()
+            );
+        }
+    }
+
+    #[test]
+    fn channel_dominance_matches_the_stated_fantasy() {
+        // Short-lived animals terraform by dying; long-lived ones by
+        // existing. Wood-Animal moved off `OnExistence` in S3.2 — Wood-Plant
+        // now owns the existence-dominant slot for Wood.
+        assert_eq!(dominant_deposit_channel(animal(Element::Fire)), Channel::OnDeath);
+        assert_eq!(dominant_deposit_channel(animal(Element::Earth)), Channel::OnExistence);
+        assert_eq!(dominant_deposit_channel(animal(Element::Water)), Channel::OnAction);
+        assert_eq!(dominant_deposit_channel(animal(Element::Metal)), Channel::OnConsume);
+        assert_eq!(dominant_deposit_channel(animal(Element::Wood)), Channel::OnConsume);
+    }
+
+    #[test]
+    fn fire_and_metal_animals_leave_nothing_by_merely_existing() {
         assert_eq!(attrs(animal(Element::Fire)).deposit_mix.permille(Channel::OnExistence), 0);
         assert_eq!(attrs(animal(Element::Metal)).deposit_mix.permille(Channel::OnExistence), 0);
+    }
+
+    #[test]
+    fn no_plant_has_a_zero_existence_share() {
+        for e in Element::ALL {
+            let a = attrs(Race { element: e, kind: Kind::Plant });
+            assert!(
+                a.deposit_mix.permille(Channel::OnExistence) > 0,
+                "{}-Plant has a zero existence share",
+                e.name()
+            );
+        }
     }
 
     #[test]

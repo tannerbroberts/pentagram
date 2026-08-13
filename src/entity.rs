@@ -131,10 +131,12 @@ pub fn initial_heading(seed: u64, tick: u64, id: u32) -> V2 {
     }
 }
 
-/// The closest continuation of what these tests asserted before the `Kind`
-/// axis existed — S3.1's Plant rows are literal copies of their Animal twin
-/// (`race.rs`'s `RACES` doc comment), so this choice does not change what any
-/// test below observes. Re-deciding per-`Kind` is S3.2's job.
+/// The one specific race the tests below reach for when they need "the" row
+/// for an element's Animal variant rather than every row. Since S3.2,
+/// `Kind::Animal` is a genuine, deliberate choice of which row a given test
+/// examines — Plant and Animal rows are numerically distinct now (see
+/// `race.rs`'s `RACES` doc comment) — not an "it doesn't matter which"
+/// shortcut left over from the S3.1 scaffold.
 #[cfg(test)]
 fn animal(e: Element) -> Race {
     Race { element: e, kind: Kind::Animal }
@@ -227,14 +229,16 @@ mod tests {
     }
 
     #[test]
-    fn everything_has_a_positive_speed_and_radius() {
-        // Looped over every race, not just every element: S3.1's Plant rows
-        // are literal copies of their Animal twin (still positive speed —
-        // the kind-aware `speed == 0` rule for plants is S3.2's job), so
-        // this holds mechanically for `Race::ALL` too.
+    fn every_race_has_a_kind_appropriate_body() {
+        // S3.2's kind-aware `is_valid` rule, exercised directly: an Animal
+        // must actually move, a Plant must actually not — and every row,
+        // both kinds, still needs a body that crowds neighbours.
         for race in Race::ALL {
             let a = attrs(race);
-            assert!(a.speed > Fx::ZERO, "{}-{} is immobile", race.element.name(), race.kind.name());
+            match race.kind {
+                Kind::Animal => assert!(a.speed > Fx::ZERO, "{}-{} is immobile", race.element.name(), race.kind.name()),
+                Kind::Plant => assert!(a.speed == Fx::ZERO, "{}-{} should be rooted", race.element.name(), race.kind.name()),
+            }
             assert!(a.radius > Fx::ZERO, "{}-{} has no body", race.element.name(), race.kind.name());
         }
     }

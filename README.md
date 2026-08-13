@@ -311,11 +311,67 @@ ring; the live view is where that gets found.
 > because they act on bodies, not on the ground. See the S1 section's update
 > note above for what they replaced and why.
 
+## S3 — ecology layers (the plant/animal Kind split)
+
+Landed: a new `Kind` axis (`Kind::Plant | Kind::Animal`, `src/race.rs`) sits
+orthogonal to `Element` — every element now splits into a Plant and an Animal
+race variant, ten races total via `Race { element, kind }`, not a behavioural
+relabelling of the old five and not a re-topology of the ring (`element.rs`'s
+mod-5 arithmetic stays completely `Kind`-unaware, by design). A new
+`PerRace<T>` type (mirroring `PerElement<T>` member for member) replaces
+every per-race `World`/`Occupancy` table — `races`, the deposit/consume
+governors and demand accumulators, `last_deposit`/`last_consume` — so a
+Plant's and an Animal's demand settle through independent governors, never
+clipping each other. `Entity` gained a `kind` field alongside its existing
+`element`; predation/suppression/attrition relations still resolve off
+`element` alone, race-attribute lookups resolve off the full `(element,
+kind)` pair. `docs/S3_ECOLOGY_LAYERS_DESIGN.md` writes up every call this
+required — the `PerRace<T>` type decision, the `terrain::Occupancy`
+apportionment-salt fix a two-race-per-layer world needed (§3), the input log
+v2 bump that lets `CmdKind::Spawn` carry a `Kind` (§9) — the same grounded,
+decision-and-assumption method `docs/S1_TERRAIN_DESIGN.md` used for S1.
+
+The ten-row table (`RACES` in `src/race.rs`) ships real, deliberately
+designed numbers, not scaffold copies: every Plant row is rooted
+(`speed: Fx::ZERO`), lives exactly 3x as long as its Animal twin, and is
+existence-dominant in its deposit mix (it terraforms by merely persisting);
+every Animal's `deposit_unit`/`consume_unit` is exactly half its pre-`Kind`
+value and every Plant's is exactly 1.5x that same old value, so a Plant+Animal
+pair's *combined* terraform pressure lands within about 1 part in 250 of the
+single-race baseline that element carried before the split — the tempo
+budget is split between the two kinds, not doubled. All ten rows still
+cluster inside the pre-existing 2x parity band. `RaceAttrs::is_valid()`
+enforces this shape directly: `Kind::Animal` rows must have positive speed,
+`Kind::Plant` rows must have exactly zero speed, and every row (either kind)
+must have a positive collision radius.
+
+"Plant" means something mechanically, not just a label. `World::phase_movement`
+skips `Kind::Plant` entirely, before step/jitter/reflect/clamp ever run — a
+structural `continue`, not just a zero-speed number nothing reads, because the
+per-tick jitter term alone would still random-walk a zero-speed body if
+nothing else stopped it. `phase_collisions` is *not* skipped — a thicket
+still occupies space and crowds neighbours through its radius exactly as
+before. And `World::phase_feeding`'s predator/prey pairing now refuses a
+Plant as predator (`entities[pred].kind != Kind::Animal` short-circuits the
+match) — a Plant can be eaten, never eat. `apply_attrition`/`apply_suppression`
+(`ecology.rs`) are deliberately unchanged: plants still take terrain-based
+ring/star damage exactly like animals, on purpose.
+
+Not yet landed: hunt-weight-gated Animal-vs-Animal predation (a satiated,
+in-reach Animal predator still always eats Animal prey today, same as before
+the `Kind` split — S3.3's `hunt_weight` knob and `Channel::Hunt` roll change
+that); the animal FSM (`src/behavior.rs`, Flee/Hunt/Graze drive-selection —
+S3.4); plant propagation (`phase_flora`, `Entity.size`, `PropagationTuning` —
+S3.5); and the `chaos` live view's two-axis (Element × Kind) support — it
+currently hardcodes every spawn to `Kind::Animal` and shows five columns, not
+ten (S3.6). See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §12 for the full staged
+rollout these fit into.
+
 ## Next
 
-Nothing past S2 has a design yet. The "Known and deliberate" section above
-names S5 (combat, artifacts) as the next *named* milestone, but S3 and S4 are
-an open gap — nothing in this repo describes what they are.
+Nothing past S3.2 has a design yet. The "Known and deliberate" section above
+names S5 (combat, artifacts) as the next *named* milestone; S3's remaining
+stages (§12 above) and S4 are the open gap now.
 
 One constraint on whatever fills that gap, from "Known and deliberate" above:
 every race's eventual way of life must have a reachable, naturally stable
