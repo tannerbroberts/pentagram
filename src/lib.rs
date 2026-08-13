@@ -28,7 +28,10 @@
 //! bodies rather than the other way around. [`ecology`] is Stage 2's
 //! feeding/starvation/reproduction rates plus those two terrain-tick-gated
 //! operators, read by `world`'s `phase_feeding`, `phase_aging`, and
-//! `phase_terrain`. [`world`] is the tick loop, and its phase order is a
+//! `phase_terrain`. [`behavior`] is Stage 3's animal FSM — Flee, Hunt, and
+//! Graze, derived fresh every tick from `(hunger, sensed neighbourhood,
+//! terrain)` rather than stored on `Entity` — read by `world`'s
+//! `phase_movement`. [`world`] is the tick loop, and its phase order is a
 //! wire format, not an implementation detail.
 
 pub mod behavior;

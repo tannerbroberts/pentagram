@@ -15,7 +15,7 @@ chaos watch            same, rebuilding whenever src/ changes
 chaos edit             open the tuning table in $EDITOR
 chaos verify           the determinism exit condition
 chaos soak [ticks]     long headless run + per-race report
-chaos test             full suite (135 tests, 2 gated behind --ignored)
+chaos test             full suite (185 tests, 3 gated behind --ignored)
 ```
 
 `chaos` lives in `~/.local/bin`; set `CHAOS_ROOT` to point it at a different
@@ -30,7 +30,9 @@ cursor keys move between cells.
 ↑↓←→ / hjkl   move the cursor        - +   adjust        [ ]   adjust ×10
 space         pause                  .     advance one simulated minute
 < >           halve / double sim speed
-tab           knob page (body & rates ⇄ channel mix ⇄ terrain & climate ⇄ ecology)
+tab           knob page (body & rates ⇄ channel mix ⇄ terrain & climate ⇄
+              ecology ⇄ propagation ⇄ behavior)
+x             toggle Plant / Animal on the current page (Race-scoped pages only)
 m             show or hide the map   w     how much the view steers bodies
 r / R         reset this knob / the whole table
 z             restart at tick 0 with the current knobs
@@ -423,10 +425,15 @@ takes effect immediately, and it is read at exactly one place —
 `phase_collisions`' radius calculation — so a seedling crowds less than a
 mature body without touching deposit/consume demand at all.
 
-Not yet landed: the `chaos` live view's two-axis (Element × Kind) support —
-it currently hardcodes every spawn to `Kind::Animal` and shows five columns,
-not ten (S3.6). See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §12 for the full
-staged rollout this fits into.
+Also landed: the `chaos` live view's two-axis (Element × Kind) support
+(S3.6) — a `Kind` toggle (`x`) on the current knob page, driving a real
+`view.kind` field rather than a hardcoded `Kind::Animal`, ten-wide
+`PerRace`-shaped history and race rows, and new `propagation`/`behavior`
+knob pages. Terrain/climate/propagation knobs stay Element-scoped — a
+Wood-Plant and a Wood-Animal share one diffusion rate, one root-min stock —
+while race/ecology/behavior knobs are Race-scoped; each page's own `Axis`
+says which, so the Kind toggle doesn't imply two independent numbers where
+there is really only one.
 
 > **Windowed client update:** `chaos-ui` (`src/bin/chaos-ui.rs`, `eframe`/`egui`)
 > is a second client alongside the terminal `chaos` live view, driving the exact
@@ -437,11 +444,38 @@ staged rollout this fits into.
 > terrain concentration summary. It is a spectator/tuning surface only — no
 > player-embodiment layer, nothing here steers or claims a body.
 
+> **S3.7 exit condition.** `tests/layers.rs` closes S3 the way
+> `tests/succession.rs` closed S1: under the shipped table, no S3 mechanism
+> is dead code (Graze, Hunt, and Flee all fire, and at least one Plant roots
+> — each proven in its own scenario, terrain pre-seeded where an ordinary
+> run would not build up the right conditions in time; see the file's own
+> header for why), a rooted Plant never self-propels across a long run
+> (`phase_collisions` pushing it is not a violation — the design's own
+> claim, distinguished from real drift), the named `crowd_max` runaway-risk
+> mitigation actually bounds growth once growth has a real chance to happen
+> (`#[ignore]`d — population climbs into the thousands, expensive under
+> today's O(n²) collision check), and 10 000 ticks still replay bit-for-bit
+> identically with every S3 phase wired into the tick. A real, unplanned
+> finding surfaced along the way: `phase_aging`'s hunger/starvation
+> mechanic (S2, predates the Kind split) has no `Kind` exemption, and a
+> Plant can structurally never eat — so every Plant is *guaranteed* to
+> starve roughly 2 000 ticks after birth under the shipped
+> `EcologyTuning`, regardless of terrain or predation. Documented as a
+> permanent regression (`every_plant_starves_under_the_shipped_table_
+> because_it_can_never_eat`), not silently patched. Re-running
+> `tests/succession.rs`'s two 30-day tests: **both still fail**, on the
+> identical signature already recorded in the Post-S2 update above (Wood
+> saturates to the grid's maximum within the first season and stays there)
+> — S3 neither fixes nor worsens it; the failure predates the Kind split
+> and is unrelated to it.
+
 ## Next
 
-Nothing past S3.2 has a design yet. The "Known and deliberate" section above
-names S5 (combat, artifacts) as the next *named* milestone; S3's remaining
-stages (§12 above) and S4 are the open gap now.
+Nothing past S3 has a design yet. The "Known and deliberate" section above
+names S5 (combat, artifacts) as the next *named* milestone; S4 is the open
+gap now — including the Plant-starvation finding just above, which stands
+in the way of any race's Plant variant being a real, livable way of life
+rather than a guaranteed ~2 000-tick countdown.
 
 One constraint on whatever fills that gap, from "Known and deliberate" above:
 every race's eventual way of life must have a reachable, naturally stable
@@ -459,6 +493,6 @@ player playable, which raises real, unresolved questions rather than
 answers: does a split hand control to an NPC, a new player, or something in
 between? Is there a "right to continuity" a lineage competes for, where a
 longer lineage is more stable and better rewarded? None of this is decided —
-it's flagged here so it shapes whatever S3/S4 design gets written, the same
-way S1's and S2's own interpretive calls were flagged before they were
-resolved.
+it's flagged here so it shapes whatever S4 design gets written, the same
+way S1's, S2's, and S3's own interpretive calls were flagged before they
+were resolved.
