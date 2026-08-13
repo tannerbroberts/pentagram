@@ -39,6 +39,12 @@ pub enum Channel {
     /// prey never rolls this channel — only the Animal-prey edge is a dial.
     /// See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
     Hunt = 10,
+    /// S3.5: `World::phase_flora`'s per-eligible-plant-per-attempt propagation
+    /// roll, keyed by terrain tick. See docs/S3_ECOLOGY_LAYERS_DESIGN.md section 7.
+    Propagate = 11,
+    /// S3.5: `World::phase_flora`'s x/y scatter draw for where a new
+    /// offspring roots, relative to its parent.
+    Disperse = 12,
     /// Reserved for ad-hoc debugging. Never read by shipped simulation code.
     Debug = 255,
 }

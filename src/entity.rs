@@ -45,6 +45,13 @@ pub struct Entity {
     /// `World::phase_aging`; reset to zero by a successful meal in
     /// `World::phase_feeding`.
     pub hunger: u32,
+    /// S3.5: current structural size, per-mille of full size. 1000 for
+    /// everything except an in-progress Plant seedling -- see grown_size.
+    /// Read at exactly one place: World::phase_collisions' radius
+    /// calculation, so a seedling crowds less than a mature plant. Does NOT
+    /// scale deposit/consume demand -- a deliberate choice, see
+    /// docs/S3_ECOLOGY_LAYERS_DESIGN.md section 7.
+    pub size: u16,
 }
 
 impl Entity {
@@ -71,6 +78,7 @@ impl Entity {
             alive: true,
             acted: false,
             hunger: 0,
+            size: 1000,
         }
     }
 
@@ -103,8 +111,32 @@ impl Hashable for Entity {
             .i32(self.hp)
             .bool(self.alive)
             .bool(self.acted)
-            .u32(self.hunger);
+            .u32(self.hunger)
+            .u16(self.size);
     }
+}
+
+/// S3.5: the per-mille of lifespan at which a growing Plant reaches full
+/// size. Derived, not an independent knob -- a live-tuning session cannot
+/// put it out of sync with lifespan, since it is always read as a fraction
+/// of whatever `lifespan` currently is rather than stored as its own tick
+/// count.
+pub const MATURITY_PERMILLE: u64 = 250;
+
+/// S3.5: `Entity.size`'s pure growth function, purely derived from
+/// `(birth_size, age, lifespan)`, never accumulated -- so it can be, and is
+/// (`World::phase_aging`), recomputed from scratch every tick. Linear growth
+/// from `birth_size` at age 0 to 1000 at `MATURITY_PERMILLE` of lifespan,
+/// then held at 1000. `birth_size == 1000` collapses this to a constant 1000
+/// at every age with no special-casing needed -- the shape every Animal, and
+/// any Plant already past maturity, actually takes.
+pub fn grown_size(birth_size: u16, age: u64, lifespan: u64) -> u16 {
+    let maturity_age = lifespan.saturating_mul(MATURITY_PERMILLE) / 1000;
+    if maturity_age == 0 || age >= maturity_age {
+        return 1000;
+    }
+    let birth = birth_size as u64;
+    (birth + (1000 - birth) * age / maturity_age).min(1000) as u16
 }
 
 /// Deterministic per-individual lifespan. Variance is per-mille around the
@@ -288,6 +320,8 @@ mod tests {
         acted.acted = !acted.acted;
         let mut hunger = base;
         hunger.hunger += 1;
+        let mut size = base;
+        size.size += 1;
 
         for (name, variant) in [
             ("id", id),
@@ -303,8 +337,46 @@ mod tests {
             ("alive", alive),
             ("acted", acted),
             ("hunger", hunger),
+            ("size", size),
         ] {
             assert_ne!(hash_of(&variant), base_hash, "{name} does not affect the hash");
         }
+    }
+
+    // S3.5: `grown_size` is the pure function `Entity.size` is recomputed
+    // from every tick (`World::phase_aging`) -- covered here in isolation,
+    // separately from the mechanism test in `world.rs` that proves
+    // `phase_aging` actually calls it.
+    #[test]
+    fn grown_size_starts_at_birth_size() {
+        assert_eq!(grown_size(200, 0, 4000), 200);
+    }
+
+    #[test]
+    fn grown_size_reaches_and_holds_full_size_at_maturity() {
+        // maturity_age = 4000 * 250 / 1000 = 1000.
+        assert_eq!(grown_size(200, 1000, 4000), 1000);
+        assert_eq!(grown_size(200, 1000000, 4000), 1000, "held at 1000 past maturity");
+    }
+
+    #[test]
+    fn grown_size_is_linear_at_the_midpoint() {
+        // maturity_age = 4000 * 250 / 1000 = 1000; age 500 is halfway there.
+        let birth = 200u64;
+        let expected = (birth + (1000 - birth) * 500 / 1000) as u16;
+        assert_eq!(grown_size(200, 500, 4000), expected);
+    }
+
+    #[test]
+    fn grown_size_at_full_birth_size_is_constant_at_every_age() {
+        for age in [0, 1, 500, 1000, 5000] {
+            assert_eq!(grown_size(1000, age, 4000), 1000, "age {age}");
+        }
+    }
+
+    #[test]
+    fn grown_size_does_not_panic_on_zero_lifespan() {
+        assert_eq!(grown_size(200, 0, 0), 1000);
+        assert_eq!(grown_size(200, 5, 0), 1000);
     }
 }

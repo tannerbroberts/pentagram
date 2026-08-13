@@ -226,6 +226,14 @@ impl Occupancy {
         }
         Occupancy { weight }
     }
+
+    /// How many bodies of `race` currently occupy the terrain cell at
+    /// `cell_index` (`Terrain::index`'s output). `phase_flora`'s `crowd_max`
+    /// gate needs this (S3.5); `apply_deposit`/`apply_consume` don't -- they
+    /// iterate the whole weight map by other means already.
+    pub fn count(&self, race: Race, cell_index: u32) -> u32 {
+        self.weight.get(race).get(&cell_index).copied().unwrap_or(0)
+    }
 }
 
 /// Apportion `total` across `weight`'s cells in proportion to each cell's

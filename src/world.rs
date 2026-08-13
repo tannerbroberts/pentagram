@@ -4,17 +4,22 @@
 //! detail. Reordering any two phases changes results and therefore invalidates
 //! every recorded replay — treat it the way you would treat a wire format.
 //!
-//! `commands → aging → movement → collisions → feeding → settle → terrain →
-//! reap` — `feeding` (S2, `phase_feeding`) runs after collisions so predator
-//! and prey are compared at this tick's settled positions, and before settle
-//! so a kill's `OnDeath` demand and a meal's `OnConsume` demand both land in
-//! the same terrain tick's settlement as everything else that happened this
-//! tick. `terrain` (S1) runs the six fixed-order operators described in
-//! `docs/S1_TERRAIN_DESIGN.md` and `terrain.rs`'s own doc comment.
+//! `commands → aging → movement → collisions → feeding → flora → settle →
+//! terrain → reap` — `feeding` (S2, `phase_feeding`) runs after collisions so
+//! predator and prey are compared at this tick's settled positions, and
+//! before settle so a kill's `OnDeath` demand and a meal's `OnConsume`
+//! demand both land in the same terrain tick's settlement as everything else
+//! that happened this tick. `flora` (S3.5, `phase_flora`) runs right after
+//! feeding for the same reason — a rooted seedling's `OnBirth` demand must
+//! land in this same terrain tick's settlement, not the next one — and
+//! before settle/terrain so it never grows `phase_terrain`'s own fixed
+//! six-slot sequence into a seventh. `terrain` (S1) runs the six fixed-order
+//! operators described in `docs/S1_TERRAIN_DESIGN.md` and `terrain.rs`'s own
+//! doc comment.
 
 use crate::behavior::{BehaviorTuning, Drive};
 use crate::climate::{Climate, ClimateTuning};
-use crate::ecology::EcologyTuning;
+use crate::ecology::{EcologyTuning, PropagationTuning};
 #[cfg(test)]
 use crate::element::Element;
 use crate::element::PerElement;
@@ -64,6 +69,15 @@ pub struct Stats {
     /// held enough of what eats it (`element.eaten_by()`) to cross
     /// `flee_threshold`, steering away from the worst neighbouring cell.
     pub fled: u64,
+    /// S3.5: successful plant propagation events (a new offspring actually
+    /// rooted) -- a subset of `births`, not an addition to it.
+    pub propagated: u64,
+    /// S3.5: propagation attempts that passed the chance roll but then
+    /// failed either the `root_min` or `crowd_max` gate. A rising value
+    /// confirms `crowd_max` is actually doing something under the shipped
+    /// table, not merely assumed to -- see section 7's named runaway-risk
+    /// note (docs/S3_ECOLOGY_LAYERS_DESIGN.md).
+    pub rooted_rejected: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +116,10 @@ pub struct World {
     /// [`World::state_hash`] the same way `ecology` is.
     pub behavior: BehaviorTuning,
 
+    /// S3.5: plant-reproduction rate/reach knobs (`World::phase_flora`).
+    /// Covered by [`World::state_hash`] the same way `ecology`/`behavior` are.
+    pub propagation: PropagationTuning,
+
     deposit_gov: PerRace<Governor>,
     consume_gov: PerRace<Governor>,
     /// Accumulated in milli-units between terrain ticks.
@@ -137,6 +155,7 @@ impl World {
             climate_tuning,
             ecology: EcologyTuning::default(),
             behavior: BehaviorTuning::default(),
+            propagation: PropagationTuning::default(),
             deposit_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).deposit))),
             consume_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).consume))),
             deposit_demand: PerRace::filled(0),
@@ -191,6 +210,12 @@ impl World {
         self.behavior = behavior;
     }
 
+    /// Swap the propagation tuning table. A straight field replacement, same
+    /// as `retune_ecology`/`retune_behavior`.
+    pub fn retune_propagation(&mut self, propagation: PropagationTuning) {
+        self.propagation = propagation;
+    }
+
     /// A deterministic starting population, spread evenly across the ten
     /// races and placed by hash rather than by sequence.
     pub fn seed_population(&mut self, per_race: u32) {
@@ -216,10 +241,19 @@ impl World {
     }
 
     pub fn spawn(&mut self, race: Race, at: V2) -> u32 {
+        self.spawn_sized(race, at, 1000)
+    }
+
+    /// Same as `World::spawn`, except the newborn's `size` (per-mille of
+    /// full size) is set explicitly rather than defaulting to fully grown;
+    /// only `phase_flora`'s plant offspring (S3.5) ever pass anything but
+    /// 1000 -- see `Entity.size`'s own doc comment.
+    pub fn spawn_sized(&mut self, race: Race, at: V2, size: u16) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         let a = self.races[race];
-        let e = Entity::spawn(id, race.element, self.clamp_to_bounds(at), self.seed, self.tick, &a);
+        let mut e = Entity::spawn(id, race.element, self.clamp_to_bounds(at), self.seed, self.tick, &a);
+        e.size = size;
         // Ids are handed out ascending, so pushing preserves the sort.
         self.entities.push(e);
         self.stats.births += 1;
@@ -246,6 +280,7 @@ impl World {
         self.phase_movement();
         self.phase_collisions();
         self.phase_feeding();
+        self.phase_flora();
         self.phase_settle();
         self.phase_terrain();
         self.phase_reap();
@@ -285,6 +320,7 @@ impl World {
     /// so a body that dies this tick still contributes its corpse.
     fn phase_aging(&mut self) {
         let ecology = self.ecology;
+        let propagation = self.propagation;
         for i in 0..self.entities.len() {
             // Scoped so the mutable borrow of `self.entities` ends before
             // `charge_death` below needs `&mut self` itself.
@@ -300,6 +336,14 @@ impl World {
                     if starving {
                         e.hp = e.hp.saturating_sub(ecology.starve_rate[e.element]);
                     }
+                    // S3.5: size is derived fresh every tick from
+                    // (age, lifespan, birth_size), never accumulated -- a
+                    // retuned offspring_size/MATURITY_PERMILLE takes effect
+                    // immediately. Animals collapse to a constant 1000 since
+                    // birth_size equals full size, so the formula never
+                    // moves them.
+                    let birth_size = if e.kind == Kind::Plant { propagation.offspring_size[e.element] } else { 1000 };
+                    e.size = crate::entity::grown_size(birth_size, e.age, e.lifespan);
                     if e.is_expired() || e.hp <= 0 {
                         e.alive = false;
                         Some((e.race(), starving))
@@ -441,7 +485,14 @@ impl World {
                 let d = b.pos - a.pos;
                 let a_race = a.race();
                 let b_race = b.race();
-                let min = self.races[a_race].radius + self.races[b_race].radius;
+                // S3.5: a seedling's collision footprint scales with its
+                // current growth (Entity.size, per-mille of full size) --
+                // the one place size is read. Animals and mature/unrooted
+                // Plants are always at size 1000, so this is a no-op for
+                // them (radius times 1.0 equals radius).
+                let a_radius = self.races[a_race].radius * Fx::ratio(a.size as i32, 1000);
+                let b_radius = self.races[b_race].radius * Fx::ratio(b.size as i32, 1000);
+                let min = a_radius + b_radius;
                 let dist_sq = d.len_sq();
                 if dist_sq >= min * min || dist_sq.is_zero() {
                     continue;
@@ -625,7 +676,70 @@ impl World {
         }
     }
 
-    /// 6 — at a terrain-tick boundary, charge existence and settle every
+    /// 6 — plant reproduction (S3.5). Gated at the same terrain-tick
+    /// boundary `phase_settle`/`phase_terrain` share. A new phase rather
+    /// than folding into `phase_terrain`'s existing six-slot sequence,
+    /// because `phase_terrain` runs *after* `phase_settle` — a newborn's
+    /// `OnBirth` demand would be deferred to the next terrain tick — and
+    /// folding in would renumber `docs/S1_TERRAIN_DESIGN.md`'s documented
+    /// six-slot wire format. Snapshot-then-apply, the same shape
+    /// `phase_feeding`'s own `births` vec already uses: every candidate is
+    /// decided against a fixed snapshot of who's alive and where (including
+    /// `Occupancy`, built once up front), and every successful offspring is
+    /// spawned only after the whole scan completes — so a newborn cannot
+    /// itself propagate in the tick it was born, and the scan never observes
+    /// a growing entity vector. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md`
+    /// section 7.
+    fn phase_flora(&mut self) {
+        if !(self.tick + 1).is_multiple_of(TERRAIN_PERIOD) {
+            return;
+        }
+        let terrain_tick = (self.tick + 1) / TERRAIN_PERIOD;
+        let propagation = self.propagation;
+        let occ = Occupancy::build(&self.entities, &self.terrain);
+
+        let mut offspring: Vec<(Race, V2)> = Vec::new();
+        for e in &self.entities {
+            if !e.alive || e.kind != Kind::Plant {
+                continue;
+            }
+            let el = e.element;
+            let period = propagation.period[el];
+            if period == 0 || !terrain_tick.is_multiple_of(period) {
+                continue;
+            }
+            if !rand_chance(self.seed, self.tick, e.id, Channel::Propagate, propagation.chance[el] as u32, 1000) {
+                continue;
+            }
+
+            let dx = rand_signed(self.seed, self.tick, e.id, Channel::Disperse) * propagation.dispersal[el];
+            let dy = rand_signed(self.seed, self.tick, e.id.wrapping_add(0x0D15), Channel::Disperse) * propagation.dispersal[el];
+            let candidate = self.clamp_to_bounds(e.pos + V2::new(dx, dy));
+
+            let (cx, cy) = self.terrain.cell_of(candidate);
+            let stock = self.terrain.cell(cx, cy)[el];
+            if (stock as u32) < propagation.root_min[el] as u32 {
+                self.stats.rooted_rejected += 1;
+                continue;
+            }
+            let idx = self.terrain.index(cx, cy) as u32;
+            let race = e.race();
+            if occ.count(race, idx) >= propagation.crowd_max[el] as u32 {
+                self.stats.rooted_rejected += 1;
+                continue;
+            }
+
+            offspring.push((race, candidate));
+        }
+
+        for (race, pos) in offspring {
+            let size = self.propagation.offspring_size[race.element];
+            self.spawn_sized(race, pos, size);
+            self.stats.propagated += 1;
+        }
+    }
+
+    /// 7 — at a terrain-tick boundary, charge existence and settle every
     /// governor. This is the only place demand becomes terrain change.
     fn phase_settle(&mut self) {
         if !(self.tick + 1).is_multiple_of(TERRAIN_PERIOD) {
@@ -662,7 +776,7 @@ impl World {
         }
     }
 
-    /// 7 — the six fixed-order operator slots gated at the same terrain-tick
+    /// 8 — the six fixed-order operator slots gated at the same terrain-tick
     /// boundary `phase_settle` uses so every operator sees this tick's
     /// freshly computed `last_deposit`/`last_consume` grants. See
     /// `docs/S1_TERRAIN_DESIGN.md` and `terrain.rs`'s own doc comment for why
@@ -687,7 +801,7 @@ impl World {
         crate::terrain::apply_diffusion(&mut self.terrain, &self.terrain_tuning);
     }
 
-    /// 8 — remove the dead. `retain` is order-preserving, so the id sort holds.
+    /// 9 — remove the dead. `retain` is order-preserving, so the id sort holds.
     fn phase_reap(&mut self) {
         self.entities.retain(|e| e.alive);
     }
@@ -734,6 +848,7 @@ impl World {
         self.climate_tuning.hash_into(&mut h);
         self.ecology.hash_into(&mut h);
         self.behavior.hash_into(&mut h);
+        self.propagation.hash_into(&mut h);
         for (_, g) in self.deposit_gov.iter() {
             g.hash_into(&mut h);
         }
@@ -762,7 +877,9 @@ impl World {
             .u64(self.stats.starved)
             .u64(self.stats.grazed)
             .u64(self.stats.hunted)
-            .u64(self.stats.fled);
+            .u64(self.stats.fled)
+            .u64(self.stats.propagated)
+            .u64(self.stats.rooted_rejected);
         h.finish()
     }
 }
@@ -972,6 +1089,34 @@ mod tests {
         let mut d = a.clone();
         d.stats.fled += 1;
         assert_ne!(a.state_hash(), d.state_hash(), "fled not hashed");
+    }
+
+    #[test]
+    fn state_hash_notices_a_retuned_propagation() {
+        let a = world();
+        let mut b = a.clone();
+        b.retune_propagation(crate::ecology::PropagationTuning {
+            crowd_max: PerElement::filled(1),
+            ..crate::ecology::PropagationTuning::default()
+        });
+        assert_ne!(a.state_hash(), b.state_hash());
+    }
+
+    // S3.5: `stats.propagated`/`stats.rooted_rejected` live outside every
+    // hashed sub-struct, only reachable through the hand-curated
+    // `stats.u64(..)` chain at the tail of `state_hash` — same reasoning as
+    // `state_hash_notices_grazed_hunted_and_fled` above.
+    #[test]
+    fn state_hash_notices_propagated_and_rooted_rejected() {
+        let a = world();
+
+        let mut b = a.clone();
+        b.stats.propagated += 1;
+        assert_ne!(a.state_hash(), b.state_hash(), "propagated not hashed");
+
+        let mut c = a.clone();
+        c.stats.rooted_rejected += 1;
+        assert_ne!(a.state_hash(), c.state_hash(), "rooted_rejected not hashed");
     }
 
     #[test]
@@ -1340,5 +1485,129 @@ mod tests {
             w.entities.iter().any(|e| e.id == pred_id),
             "a body fed just before the grace period should not have starved"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // S3.5 — plant propagation (`phase_flora`, `Entity.size`,
+    // `PropagationTuning`). Hand-built scenarios that force success or
+    // failure at each gate individually, the same discipline the S2 feeding
+    // tests above use, rather than leaning on the shipped defaults'
+    // emergent behaviour.
+
+    #[test]
+    fn phase_flora_roots_a_seedling_under_favourable_conditions() {
+        // NOTE: size alone cannot distinguish "a genuine new offspring" from
+        // "the original parent, still young relative to its own maturity
+        // window" -- `phase_aging` reads `birth_size` live off the current
+        // `offspring_size` table for *every* alive Plant each tick,
+        // regardless of how that Plant actually came to exist (see
+        // `Entity.size`'s doc comment / the S3.5 design clarification). So
+        // this test identifies the new offspring by id (anything other than
+        // `parent_id`), not merely by scanning for `size < 1000`.
+        let mut w = World::new(31, 32);
+        w.retune_propagation(PropagationTuning {
+            period: PerElement::filled(1),
+            chance: PerElement::filled(1000),
+            root_min: PerElement::filled(0),
+            crowd_max: PerElement::filled(100),
+            dispersal: PerElement::filled(Fx::ZERO),
+            ..PropagationTuning::default()
+        });
+        let center = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let parent_id = w.spawn(Race { element: Element::Wood, kind: Kind::Plant }, center);
+
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        assert!(w.stats.propagated > 0, "a favourable roll should have produced at least one offspring");
+        assert!(
+            w.entities.iter().any(|e| e.id != parent_id
+                && e.element == Element::Wood
+                && e.kind == Kind::Plant
+                && e.size < 1000),
+            "a smaller-than-full-size Wood seedling, distinct from the parent, should have rooted"
+        );
+    }
+
+    #[test]
+    fn root_min_actually_gates_propagation() {
+        // Same id-based reasoning as the favourable test above: the
+        // assertion is "no entity besides the original parent exists", not
+        // "no small-sized entity exists" -- the parent itself is small-sized
+        // too, early in its own life, under this design.
+        let mut w = World::new(32, 32);
+        w.retune_propagation(PropagationTuning {
+            period: PerElement::filled(1),
+            chance: PerElement::filled(1000),
+            root_min: PerElement::filled(u16::MAX),
+            crowd_max: PerElement::filled(100),
+            dispersal: PerElement::filled(Fx::ZERO),
+            ..PropagationTuning::default()
+        });
+        let center = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let parent_id = w.spawn(Race { element: Element::Wood, kind: Kind::Plant }, center);
+
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        assert!(w.stats.rooted_rejected > 0, "an unreachable root_min should reject every attempt");
+        assert!(
+            !w.entities.iter().any(|e| e.id != parent_id),
+            "no seedling should have rooted against an unreachable root_min"
+        );
+    }
+
+    #[test]
+    fn crowd_max_actually_gates_propagation() {
+        let mut w = World::new(33, 32);
+        w.retune_propagation(PropagationTuning {
+            period: PerElement::filled(1),
+            chance: PerElement::filled(1000),
+            root_min: PerElement::filled(0),
+            crowd_max: PerElement::filled(0),
+            dispersal: PerElement::filled(Fx::ZERO),
+            ..PropagationTuning::default()
+        });
+        let center = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let parent_id = w.spawn(Race { element: Element::Wood, kind: Kind::Plant }, center);
+
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        assert!(
+            w.stats.rooted_rejected > 0,
+            "a zero crowd_max should reject every attempt even though root_min alone would pass"
+        );
+        assert!(
+            !w.entities.iter().any(|e| e.id != parent_id),
+            "no seedling should have rooted against a zero crowd_max"
+        );
+    }
+
+    #[test]
+    fn entity_size_actually_grows_via_phase_aging() {
+        // Fire-Plant, not Wood-Plant: a much shorter lifespan keeps this
+        // test's loop small while still exercising the real `phase_aging`
+        // call site, not just the pure `grown_size` function in isolation
+        // (`entity.rs` covers that in isolation already).
+        let mut w = World::new(34, 32);
+        let race = Race { element: Element::Fire, kind: Kind::Plant };
+        let center = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let id = w.spawn_sized(race, center, 100);
+
+        let log = InputLog::new();
+        for _ in 0..1000 {
+            w.step(&log);
+        }
+
+        let e = w.entities.iter().find(|e| e.id == id);
+        assert!(e.is_some(), "the seedling should not have died of old age or starvation mid-test");
+        assert_eq!(e.unwrap().size, 1000, "size should have reached full growth well past maturity");
     }
 }

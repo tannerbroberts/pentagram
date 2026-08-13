@@ -131,8 +131,8 @@ choice to foraging never shifts the stream feeding collision — and every repla
 recorded before the change stays valid. Never renumber an existing channel.
 
 **The tick phase order is a wire format.** `commands → aging → movement →
-collisions → feeding → settle → terrain → reap`. Reordering any two phases
-changes results and invalidates every recorded trace.
+collisions → feeding → flora → settle → terrain → reap`. Reordering any two
+phases changes results and invalidates every recorded trace.
 
 ## The rate model
 
@@ -213,8 +213,9 @@ fixed order every terrain tick — deposit, consume, attrition, suppression,
 climate, diffusion (see the S2 update note below: slots 3–4 shipped as
 terrain's own `ring`/`star` originally, and moved to `ecology.rs` post-S2) —
 gated at the terrain-tick boundary within `World::step`'s phase
-order (`commands → aging → movement → collisions → feeding → settle →
-terrain → reap`; `feeding` is S2's addition, below) — and a deterministic
+order (`commands → aging → movement → collisions → feeding → flora → settle →
+terrain → reap`; `feeding` is S2's addition and `flora` is S3.5's, both
+below) — and a deterministic
 climate influx map with a five-season, 30-simulated-day cycle (`climate.rs`).
 Every design choice the README's one-sentence spec left open — the deposit/consume element
 mapping, the diffusion boundary, the operator order's justification, the exit
@@ -391,12 +392,41 @@ positions before any body in the same phase has moved, so steering never
 depends on iteration order; three new `Stats` counters (`grazed`, `hunted`,
 `fled`) track which drive fired.
 
-Not yet landed: plant propagation (`phase_flora`, `Entity.size`,
-`PropagationTuning` — S3.5); and the `chaos` live view's two-axis (Element ×
-Kind) support — it currently hardcodes every spawn to `Kind::Animal` and
-shows five columns, not ten (S3.6). See
-`docs/S3_ECOLOGY_LAYERS_DESIGN.md` §12 for the full staged rollout these fit
-into.
+Plants now reproduce (`World::phase_flora`, S3.5): a new tick phase, run
+right after `phase_feeding` and before `phase_settle` — `commands → aging →
+movement → collisions → feeding → flora → settle → terrain → reap` — not a
+seventh `phase_terrain` slot, for two reasons: `phase_terrain` runs *after*
+`phase_settle`, so a newborn's `OnBirth` demand would otherwise be deferred
+to the next terrain tick, and folding it in would renumber
+`docs/S1_TERRAIN_DESIGN.md`'s documented six-slot wire format. Gated at the
+same terrain-tick boundary `phase_settle`/`phase_terrain` share, it rolls
+each living Plant's chance to propagate (a new `PropagationTuning` table in
+`ecology.rs`, `PerElement`-shaped since only Plant rows ever read it: period
+between attempts, per-attempt chance, offspring size, the two rooting gates
+below, and dispersal reach), scatters a candidate cell near the parent, and
+roots a new offspring there if two gates both pass: `root_min` (the
+candidate cell must already hold enough of the plant's own element in the
+terrain) and `crowd_max` (the candidate cell must not already be crowded with
+same-race bodies, checked via a new `Occupancy::count`). `root_min` alone is
+a named runaway risk, not a silent gap: a plant's own deposits raise the
+terrain concentration of its own element, which makes rooting easier, which
+allows more plants — `crowd_max` is the shipped mitigation. Two new `Stats`
+counters, `propagated` and `rooted_rejected`, track successful roots and
+gate-failed attempts respectively, so a live view can watch whether
+`crowd_max` is actually doing anything under the shipped table. A rooted
+offspring starts at `Entity.size` less than full — the first new *stored*
+field this design adds beyond `kind` — and grows into its mature collision
+footprint over time; `size` is never accumulated, only recomputed from
+scratch every tick in `phase_aging` as a pure function of `(birth_size, age,
+lifespan)`, so a live retune of `offspring_size` or the maturity fraction
+takes effect immediately, and it is read at exactly one place —
+`phase_collisions`' radius calculation — so a seedling crowds less than a
+mature body without touching deposit/consume demand at all.
+
+Not yet landed: the `chaos` live view's two-axis (Element × Kind) support —
+it currently hardcodes every spawn to `Kind::Animal` and shows five columns,
+not ten (S3.6). See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §12 for the full
+staged rollout this fits into.
 
 ## Next
 

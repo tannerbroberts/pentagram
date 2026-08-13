@@ -258,6 +258,75 @@ pub fn apply_suppression(entities: &mut [Entity], terrain: &Terrain, tuning: &Ec
     }
 }
 
+/// S3.5's plant-reproduction knob table for `World::phase_flora`.
+/// `PerElement`-shaped, not `PerRace`-shaped, because only `Kind::Plant` rows
+/// ever read it -- an Animal never calls `phase_flora`'s logic, so shipping
+/// five permanently dead `PerRace` rows would misstate what actually varies.
+/// Every number below is a first guess, in the same spirit `race.rs` and
+/// this file's own `EcologyTuning` state of their own tables: a starting
+/// point for the live tuning loop, not a derived constant. See
+/// `docs/S3_ECOLOGY_LAYERS_DESIGN.md` section 7.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PropagationTuning {
+    /// Terrain ticks between propagation attempts. 0 means a Plant of that
+    /// element never attempts.
+    pub period: PerElement<u64>,
+    /// Permille chance, per eligible Plant per attempt, that propagation
+    /// actually fires.
+    pub chance: PerElement<u16>,
+    /// Permille of full size a new offspring is born at (`Entity.size`).
+    pub offspring_size: PerElement<u16>,
+    /// Minimum terrain stock of the plant's own element required at the
+    /// candidate cell for rooting to succeed -- the same raw stock scale
+    /// `EcologyTuning::attrition_rate` reads (up to `u16::MAX`), not a
+    /// per-mille fraction.
+    pub root_min: PerElement<u16>,
+    /// Max scatter offset from the parent, same shape as `world::BIRTH_SCATTER`.
+    pub dispersal: PerElement<Fx>,
+    /// Max same-race bodies already occupying the candidate cell before
+    /// rooting is refused -- the mitigation for the positive-feedback
+    /// runaway risk named in section 7 of the design doc: more plants
+    /// deposit more of their element, which makes rooting easier, which
+    /// allows more plants.
+    pub crowd_max: PerElement<u16>,
+}
+
+impl Default for PropagationTuning {
+    fn default() -> PropagationTuning {
+        PropagationTuning {
+            period: PerElement::filled(3),
+            chance: PerElement::filled(200),
+            offspring_size: PerElement::filled(200),
+            root_min: PerElement::filled(300),
+            dispersal: PerElement::filled(Fx::ratio(300, 100)),
+            crowd_max: PerElement::filled(3),
+        }
+    }
+}
+
+impl Hashable for PropagationTuning {
+    fn hash_into(&self, h: &mut Hasher) {
+        for (_, v) in self.period.iter() {
+            h.u64(*v);
+        }
+        for (_, v) in self.chance.iter() {
+            h.u16(*v);
+        }
+        for (_, v) in self.offspring_size.iter() {
+            h.u16(*v);
+        }
+        for (_, v) in self.root_min.iter() {
+            h.u16(*v);
+        }
+        for (_, v) in self.dispersal.iter() {
+            h.i32(v.raw());
+        }
+        for (_, v) in self.crowd_max.iter() {
+            h.u16(*v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +480,52 @@ mod tests {
         apply_suppression(&mut entities, &terrain, &tuning);
         assert_eq!(entities[0].hp, crate::entity::MAX_HP);
         assert_eq!(entities[0].hunger, 0);
+    }
+
+    #[test]
+    fn propagation_default_is_internally_sane() {
+        let t = PropagationTuning::default();
+        for e in Element::ALL {
+            assert!(t.period[e] > 0, "{} never attempts propagation", e.name());
+            assert!(t.chance[e] > 0 && t.chance[e] <= 1000, "{} has an out-of-range chance", e.name());
+            assert!(t.offspring_size[e] > 0 && t.offspring_size[e] < 1000, "{} seedlings do not start smaller than mature", e.name());
+            assert!(t.crowd_max[e] > 0, "{} can never root anywhere", e.name());
+        }
+    }
+
+    #[test]
+    fn propagation_hash_notices_every_field() {
+        let a = PropagationTuning::default();
+        let base = {
+            let mut h = Hasher::new();
+            a.hash_into(&mut h);
+            h.finish()
+        };
+
+        let mut period = a;
+        period.period[Element::Fire] += 1;
+        let mut chance = a;
+        chance.chance[Element::Fire] += 1;
+        let mut offspring_size = a;
+        offspring_size.offspring_size[Element::Fire] += 1;
+        let mut root_min = a;
+        root_min.root_min[Element::Fire] += 1;
+        let mut dispersal = a;
+        dispersal.dispersal[Element::Fire] += Fx::ONE;
+        let mut crowd_max = a;
+        crowd_max.crowd_max[Element::Fire] += 1;
+
+        for (name, tuning) in [
+            ("period", period),
+            ("chance", chance),
+            ("offspring_size", offspring_size),
+            ("root_min", root_min),
+            ("dispersal", dispersal),
+            ("crowd_max", crowd_max),
+        ] {
+            let mut h = Hasher::new();
+            tuning.hash_into(&mut h);
+            assert_ne!(h.finish(), base, "{name} does not affect the hash");
+        }
     }
 }
