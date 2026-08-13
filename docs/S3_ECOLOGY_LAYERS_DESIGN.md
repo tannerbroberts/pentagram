@@ -348,7 +348,12 @@ Algorithm, ascending-id over the (already id-sorted) `entities`, snapshot-then-a
 exactly like `phase_feeding`'s `births` vec (world.rs:485, 517-524) so a newborn cannot
 propagate in the tick it was born and the scan never observes a growing vector:
 
-1. Roll `chance` on a new `Channel::Propagate`, keyed by `terrain_tick`.
+1. Roll `chance` on a new `Channel::Propagate`, keyed by `self.tick` — the same
+   per-tick keying convention `Channel::Hunt`/`Forage`/`MoveJitter` already use elsewhere
+   in this codebase (none of them key by `terrain_tick`). Since `phase_flora` only ever
+   runs when `(tick + 1)` is a multiple of `TERRAIN_PERIOD`, `self.tick` is already a
+   bijective function of `terrain_tick` at this call site, so this is just a naming
+   choice, not a determinism or behavioral difference.
 2. Draw x/y scatter offsets on a new `Channel::Disperse`, `id.wrapping_add(K)` salt for
    the second axis — the same paired-draw convention `Channel::Forage`'s birth-scatter
    already establishes (world.rs:519-522).
