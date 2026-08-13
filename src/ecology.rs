@@ -10,13 +10,24 @@
 //! an offspring through the existing `World::spawn` (so it charges `OnBirth`
 //! the same way a command-spawned or seeded body always has).
 //!
-//! **No plant/animal type split.** The ring is a full pentagon — every race
+//! **Update, S3.1** — the paragraph below is superseded, kept for history the
+//! same way S1's ring/star → attrition/suppression note is in `README.md`:
+//! ~~No plant/animal type split. The ring is a full pentagon — every race
 //! eats exactly one other and is eaten by exactly one other (`element.rs`'s
-//! own arithmetic) — so nothing in the shipped data distinguishes a
-//! "plant" tier from an "animal" tier. Reading the README's "plants and
-//! animals" as *the ecology layer* rather than as a literal taxonomy is this
-//! file's interpretive call, the same kind `terrain.rs` names for its own
-//! deposit/consume mapping — flagged here rather than silently assumed.
+//! own arithmetic) — so nothing in the shipped data distinguishes a "plant"
+//! tier from an "animal" tier.~~ `src/race.rs`'s `Kind` axis now does exactly
+//! that: every element splits into a `Kind::Plant` and a `Kind::Animal` race
+//! (`Race`, ten rows total), a real structural distinction rather than an
+//! interpretive reading. **S3.1 is a scaffold stage** — the mechanisms
+//! *this* file owns (`phase_feeding`'s predation pairing, `apply_attrition`/
+//! `apply_suppression`) are still purely `Element`-keyed and completely
+//! `Kind`-unaware, so a Plant is, today, still exactly as mobile and exactly
+//! as eligible to be predator or prey as its Animal twin — the shipped Plant
+//! rows in `race.rs` are literal copies of their Animal counterpart for
+//! exactly this reason. Kind-gated predation (a Plant is never a predator;
+//! hunting Animal prey needs a tunable hunt-weight roll) and plant rooting
+//! (`phase_movement` skipping `Kind::Plant`) are S3.2/S3.3's job — see
+//! `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4, §5, §12.
 //!
 //! Every number below is a first guess, in the same spirit `race.rs` and
 //! `terrain.rs` state of their own tables: a starting point for the live
@@ -245,7 +256,8 @@ mod tests {
     }
 
     fn spawn_at(element: Element, pos: crate::fx::V2) -> Entity {
-        let a = crate::race::attrs(element);
+        let race = crate::race::Race { element, kind: crate::race::Kind::Animal };
+        let a = crate::race::attrs(race);
         let mut e = Entity::spawn(1, element, pos, 5, 0, a);
         e.hp = crate::entity::MAX_HP;
         e

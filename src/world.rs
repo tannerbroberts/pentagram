@@ -14,13 +14,17 @@
 
 use crate::climate::{Climate, ClimateTuning};
 use crate::ecology::EcologyTuning;
-use crate::element::{Element, PerElement};
+#[cfg(test)]
+use crate::element::Element;
+use crate::element::PerElement;
 use crate::entity::{Entity, ACTION_THRESHOLD, MAX_HP};
 use crate::fx::{Fx, V2};
 use crate::governor::{Governor, Grant};
 use crate::hash::{Hashable, Hasher};
 use crate::input::{CmdKind, Command, InputLog};
-use crate::race::{attrs, Channel as DepChannel, RaceAttrs, MILLI, RACES, TERRAIN_PERIOD};
+#[cfg(test)]
+use crate::race::Kind;
+use crate::race::{attrs, Channel as DepChannel, PerRace, Race, RaceAttrs, MILLI, RACES, TERRAIN_PERIOD};
 use crate::rand::{rand_signed, Channel};
 use crate::terrain::{Occupancy, Terrain, TerrainTuning};
 
@@ -68,7 +72,7 @@ pub struct World {
     ///
     /// It is covered by [`World::state_hash`], so a retuned world never
     /// compares equal to an untuned one.
-    pub races: PerElement<RaceAttrs>,
+    pub races: PerRace<RaceAttrs>,
 
     /// S1: the terrain field and the tuning tables its six operators read.
     /// Covered by [`World::state_hash`] the same way `races` is — a
@@ -82,14 +86,14 @@ pub struct World {
     /// [`World::state_hash`] the same way `terrain_tuning` is.
     pub ecology: EcologyTuning,
 
-    deposit_gov: PerElement<Governor>,
-    consume_gov: PerElement<Governor>,
+    deposit_gov: PerRace<Governor>,
+    consume_gov: PerRace<Governor>,
     /// Accumulated in milli-units between terrain ticks.
-    deposit_demand: PerElement<u64>,
-    consume_demand: PerElement<u64>,
+    deposit_demand: PerRace<u64>,
+    consume_demand: PerRace<u64>,
 
-    pub last_deposit: PerElement<Grant>,
-    pub last_consume: PerElement<Grant>,
+    pub last_deposit: PerRace<Grant>,
+    pub last_consume: PerRace<Grant>,
     pub stats: Stats,
 }
 
@@ -116,12 +120,12 @@ impl World {
             climate: Climate::new(seed, size_cells, &climate_tuning),
             climate_tuning,
             ecology: EcologyTuning::default(),
-            deposit_gov: PerElement(Element::ALL.map(|e| Governor::new(attrs(e).deposit))),
-            consume_gov: PerElement(Element::ALL.map(|e| Governor::new(attrs(e).consume))),
-            deposit_demand: PerElement::filled(0),
-            consume_demand: PerElement::filled(0),
-            last_deposit: PerElement::default(),
-            last_consume: PerElement::default(),
+            deposit_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).deposit))),
+            consume_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).consume))),
+            deposit_demand: PerRace::filled(0),
+            consume_demand: PerRace::filled(0),
+            last_deposit: PerRace::default(),
+            last_consume: PerRace::default(),
             stats: Stats::default(),
         }
     }
@@ -133,11 +137,11 @@ impl World {
     /// one knob that does *not* reach back — every body already alive keeps the
     /// span it rolled at birth, so lowering it thins the population by
     /// attrition rather than by mass execution.
-    pub fn retune(&mut self, races: PerElement<RaceAttrs>) {
+    pub fn retune(&mut self, races: PerRace<RaceAttrs>) {
         self.races = races;
-        for e in Element::ALL {
-            self.deposit_gov.get_mut(e).set_band(races[e].deposit);
-            self.consume_gov.get_mut(e).set_band(races[e].consume);
+        for r in Race::ALL {
+            self.deposit_gov.get_mut(r).set_band(races[r].deposit);
+            self.consume_gov.get_mut(r).set_band(races[r].consume);
         }
     }
 
@@ -163,15 +167,15 @@ impl World {
         self.ecology = ecology;
     }
 
-    /// A deterministic starting population, spread evenly across the five
+    /// A deterministic starting population, spread evenly across the ten
     /// races and placed by hash rather than by sequence.
     pub fn seed_population(&mut self, per_race: u32) {
-        for e in Element::ALL {
+        for r in Race::ALL {
             for k in 0..per_race {
-                let salt = (e.index() as u32) * 7919 + k;
+                let salt = (r.index() as u32) * 7919 + k;
                 let x = self.scatter(salt, 0);
                 let y = self.scatter(salt, 1);
-                self.spawn(e, V2::new(x, y));
+                self.spawn(r, V2::new(x, y));
             }
         }
     }
@@ -187,16 +191,16 @@ impl World {
         Fx::from_int(r as i32)
     }
 
-    pub fn spawn(&mut self, element: Element, at: V2) -> u32 {
+    pub fn spawn(&mut self, race: Race, at: V2) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        let a = self.races[element];
-        let e = Entity::spawn(id, element, self.clamp_to_bounds(at), self.seed, self.tick, &a);
+        let a = self.races[race];
+        let e = Entity::spawn(id, race.element, self.clamp_to_bounds(at), self.seed, self.tick, &a);
         // Ids are handed out ascending, so pushing preserves the sort.
         self.entities.push(e);
         self.stats.births += 1;
-        *self.deposit_demand.get_mut(element) += a.deposit_per(DepChannel::OnBirth);
-        *self.consume_demand.get_mut(element) += a.consume_per(DepChannel::OnBirth);
+        *self.deposit_demand.get_mut(race) += a.deposit_per(DepChannel::OnBirth);
+        *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnBirth);
         id
     }
 
@@ -233,8 +237,8 @@ impl World {
 
     fn apply(&mut self, c: Command) {
         match c.kind {
-            CmdKind::Spawn { element, at } => {
-                self.spawn(element, at);
+            CmdKind::Spawn { element, kind, at } => {
+                self.spawn(Race { element, kind }, at);
             }
             CmdKind::SetHeading { dir } => {
                 if let Some(i) = self.find(c.entity) {
@@ -274,43 +278,44 @@ impl World {
                     }
                     if e.is_expired() || e.hp <= 0 {
                         e.alive = false;
-                        Some((e.element, starving))
+                        Some((e.race(), starving))
                     } else {
                         None
                     }
                 }
             };
-            if let Some((el, starving)) = dead {
+            if let Some((race, starving)) = dead {
                 if starving {
                     self.stats.starved += 1;
                 }
-                self.charge_death(el);
+                self.charge_death(race);
             }
         }
     }
 
-    /// Charge the `OnDeath` demand for one body's element and count the
+    /// Charge the `OnDeath` demand for one body's race and count the
     /// death. Shared by natural/starvation death (`phase_aging`) and
     /// predation (`phase_feeding`) — a corpse terraforms the same way
     /// regardless of what ended the body.
-    fn charge_death(&mut self, el: Element) {
-        let a = self.races[el];
+    fn charge_death(&mut self, race: Race) {
+        let a = self.races[race];
         self.stats.deaths += 1;
-        *self.deposit_demand.get_mut(el) += a.deposit_per(DepChannel::OnDeath);
-        *self.consume_demand.get_mut(el) += a.consume_per(DepChannel::OnDeath);
+        *self.deposit_demand.get_mut(race) += a.deposit_per(DepChannel::OnDeath);
+        *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnDeath);
     }
 
     /// 3 — move, jitter, and reflect off the bounds.
     fn phase_movement(&mut self) {
         let (seed, tick, size) = (self.seed, self.tick, self.size);
         let races = self.races;
-        let mut acted: PerElement<u64> = PerElement::filled(0);
+        let mut acted: PerRace<u64> = PerRace::filled(0);
 
         for e in self.entities.iter_mut() {
             if !e.alive {
                 continue;
             }
-            let step = e.heading.scale(races[e.element].speed);
+            let race = e.race();
+            let step = e.heading.scale(races[race].speed);
             let jitter = V2::new(
                 rand_signed(seed, tick, e.id, Channel::MoveJitter) * JITTER,
                 rand_signed(seed, tick, e.id.wrapping_add(0x9E37), Channel::MoveJitter) * JITTER,
@@ -337,15 +342,15 @@ impl World {
 
             if delta.len_sq() > ACTION_THRESHOLD * ACTION_THRESHOLD {
                 e.acted = true;
-                *acted.get_mut(e.element) += 1;
+                *acted.get_mut(race) += 1;
             }
         }
 
-        for (el, n) in acted.iter() {
+        for (race, n) in acted.iter() {
             if *n > 0 {
                 self.stats.actions += *n;
-                *self.deposit_demand.get_mut(el) += races[el].deposit_per(DepChannel::OnAction) * *n;
-                *self.consume_demand.get_mut(el) += races[el].consume_per(DepChannel::OnAction) * *n;
+                *self.deposit_demand.get_mut(race) += races[race].deposit_per(DepChannel::OnAction) * *n;
+                *self.consume_demand.get_mut(race) += races[race].consume_per(DepChannel::OnAction) * *n;
             }
         }
     }
@@ -368,7 +373,9 @@ impl World {
                 let a = &self.entities[i];
                 let b = &self.entities[j];
                 let d = b.pos - a.pos;
-                let min = self.races[a.element].radius + self.races[b.element].radius;
+                let a_race = a.race();
+                let b_race = b.race();
+                let min = self.races[a_race].radius + self.races[b_race].radius;
                 let dist_sq = d.len_sq();
                 if dist_sq >= min * min || dist_sq.is_zero() {
                     continue;
@@ -439,6 +446,12 @@ impl World {
                 if !self.entities[j].alive || eaten[j] {
                     continue;
                 }
+                // S3.1 scaffold: pred/prey pairing is still purely
+                // element-based, exactly as before `Kind` existed — a Plant
+                // is, today, exactly as eligible to predate or be predated
+                // as its Animal twin. Kind-gating this (a Plant is never a
+                // predator; hunting Animal prey needs a hunt-weight roll) is
+                // S3.2/S3.3's job — see `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
                 let a = self.entities[i].element;
                 let b = self.entities[j].element;
                 let (pred, prey) = if a.eats() == b {
@@ -482,31 +495,32 @@ impl World {
             }
         }
 
-        let mut births: Vec<(Element, V2, u32)> = Vec::new();
+        let mut births: Vec<(Race, V2, u32)> = Vec::new();
         for (i, &was_fed) in fed.iter().enumerate() {
             if !was_fed {
                 continue;
             }
             let el = self.entities[i].element;
+            let race = self.entities[i].race();
             let before = self.entities[i].hp;
             let after = before.saturating_add(ecology.feed_gain[el]).min(MAX_HP);
             self.entities[i].hp = after;
             self.entities[i].hunger = 0;
             self.stats.feedings += 1;
-            *self.deposit_demand.get_mut(el) += races[el].deposit_per(DepChannel::OnConsume);
-            *self.consume_demand.get_mut(el) += races[el].consume_per(DepChannel::OnConsume);
+            *self.deposit_demand.get_mut(race) += races[race].deposit_per(DepChannel::OnConsume);
+            *self.consume_demand.get_mut(race) += races[race].consume_per(DepChannel::OnConsume);
 
             if before < ecology.repro_threshold[el] && after >= ecology.repro_threshold[el] {
-                births.push((el, self.entities[i].pos, self.entities[i].id));
+                births.push((race, self.entities[i].pos, self.entities[i].id));
             }
         }
 
         for (i, &was_eaten) in eaten.iter().enumerate() {
             if was_eaten {
-                let el = self.entities[i].element;
+                let race = self.entities[i].race();
                 self.entities[i].alive = false;
                 self.entities[i].hp = 0;
-                self.charge_death(el);
+                self.charge_death(race);
             }
         }
 
@@ -514,13 +528,15 @@ impl World {
         // sort invariant holds) after every kill and every meal from this
         // tick is already resolved — a body born from feeding does not
         // itself get to move, collide or eat again until its own next tick.
+        // An offspring is the same race as its parent — same element and
+        // same kind.
         let (seed, tick) = (self.seed, self.tick);
-        for (el, pos, parent_id) in births {
+        for (race, pos, parent_id) in births {
             let jitter = V2::new(
                 rand_signed(seed, tick, parent_id, Channel::Forage) * BIRTH_SCATTER,
                 rand_signed(seed, tick, parent_id.wrapping_add(0x0F0D), Channel::Forage) * BIRTH_SCATTER,
             );
-            self.spawn(el, pos + jitter);
+            self.spawn(race, pos + jitter);
         }
     }
 
@@ -531,33 +547,33 @@ impl World {
             return;
         }
 
-        let mut alive: PerElement<u64> = PerElement::filled(0);
+        let mut alive: PerRace<u64> = PerRace::filled(0);
         for e in &self.entities {
             if e.alive {
-                *alive.get_mut(e.element) += 1;
+                *alive.get_mut(e.race()) += 1;
             }
         }
         let races = self.races;
-        for (el, n) in alive.iter() {
+        for (race, n) in alive.iter() {
             if *n > 0 {
-                *self.deposit_demand.get_mut(el) +=
-                    races[el].deposit_per(DepChannel::OnExistence) * *n;
-                *self.consume_demand.get_mut(el) +=
-                    races[el].consume_per(DepChannel::OnExistence) * *n;
+                *self.deposit_demand.get_mut(race) +=
+                    races[race].deposit_per(DepChannel::OnExistence) * *n;
+                *self.consume_demand.get_mut(race) +=
+                    races[race].consume_per(DepChannel::OnExistence) * *n;
             }
         }
 
-        for el in Element::ALL {
-            let d = self.deposit_demand[el] / MILLI;
-            let grant = self.deposit_gov.get_mut(el).settle(d);
+        for race in Race::ALL {
+            let d = self.deposit_demand[race] / MILLI;
+            let grant = self.deposit_gov.get_mut(race).settle(d);
             self.stats.deposit_clipped += grant.clipped;
             self.stats.deposit_forced += grant.forced;
-            self.last_deposit[el] = grant;
-            self.deposit_demand[el] = 0;
+            self.last_deposit[race] = grant;
+            self.deposit_demand[race] = 0;
 
-            let c = self.consume_demand[el] / MILLI;
-            self.last_consume[el] = self.consume_gov.get_mut(el).settle(c);
-            self.consume_demand[el] = 0;
+            let c = self.consume_demand[race] / MILLI;
+            self.last_consume[race] = self.consume_gov.get_mut(race).settle(c);
+            self.consume_demand[race] = 0;
         }
     }
 
@@ -718,9 +734,13 @@ mod tests {
             w.step(&log);
         }
         let pop = w.population();
-        assert_eq!(pop[Element::Earth], 6, "Earth should not have died at all");
+        // `population()` aggregates by element, across both kinds — S3.1's
+        // Plant rows are literal copies of their Animal twin, so both
+        // Earth-Plant and Earth-Animal outlive the run (12 = 6 per_race × 2
+        // kinds) and both Fire variants burn out identically.
+        assert_eq!(pop[Element::Earth], 12, "Earth should not have died at all");
         assert_eq!(pop[Element::Fire], 0, "Fire should have burned out entirely");
-        assert!(w.stats.deaths >= 6, "expected turnover, saw {}", w.stats.deaths);
+        assert!(w.stats.deaths >= 12, "expected turnover, saw {}", w.stats.deaths);
     }
 
     #[test]
@@ -729,16 +749,17 @@ mod tests {
         let log = InputLog::new();
         for _ in 0..4000 {
             w.step(&log);
-            for el in Element::ALL {
-                let b = attrs(el).deposit;
-                let g = w.last_deposit[el];
+            for race in Race::ALL {
+                let b = attrs(race).deposit;
+                let g = w.last_deposit[race];
                 if g.granted == 0 {
                     continue; // before the first settlement
                 }
                 assert!(
                     g.granted >= b.floor as u64 && g.granted <= b.ceiling as u64,
-                    "{} granted {} outside [{}, {}]",
-                    el.name(),
+                    "{}-{} granted {} outside [{}, {}]",
+                    race.element.name(),
+                    race.kind.name(),
                     g.granted,
                     b.floor,
                     b.ceiling
@@ -749,31 +770,37 @@ mod tests {
 
     #[test]
     fn an_extinct_race_still_churns_its_terrain() {
-        // Nothing but Earth exists. Every other race must still be granted its
-        // floor, which is what stops a lost biome becoming an absorbing state.
+        // Only Earth-Animal exists. Every other race — including Earth-Plant
+        // — must still be granted its floor, which is what stops a lost
+        // biome becoming an absorbing state.
         let mut w = World::new(3, 32);
+        let earth_animal = Race { element: Element::Earth, kind: Kind::Animal };
         for k in 0..4 {
-            w.spawn(Element::Earth, V2::new(Fx::from_int(k * 3), Fx::from_int(k * 3)));
+            w.spawn(earth_animal, V2::new(Fx::from_int(k * 3), Fx::from_int(k * 3)));
         }
         let log = InputLog::new();
         for _ in 0..(TERRAIN_PERIOD * 3) {
             w.step(&log);
         }
-        for el in [Element::Fire, Element::Water, Element::Wood, Element::Metal] {
+        for race in Race::ALL {
+            if race == earth_animal {
+                continue;
+            }
             assert_eq!(
-                w.last_deposit[el].granted,
-                attrs(el).deposit.floor as u64,
-                "{} should be churning at its floor",
-                el.name()
+                w.last_deposit[race].granted,
+                attrs(race).deposit.floor as u64,
+                "{}-{} should be churning at its floor",
+                race.element.name(),
+                race.kind.name()
             );
-            assert!(w.last_deposit[el].forced > 0);
+            assert!(w.last_deposit[race].forced > 0);
         }
     }
 
     #[test]
     fn commands_are_applied_at_their_stamped_tick() {
         let mut w = World::new(1, 32);
-        let id = w.spawn(Element::Metal, V2::new(Fx::from_int(16), Fx::from_int(16)));
+        let id = w.spawn(Race { element: Element::Metal, kind: Kind::Animal }, V2::new(Fx::from_int(16), Fx::from_int(16)));
         let mut log = InputLog::new();
         log.push(Command {
             tick: 10,
@@ -829,7 +856,7 @@ mod tests {
         let a = world();
         let mut b = a.clone();
         let mut races = a.races;
-        races[Element::Fire].lifespan += 1;
+        races[Race { element: Element::Fire, kind: Kind::Animal }].lifespan += 1;
         b.retune(races);
         assert_ne!(a.state_hash(), b.state_hash());
     }
@@ -854,9 +881,9 @@ mod tests {
         // considered as predator (of Wood) in the same inner-loop pass.
         let mut w = World::new(9, 32);
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let fire_id = w.spawn(Element::Fire, center); // Fire eats Wood.
-        let earth_id = w.spawn(Element::Earth, center); // Earth eats Fire.
-        let wood_id = w.spawn(Element::Wood, center);
+        let fire_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center); // Fire eats Wood.
+        let earth_id = w.spawn(Race { element: Element::Earth, kind: Kind::Animal }, center); // Earth eats Fire.
+        let wood_id = w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
         for id in [fire_id, earth_id] {
             let i = w.entities.iter().position(|e| e.id == id).unwrap();
             let el = w.entities[i].element;
@@ -878,8 +905,8 @@ mod tests {
     fn feeding_kills_prey_feeds_the_predator_and_fires_on_consume() {
         let mut w = World::new(1, 32);
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let pred_id = w.spawn(Element::Fire, center); // Fire eats Wood.
-        let prey_id = w.spawn(Element::Wood, center); // Same cell: certainly in reach.
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center); // Fire eats Wood.
+        let prey_id = w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center); // Same cell: certainly in reach.
         // Skip the satiation wait so this tick's feeding pass fires.
         let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
         w.entities[pi].hunger = w.ecology.satiation[Element::Fire];
@@ -901,9 +928,9 @@ mod tests {
     fn a_freshly_fed_predator_does_not_eat_again_until_satiated() {
         let mut w = World::new(4, 32);
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let pred_id = w.spawn(Element::Fire, center);
-        w.spawn(Element::Wood, center);
-        w.spawn(Element::Wood, center);
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
         let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
         w.entities[pi].hunger = w.ecology.satiation[Element::Fire];
 
@@ -923,8 +950,8 @@ mod tests {
         // not eat on the very first tick just because prey is reachable.
         let mut w = World::new(11, 32);
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        w.spawn(Element::Fire, center); // hunger starts at 0, well below satiation.
-        w.spawn(Element::Wood, center);
+        w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center); // hunger starts at 0, well below satiation.
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
 
         let log = InputLog::new();
         w.step(&log);
@@ -953,22 +980,22 @@ mod tests {
             ..EcologyTuning::default()
         });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let pred_id = w.spawn(Element::Fire, center);
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
         let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
         w.entities[pi].hunger = 5;
-        w.spawn(Element::Wood, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
 
         let log = InputLog::new();
         w.step(&log); // first meal
         assert_eq!(w.stats.feedings, 1);
 
         for _ in 0..4 {
-            w.spawn(Element::Wood, center); // keep prey in reach
+            w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center); // keep prey in reach
             w.step(&log);
         }
         assert_eq!(w.stats.feedings, 1, "still under satiation — no second meal yet");
 
-        w.spawn(Element::Wood, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
         w.step(&log); // hunger has now climbed back to 5
         assert_eq!(w.stats.feedings, 2, "satiation cleared again — the predator resumes eating");
     }
@@ -981,8 +1008,8 @@ mod tests {
         // must never register a meal.
         let mut w = World::new(13, 32);
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let a_id = w.spawn(Element::Fire, center);
-        let b_id = w.spawn(Element::Metal, center); // Fire suppresses Metal; neither eats the other.
+        let a_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
+        let b_id = w.spawn(Race { element: Element::Metal, kind: Kind::Animal }, center); // Fire suppresses Metal; neither eats the other.
         for id in [a_id, b_id] {
             let i = w.entities.iter().position(|e| e.id == id).unwrap();
             let el = w.entities[i].element;
@@ -1007,8 +1034,8 @@ mod tests {
             ..EcologyTuning::default()
         });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let pred_id = w.spawn(Element::Fire, center);
-        w.spawn(Element::Wood, center);
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
 
         let log = InputLog::new();
         w.step(&log);
@@ -1021,8 +1048,8 @@ mod tests {
     fn a_meal_that_crosses_repro_threshold_spawns_an_offspring() {
         let mut w = World::new(3, 32);
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let pred_id = w.spawn(Element::Fire, center);
-        w.spawn(Element::Wood, center);
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
         let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
         w.entities[pi].hunger = w.ecology.satiation[Element::Fire];
         let births_before = w.stats.births;
@@ -1045,7 +1072,7 @@ mod tests {
             starve_rate: PerElement::filled(1000), // one drain tick is fatal
             ..EcologyTuning::default()
         });
-        let id = w.spawn(Element::Fire, V2::new(Fx::from_int(16), Fx::from_int(16)));
+        let id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, V2::new(Fx::from_int(16), Fx::from_int(16)));
 
         let log = InputLog::new();
         for _ in 0..51 {
@@ -1073,10 +1100,10 @@ mod tests {
             ..EcologyTuning::default()
         });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
-        let pred_id = w.spawn(Element::Fire, center);
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
         let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
         w.entities[pi].hunger = w.ecology.satiation[Element::Fire];
-        w.spawn(Element::Wood, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
 
         let log = InputLog::new();
         w.step(&log); // feeds immediately, resetting hunger to 0

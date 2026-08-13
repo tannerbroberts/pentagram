@@ -16,9 +16,115 @@
 //! roughly equal across races and no race reshapes the map faster than
 //! another, while the texture stays completely distinct.
 
-use crate::element::{Element, PerElement};
+use crate::element::Element;
 use crate::fx::Fx;
 use crate::hash::{Hashable, Hasher};
+
+/// Rooted vs. mobile. Every element splits into a Plant and an Animal race
+/// variant (`Race` below) — ten races total via this new axis, not a
+/// behavioural relabelling of the five existing races and not a re-topology
+/// of the ring (`element.rs`'s mod-5 arithmetic is completely `Kind`-unaware
+/// by design). Never renumber — hash/iteration-visible, same discipline as
+/// `rand::Channel` (rand.rs:16-17) and `Element`'s own ring order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+pub enum Kind {
+    Plant = 0,
+    Animal = 1,
+}
+
+impl Kind {
+    pub const COUNT: usize = 2;
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::Plant => "Plant",
+            Kind::Animal => "Animal",
+        }
+    }
+}
+
+/// A race is `(element, kind)` — the axis a body actually spawns as.
+/// Predation/suppression/attrition relations resolve off `element` alone,
+/// unchanged from before S3; race-attribute lookups (the table below,
+/// governors, demand) resolve off the full `(element, kind)` pair.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Race {
+    pub element: Element,
+    pub kind: Kind,
+}
+
+impl Race {
+    pub const COUNT: usize = Element::COUNT * Kind::COUNT;
+
+    /// Ring order primary, a race's two variants adjacent — mirrors why
+    /// `Element::ALL`'s ring order matters (Invariant IV). Index order is
+    /// hash/iteration-visible and therefore wire-format-grade: never
+    /// renumber.
+    pub const ALL: [Race; Race::COUNT] = [
+        Race { element: Element::Wood, kind: Kind::Plant },
+        Race { element: Element::Wood, kind: Kind::Animal },
+        Race { element: Element::Fire, kind: Kind::Plant },
+        Race { element: Element::Fire, kind: Kind::Animal },
+        Race { element: Element::Earth, kind: Kind::Plant },
+        Race { element: Element::Earth, kind: Kind::Animal },
+        Race { element: Element::Metal, kind: Kind::Plant },
+        Race { element: Element::Metal, kind: Kind::Animal },
+        Race { element: Element::Water, kind: Kind::Plant },
+        Race { element: Element::Water, kind: Kind::Animal },
+    ];
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self.element.index() * Kind::COUNT + self.kind as usize
+    }
+}
+
+/// A value per race. Mirrors [`crate::element::PerElement`] member for
+/// member — see that type's own doc comment. Kept as a distinct type (not `PerElement<[T;
+/// 2]>`) so *per-element* things (terrain layers, `TerrainTuning`) stay
+/// visibly distinct from *per-race* things (governors, demand, `RaceAttrs`
+/// itself) — that distinction is the entire point of the `Kind` axis.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PerRace<T>(pub [T; Race::COUNT]);
+
+impl<T> PerRace<T> {
+    #[inline]
+    pub fn get(&self, r: Race) -> &T {
+        &self.0[r.index()]
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, r: Race) -> &mut T {
+        &mut self.0[r.index()]
+    }
+
+    /// Always yields races in `Race::ALL`'s fixed order.
+    pub fn iter(&self) -> impl Iterator<Item = (Race, &T)> {
+        Race::ALL.into_iter().zip(self.0.iter())
+    }
+}
+
+impl<T: Copy> PerRace<T> {
+    pub fn filled(v: T) -> PerRace<T> {
+        PerRace([v; Race::COUNT])
+    }
+}
+
+impl<T> core::ops::Index<Race> for PerRace<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, r: Race) -> &T {
+        &self.0[r.index()]
+    }
+}
+
+impl<T> core::ops::IndexMut<Race> for PerRace<T> {
+    #[inline]
+    fn index_mut(&mut self, r: Race) -> &mut T {
+        &mut self.0[r.index()]
+    }
+}
 
 /// Sim ticks per second is 1 / 0.6, so a minute is 100 ticks.
 pub const TICKS_PER_MINUTE: u64 = 100;
@@ -223,6 +329,7 @@ pub enum Edge {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RaceAttrs {
     pub element: Element,
+    pub kind: Kind,
 
     /// Natural lifespan in sim ticks, before variance.
     pub lifespan: u64,
@@ -326,10 +433,38 @@ impl RaceAttrs {
 pub const MILLI: u64 = 1000;
 
 /// The table. Every number here is a knob, and every one is meant to be moved.
-pub const RACES: PerElement<RaceAttrs> = PerElement([
+///
+/// **S3.1 scaffold state**: every Plant row below is a *literal copy* of its
+/// element's Animal row — identical lifespan/speed/radius/deposit/consume/
+/// mixes, differing only in `kind` and the `fantasy` label. Plants are not
+/// yet rooted (`phase_movement` does not skip them) and predation is not yet
+/// kind-gated, so a Plant is, today, still exactly as mobile and exactly as
+/// eligible to be predator or prey as its Animal twin. That is deliberate:
+/// this stage's whole job is standing the `Kind` axis up end-to-end
+/// (table → entity → governors → terrain → input log) without changing any
+/// simulated behaviour yet. Real, distinct plant numbers (and the mechanics
+/// that make "plant" mean something — rooting, kind-gated predation) are
+/// S3.2's job; see `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §2, §4, §12.
+pub const RACES: PerRace<RaceAttrs> = PerRace([
     // ---------------------------------------------------------------- WOOD
     RaceAttrs {
         element: Element::Wood,
+        kind: Kind::Plant,
+        lifespan: TICKS_PER_HOUR * 5 / 2, // 2.5 hours
+        lifespan_variance: 180,
+        speed: Fx::ratio(9, 100),
+        radius: Fx::ratio(60, 100),
+        deposit_unit: 38_000,
+        deposit: RateBand::new(500, 1000, 2000, 6),
+        deposit_mix: ChannelMix::new(100, 200, 50, 250, 400),
+        consume_unit: 22_000,
+        consume: RateBand::new(300, 900, 1800, 6),
+        consume_mix: ChannelMix::new(50, 50, 100, 500, 300),
+        fantasy: "S3.1 scaffold — literal copy of Wood-Animal, not yet rooted. Real numbers land in S3.2.",
+    },
+    RaceAttrs {
+        element: Element::Wood,
+        kind: Kind::Animal,
         lifespan: TICKS_PER_HOUR * 5 / 2, // 2.5 hours
         lifespan_variance: 180,
         speed: Fx::ratio(9, 100),
@@ -347,6 +482,22 @@ pub const RACES: PerElement<RaceAttrs> = PerElement([
     // ---------------------------------------------------------------- FIRE
     RaceAttrs {
         element: Element::Fire,
+        kind: Kind::Plant,
+        lifespan: TICKS_PER_MINUTE * 8, // 8 minutes
+        lifespan_variance: 300,
+        speed: Fx::ratio(46, 100),
+        radius: Fx::ratio(40, 100),
+        deposit_unit: 2_100,
+        deposit: RateBand::new(200, 1000, 6000, 20),
+        deposit_mix: ChannelMix::new(150, 700, 100, 50, 0),
+        consume_unit: 4_400,
+        consume: RateBand::new(150, 1100, 7000, 20),
+        consume_mix: ChannelMix::new(0, 100, 400, 500, 0),
+        fantasy: "S3.1 scaffold — literal copy of Fire-Animal, not yet rooted. Real numbers land in S3.2.",
+    },
+    RaceAttrs {
+        element: Element::Fire,
+        kind: Kind::Animal,
         lifespan: TICKS_PER_MINUTE * 8, // 8 minutes
         lifespan_variance: 300,
         speed: Fx::ratio(46, 100),
@@ -365,6 +516,22 @@ pub const RACES: PerElement<RaceAttrs> = PerElement([
     // --------------------------------------------------------------- EARTH
     RaceAttrs {
         element: Element::Earth,
+        kind: Kind::Plant,
+        lifespan: TICKS_PER_DAY * 14, // a fortnight
+        lifespan_variance: 120,
+        speed: Fx::ratio(4, 100),
+        radius: Fx::ratio(150, 100),
+        deposit_unit: 5_100_000,
+        deposit: RateBand::new(800, 1000, 1400, 2),
+        deposit_mix: ChannelMix::new(50, 50, 50, 100, 750),
+        consume_unit: 2_400_000,
+        consume: RateBand::new(600, 850, 1200, 2),
+        consume_mix: ChannelMix::new(0, 50, 50, 200, 700),
+        fantasy: "S3.1 scaffold — literal copy of Earth-Animal, not yet rooted. Real numbers land in S3.2.",
+    },
+    RaceAttrs {
+        element: Element::Earth,
+        kind: Kind::Animal,
         lifespan: TICKS_PER_DAY * 14, // a fortnight
         lifespan_variance: 120,
         speed: Fx::ratio(4, 100),
@@ -383,6 +550,22 @@ pub const RACES: PerElement<RaceAttrs> = PerElement([
     // --------------------------------------------------------------- METAL
     RaceAttrs {
         element: Element::Metal,
+        kind: Kind::Plant,
+        lifespan: TICKS_PER_HOUR * 12,
+        lifespan_variance: 90,
+        speed: Fx::ratio(21, 100),
+        radius: Fx::ratio(55, 100),
+        deposit_unit: 182_000,
+        deposit: RateBand::new(250, 1000, 2500, 12),
+        deposit_mix: ChannelMix::new(200, 150, 250, 400, 0),
+        consume_unit: 96_000,
+        consume: RateBand::new(200, 950, 2400, 12),
+        consume_mix: ChannelMix::new(100, 50, 250, 600, 0),
+        fantasy: "S3.1 scaffold — literal copy of Metal-Animal, not yet rooted. Real numbers land in S3.2.",
+    },
+    RaceAttrs {
+        element: Element::Metal,
+        kind: Kind::Animal,
         lifespan: TICKS_PER_HOUR * 12,
         lifespan_variance: 90,
         speed: Fx::ratio(21, 100),
@@ -400,6 +583,22 @@ pub const RACES: PerElement<RaceAttrs> = PerElement([
     // --------------------------------------------------------------- WATER
     RaceAttrs {
         element: Element::Water,
+        kind: Kind::Plant,
+        lifespan: TICKS_PER_MINUTE * 35,
+        lifespan_variance: 220,
+        speed: Fx::ratio(33, 100),
+        radius: Fx::ratio(50, 100),
+        deposit_unit: 8_900,
+        deposit: RateBand::new(300, 1000, 3000, 10),
+        deposit_mix: ChannelMix::new(50, 250, 500, 150, 50),
+        consume_unit: 12_000,
+        consume: RateBand::new(250, 1000, 3200, 10),
+        consume_mix: ChannelMix::new(0, 100, 550, 300, 50),
+        fantasy: "S3.1 scaffold — literal copy of Water-Animal, not yet rooted. Real numbers land in S3.2.",
+    },
+    RaceAttrs {
+        element: Element::Water,
+        kind: Kind::Animal,
         lifespan: TICKS_PER_MINUTE * 35,
         lifespan_variance: 220,
         speed: Fx::ratio(33, 100),
@@ -418,8 +617,8 @@ pub const RACES: PerElement<RaceAttrs> = PerElement([
 
 /// The shipped table — the starting point every `World` is tuned away from.
 #[inline]
-pub fn attrs(e: Element) -> &'static RaceAttrs {
-    &RACES.0[e.index()]
+pub fn attrs(r: Race) -> &'static RaceAttrs {
+    &RACES.0[r.index()]
 }
 
 // The tuning table is part of simulation state the moment it becomes runtime
@@ -446,6 +645,7 @@ impl Hashable for ChannelMix {
 impl Hashable for RaceAttrs {
     fn hash_into(&self, h: &mut Hasher) {
         h.u8(self.element as u8)
+            .u8(self.kind as u8)
             .u64(self.lifespan)
             .u16(self.lifespan_variance)
             .i32(self.speed.raw())
@@ -459,25 +659,40 @@ impl Hashable for RaceAttrs {
     }
 }
 
+/// The one specific race every narrative test below reaches for when it
+/// needs "the" row for an element rather than every row — S3.1 ships Plant
+/// rows as literal copies of their Animal twin (see `RACES`'s own doc
+/// comment), so picking a `Kind` here does not change what any of these
+/// tests observe; `Kind::Animal` is chosen as the closest continuation of
+/// what these tests asserted before the `Kind` axis existed. Re-deciding
+/// these per-`Kind` (distinct plant numbers, `every_plant_is_existence_
+/// dominant`, etc.) is explicitly S3.2's job — see
+/// `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §10, §12.
+#[cfg(test)]
+fn animal(e: Element) -> Race {
+    Race { element: e, kind: Kind::Animal }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn every_race_is_internally_consistent() {
-        for e in Element::ALL {
-            let a = attrs(e);
-            assert_eq!(a.element, e, "table row is filed under the wrong element");
-            assert!(a.is_valid(), "{} has an invalid attribute set", e.name());
+        for race in Race::ALL {
+            let a = attrs(race);
+            assert_eq!(a.element, race.element, "table row is filed under the wrong element");
+            assert_eq!(a.kind, race.kind, "table row is filed under the wrong kind");
+            assert!(a.is_valid(), "{}-{} has an invalid attribute set", race.element.name(), race.kind.name());
         }
     }
 
     #[test]
     fn every_mix_sums_to_one_thousand() {
-        for e in Element::ALL {
-            let a = attrs(e);
-            assert_eq!(a.deposit_mix.total(), 1000, "{} deposit mix", e.name());
-            assert_eq!(a.consume_mix.total(), 1000, "{} consume mix", e.name());
+        for race in Race::ALL {
+            let a = attrs(race);
+            assert_eq!(a.deposit_mix.total(), 1000, "{}-{} deposit mix", race.element.name(), race.kind.name());
+            assert_eq!(a.consume_mix.total(), 1000, "{}-{} consume mix", race.element.name(), race.kind.name());
         }
     }
 
@@ -485,17 +700,17 @@ mod tests {
     fn every_band_has_a_nonzero_floor() {
         // The churn guarantee. A race with a zero floor can leave a region
         // frozen, which is how a dead server happens.
-        for e in Element::ALL {
-            let a = attrs(e);
-            assert!(a.deposit.floor > 0, "{} deposit floor is zero", e.name());
-            assert!(a.consume.floor > 0, "{} consume floor is zero", e.name());
+        for race in Race::ALL {
+            let a = attrs(race);
+            assert!(a.deposit.floor > 0, "{}-{} deposit floor is zero", race.element.name(), race.kind.name());
+            assert!(a.consume.floor > 0, "{}-{} consume floor is zero", race.element.name(), race.kind.name());
         }
     }
 
     #[test]
     fn lifespans_span_the_intended_three_orders_of_magnitude() {
-        let fire = attrs(Element::Fire).lifespan;
-        let earth = attrs(Element::Earth).lifespan;
+        let fire = attrs(animal(Element::Fire)).lifespan;
+        let earth = attrs(animal(Element::Earth)).lifespan;
         assert!(earth / fire > 2000, "ratio is only {}", earth / fire);
     }
 
@@ -510,7 +725,7 @@ mod tests {
         ];
         for w in order.windows(2) {
             assert!(
-                attrs(w[0]).lifespan < attrs(w[1]).lifespan,
+                attrs(animal(w[0])).lifespan < attrs(animal(w[1])).lifespan,
                 "{} should be shorter-lived than {}",
                 w[0].name(),
                 w[1].name()
@@ -521,8 +736,12 @@ mod tests {
     #[test]
     fn terraform_pressure_is_within_parity_band() {
         // §3.1: deposit_unit / lifespan roughly equal across races, so no race
-        // reshapes the map faster than another. Allow a 2x spread.
-        let ps: Vec<u64> = Element::ALL.iter().map(|e| attrs(*e).terraform_pressure()).collect();
+        // reshapes the map faster than another. Allow a 2x spread. Looped
+        // over every race (not just every element): S3.1's Plant rows are
+        // literal copies of their Animal twin, so this trivially still
+        // holds — the point is the loop is now mechanically over
+        // `Race::ALL`, not that the numbers changed.
+        let ps: Vec<u64> = Race::ALL.iter().map(|r| attrs(*r).terraform_pressure()).collect();
         let lo = *ps.iter().min().unwrap();
         let hi = *ps.iter().max().unwrap();
         assert!(lo > 0, "a race has zero terraform pressure");
@@ -537,7 +756,7 @@ mod tests {
     #[test]
     fn channel_dominance_matches_the_stated_fantasy() {
         let dominant = |e: Element| -> Channel {
-            let a = attrs(e);
+            let a = attrs(animal(e));
             *Channel::ALL
                 .iter()
                 .max_by_key(|c| a.deposit_mix.permille(**c))
@@ -553,19 +772,19 @@ mod tests {
 
     #[test]
     fn fire_leaves_nothing_by_merely_existing() {
-        assert_eq!(attrs(Element::Fire).deposit_mix.permille(Channel::OnExistence), 0);
-        assert_eq!(attrs(Element::Metal).deposit_mix.permille(Channel::OnExistence), 0);
+        assert_eq!(attrs(animal(Element::Fire)).deposit_mix.permille(Channel::OnExistence), 0);
+        assert_eq!(attrs(animal(Element::Metal)).deposit_mix.permille(Channel::OnExistence), 0);
     }
 
     #[test]
     fn a_rebalanced_mix_always_sums_to_one_thousand() {
         // Every reachable keystroke on the mix knobs, on every shipped row.
-        for e in Element::ALL {
+        for race in Race::ALL {
             for c in Channel::ALL {
                 for v in [0u16, 1, 37, 250, 499, 500, 999, 1000, 5000] {
-                    let mut m = attrs(e).deposit_mix;
+                    let mut m = attrs(race).deposit_mix;
                     m.set_rebalanced(c, v);
-                    assert_eq!(m.total(), 1000, "{} {} → {}: {:?}", e.name(), c.name(), v, m);
+                    assert_eq!(m.total(), 1000, "{}-{} {} → {}: {:?}", race.element.name(), race.kind.name(), c.name(), v, m);
                     assert_eq!(m.permille(c), v.min(1000));
                 }
             }
@@ -586,12 +805,12 @@ mod tests {
 
     #[test]
     fn a_band_edge_edit_never_inverts_the_band() {
-        for e in Element::ALL {
+        for race in Race::ALL {
             for edge in [Edge::Floor, Edge::Nominal, Edge::Ceiling] {
                 for v in [0u32, 1, 500, 1000, 6000, 100_000] {
-                    let mut b = attrs(e).deposit;
+                    let mut b = attrs(race).deposit;
                     b.set_edge(edge, v);
-                    assert!(b.is_valid(), "{} {:?}={} → {:?}", e.name(), edge, v, b);
+                    assert!(b.is_valid(), "{}-{} {:?}={} → {:?}", race.element.name(), race.kind.name(), edge, v, b);
                 }
             }
         }
@@ -599,10 +818,10 @@ mod tests {
 
     #[test]
     fn share_never_exceeds_the_unit() {
-        for e in Element::ALL {
-            let a = attrs(e);
+        for race in Race::ALL {
+            let a = attrs(race);
             let total: u64 = Channel::ALL.iter().map(|c| a.deposit_mix.share(*c, 10_000)).sum();
-            assert!(total <= 10_000, "{} over-distributes: {}", e.name(), total);
+            assert!(total <= 10_000, "{}-{} over-distributes: {}", race.element.name(), race.kind.name(), total);
         }
     }
 
@@ -613,10 +832,11 @@ mod tests {
     // file silently — see `Entity`'s sibling test (`src/entity.rs`) and
     // `EcologyTuning`'s (`src/ecology.rs`). `fantasy` is deliberately
     // excluded: it's a human-readable label, not simulation state, and
-    // `hash_into` never reads it.
+    // `hash_into` never reads it. S3.1 extends this with a `kind` variant
+    // rather than writing a new test, per the established pattern.
     #[test]
     fn hash_notices_every_field() {
-        let base = *attrs(Element::Fire);
+        let base = *attrs(animal(Element::Fire));
         let hash_of = |a: &RaceAttrs| {
             let mut h = Hasher::new();
             a.hash_into(&mut h);
@@ -626,6 +846,8 @@ mod tests {
 
         let mut element = base;
         element.element = Element::Water;
+        let mut kind = base;
+        kind.kind = Kind::Plant;
         let mut lifespan = base;
         lifespan.lifespan += 1;
         let mut lifespan_variance = base;
@@ -651,6 +873,7 @@ mod tests {
 
         for (name, variant) in [
             ("element", element),
+            ("kind", kind),
             ("lifespan", lifespan),
             ("lifespan_variance", lifespan_variance),
             ("speed", speed),

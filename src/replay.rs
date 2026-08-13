@@ -8,6 +8,7 @@
 use crate::element::Element;
 use crate::fx::{Fx, V2};
 use crate::input::{CmdKind, Command, InputLog};
+use crate::race::Kind;
 use crate::rand::{rand_below, rand_signed, Channel};
 use crate::world::World;
 
@@ -102,7 +103,11 @@ pub fn scripted_log(seed: u64, ticks: u64, live_ids: u32) -> InputLog {
                 },
             });
         }
-        // Occasional incarnation.
+        // Occasional incarnation. Kind is hardcoded to Animal here — the
+        // same "closest honest default" S3.1 uses elsewhere (v1 log compat,
+        // the chaos TUI's compile fix) rather than a design claim that
+        // scripted logs should exercise Plant spawns; that is a later
+        // stage's job.
         if rand_below(seed, t, 4, Channel::SpawnPlacement, 40) == 0 {
             let e = Element::from_index(rand_below(seed, t, 5, Channel::SpawnPlacement, 5) as usize);
             log.push(Command {
@@ -110,6 +115,7 @@ pub fn scripted_log(seed: u64, ticks: u64, live_ids: u32) -> InputLog {
                 entity: 0,
                 kind: CmdKind::Spawn {
                     element: e,
+                    kind: Kind::Animal,
                     at: V2::new(
                         Fx::from_int(rand_below(seed, t, 6, Channel::SpawnPlacement, 60) as i32),
                         Fx::from_int(rand_below(seed, t, 7, Channel::SpawnPlacement, 60) as i32),

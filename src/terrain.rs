@@ -48,6 +48,7 @@ use crate::entity::Entity;
 use crate::fx::V2;
 use crate::governor::Grant;
 use crate::hash::{Hashable, Hasher};
+use crate::race::{PerRace, Race};
 use crate::rand::{rand_below, Channel};
 
 /// Element colours. The same five constants `chaos/view.rs::RGB` defines —
@@ -197,27 +198,31 @@ impl Hashable for Terrain {
 // currently occupy.
 // ------------------------------------------------------------------
 
-/// One terrain tick's occupancy: for each element, which cells its living
+/// One terrain tick's occupancy: for each race, which cells its living
 /// bodies are in and how many. Built once per terrain tick and shared by
-/// both the deposit and the consume operator.
+/// both the deposit and the consume operator. Race-shaped, not
+/// element-shaped: a Wood-Plant and a Wood-Animal both write the Wood
+/// terrain layer, but each accrues its own governor demand and must be
+/// apportioned separately (see `apply_deposit`/`apply_consume` below).
 ///
 /// `BTreeMap` rather than a hash map — same reason `entity.rs`'s own tests
 /// reach for `BTreeSet`: Invariant IV requires a defined iteration order,
 /// and a sorted-by-cell-index map gives one for free.
 pub struct Occupancy {
-    weight: PerElement<BTreeMap<u32, u32>>,
+    weight: PerRace<BTreeMap<u32, u32>>,
 }
 
 impl Occupancy {
     pub fn build(entities: &[Entity], terrain: &Terrain) -> Occupancy {
-        let mut weight: PerElement<BTreeMap<u32, u32>> = PerElement::default();
+        let mut weight: PerRace<BTreeMap<u32, u32>> = PerRace::default();
         for e in entities {
             if !e.alive {
                 continue;
             }
             let (x, y) = terrain.cell_of(e.pos);
             let idx = terrain.index(x, y) as u32;
-            *weight.get_mut(e.element).entry(idx).or_insert(0) += 1;
+            let race = e.race();
+            *weight.get_mut(race).entry(idx).or_insert(0) += 1;
         }
         Occupancy { weight }
     }
@@ -237,22 +242,30 @@ fn apportion(
     seed: u64,
     terrain_tick: u64,
     add: bool,
+    race: Race,
 ) {
     if total == 0 {
         return;
     }
     let total_weight: u64 = weight.values().map(|w| *w as u64).sum();
     let mut amounts: BTreeMap<u32, u64> = BTreeMap::new();
-    // Distinguishes which element/channel this apportionment call is for, so
+    // Distinguishes which race/channel this apportionment call is for, so
     // two independent calls in the same terrain tick — e.g. two different
     // extinct races both hitting the uniform fallback below — don't draw the
     // exact same rotation offset or tie-break order and pile their floor
-    // emission onto the same handful of cells together. `apply_deposit`
-    // covers all five elements with `add == true`; `apply_consume` covers
-    // all five (permuted through `eats()`) with `add == false`; the two
-    // never collide on the same (target, add) pair, so this salt is unique
-    // per call within a tick.
-    let salt = (target.index() as u32) * 2 + u32::from(!add);
+    // emission onto the same handful of cells together.
+    //
+    // **Race-unique, not target-unique.** Salted on `race`, not `target`
+    // (the terrain layer being written) — deliberately, and required for
+    // correctness. Two different races can target the very same element
+    // layer with the same `add` flag: a Wood-Plant and a Wood-Animal both
+    // deposit (`add == true`) into the Wood layer. `Race::index()` is
+    // unique per race regardless of what element layer it maps to, so
+    // salting on it keeps every (race, add) pair's fallback rotation and
+    // tie-break order independent — see
+    // `apportion_decorrelates_two_races_sharing_the_same_element_layer`
+    // below and `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §3.
+    let salt = (race.index() as u32) * 2 + u32::from(!add);
 
     if total_weight == 0 {
         // Extinct-race (or off-grid) fallback: spread uniformly across the
@@ -316,49 +329,53 @@ fn apportion(
     }
 }
 
-/// Operator 1. Each race's already-settled `last_deposit[e].granted` becomes
-/// per-cell increments to element `e` itself, at the cells that race's
-/// living bodies currently occupy.
+/// Operator 1. Each race's already-settled `last_deposit[r].granted` becomes
+/// per-cell increments to its own element (`r.element`), at the cells that
+/// race's living bodies currently occupy. Terrain itself stays 5-wide — a
+/// Wood-Plant and a Wood-Animal both write the Wood layer, apportioned
+/// independently (see `apportion`'s race-unique salt).
 pub fn apply_deposit(
     terrain: &mut Terrain,
     occ: &Occupancy,
-    last_deposit: &PerElement<Grant>,
+    last_deposit: &PerRace<Grant>,
     seed: u64,
     terrain_tick: u64,
 ) {
-    for e in Element::ALL {
+    for r in Race::ALL {
         apportion(
             terrain,
-            e,
-            last_deposit[e].granted,
-            &occ.weight[e],
+            r.element,
+            last_deposit[r].granted,
+            &occ.weight[r],
             seed,
             terrain_tick,
             true,
+            r,
         );
     }
 }
 
-/// Operator 2. Each race's `last_consume[e].granted` becomes per-cell
-/// decrements to `e.eats()` — the ring, read backward — at the same cells
-/// operator 1 used (a Fire body's consumption burns down the Wood layer
-/// under it, not the Fire layer).
+/// Operator 2. Each race's `last_consume[r].granted` becomes per-cell
+/// decrements to `r.element.eats()` — the ring, read backward — at the same
+/// cells operator 1 used (a Fire body's consumption burns down the Wood
+/// layer under it, not the Fire layer).
 pub fn apply_consume(
     terrain: &mut Terrain,
     occ: &Occupancy,
-    last_consume: &PerElement<Grant>,
+    last_consume: &PerRace<Grant>,
     seed: u64,
     terrain_tick: u64,
 ) {
-    for e in Element::ALL {
+    for r in Race::ALL {
         apportion(
             terrain,
-            e.eats(),
-            last_consume[e].granted,
-            &occ.weight[e],
+            r.element.eats(),
+            last_consume[r].granted,
+            &occ.weight[r],
             seed,
             terrain_tick,
             false,
+            r,
         );
     }
 }
@@ -542,9 +559,14 @@ pub fn render_ppm(terrain: &Terrain) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::race::Kind;
 
     fn grant(granted: u64) -> Grant {
         Grant { granted, forced: 0, clipped: 0 }
+    }
+
+    fn animal(e: Element) -> Race {
+        Race { element: e, kind: Kind::Animal }
     }
 
     #[test]
@@ -573,7 +595,7 @@ mod tests {
         weight.insert(t.index(2, 0) as u32, 1);
         for total in [0u64, 1, 7, 100, 9_999] {
             let mut tt = Terrain::new(8);
-            apportion(&mut tt, Element::Fire, total, &weight, 0xABC, 1, true);
+            apportion(&mut tt, Element::Fire, total, &weight, 0xABC, 1, true, animal(Element::Fire));
             assert_eq!(tt.total(Element::Fire), total, "total={total}");
         }
     }
@@ -583,7 +605,7 @@ mod tests {
         let empty = BTreeMap::new();
         for total in [0u64, 1, 5, 1_000, 50_000] {
             let mut tt = Terrain::new(6);
-            apportion(&mut tt, Element::Water, total, &empty, 0xDEF, 42, true);
+            apportion(&mut tt, Element::Water, total, &empty, 0xDEF, 42, true, animal(Element::Water));
             assert_eq!(tt.total(Element::Water), total, "total={total}");
         }
     }
@@ -596,7 +618,7 @@ mod tests {
         let mut winners = std::collections::BTreeSet::new();
         for tick in 0..20u64 {
             let mut t = Terrain::new(5); // 25 cells, so total=26 leaves a remainder of 1
-            apportion(&mut t, Element::Earth, 26, &empty, 0x1234, tick, true);
+            apportion(&mut t, Element::Earth, 26, &empty, 0x1234, tick, true, animal(Element::Earth));
             for y in 0..5 {
                 for x in 0..5 {
                     if t.cell(x, y)[Element::Earth] == 2 {
@@ -609,6 +631,39 @@ mod tests {
     }
 
     #[test]
+    fn apportion_decorrelates_two_races_sharing_the_same_element_layer() {
+        // Regression, §3 of the design doc: before the salt widened from
+        // `target.index()*2 + !add` to `race.index()*2 + !add`, two
+        // different races both depositing (`add == true`) into the very
+        // same element layer — Wood-Plant and Wood-Animal both write Wood —
+        // would draw the identical fallback rotation offset off the old
+        // target-only salt, silently correlating their apportionment noise
+        // instead of decorrelating it. This case did not exist before S3.1
+        // (`Occupancy` was Element-shaped, one race per element); now that
+        // two races can share a target, the salt must be race-unique, not
+        // just target-unique.
+        let empty = BTreeMap::new();
+        let mut winners = std::collections::BTreeSet::new();
+        for kind in [Kind::Plant, Kind::Animal] {
+            let race = Race { element: Element::Wood, kind };
+            let mut t = Terrain::new(5); // 25 cells; total=26 leaves a remainder of 1
+            apportion(&mut t, Element::Wood, 26, &empty, 0x1234, 7, true, race);
+            for y in 0..5 {
+                for x in 0..5 {
+                    if t.cell(x, y)[Element::Wood] == 2 {
+                        winners.insert((x, y));
+                    }
+                }
+            }
+        }
+        assert!(
+            winners.len() > 1,
+            "two races sharing the same element layer drew the identical fallback pattern: {:?}",
+            winners
+        );
+    }
+
+    #[test]
     fn apply_deposit_writes_the_races_own_element_at_occupied_cells() {
         let mut t = Terrain::new(4);
         let entities = vec![Entity::spawn(
@@ -617,11 +672,11 @@ mod tests {
             V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
             0,
             0,
-            crate::race::attrs(Element::Fire),
+            crate::race::attrs(animal(Element::Fire)),
         )];
         let occ = Occupancy::build(&entities, &t);
-        let mut granted = PerElement::filled(grant(0));
-        granted[Element::Fire] = grant(100);
+        let mut granted = PerRace::filled(grant(0));
+        granted[animal(Element::Fire)] = grant(100);
         apply_deposit(&mut t, &occ, &granted, 1, 1);
         assert_eq!(t.total(Element::Fire), 100);
         for e in Element::ALL {
@@ -641,11 +696,11 @@ mod tests {
             V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
             0,
             0,
-            crate::race::attrs(Element::Fire),
+            crate::race::attrs(animal(Element::Fire)),
         )];
         let occ = Occupancy::build(&entities, &t);
-        let mut granted = PerElement::filled(grant(0));
-        granted[Element::Fire] = grant(100);
+        let mut granted = PerRace::filled(grant(0));
+        granted[animal(Element::Fire)] = grant(100);
         apply_consume(&mut t, &occ, &granted, 1, 1);
         assert_eq!(t.cell(1, 1)[Element::Wood], 900, "Fire eats Wood");
         assert_eq!(t.cell(1, 1)[Element::Fire], 0, "consume must not touch Fire's own layer");
@@ -772,12 +827,12 @@ mod tests {
         // (seed, tick, id=0) coordinate regardless of which element or
         // direction (deposit/consume) was being apportioned, so an
         // all-extinct tick piled every element's floor onto the identical
-        // cell. The salt (target, add) must break that correlation.
+        // cell. The salt (race, add) must break that correlation.
         let empty = BTreeMap::new();
         let mut winners = std::collections::BTreeSet::new();
         for e in Element::ALL {
             let mut t = Terrain::new(5); // 25 cells; total=26 leaves a remainder of 1
-            apportion(&mut t, e, 26, &empty, 0x1234, 7, true);
+            apportion(&mut t, e, 26, &empty, 0x1234, 7, true, animal(e));
             for y in 0..5 {
                 for x in 0..5 {
                     if t.cell(x, y)[e] == 2 {
@@ -797,14 +852,14 @@ mod tests {
     fn apportion_decorrelates_deposit_from_consume_for_the_same_element() {
         let empty = BTreeMap::new();
         let mut t_add = Terrain::new(5);
-        apportion(&mut t_add, Element::Fire, 26, &empty, 0x1234, 7, true);
+        apportion(&mut t_add, Element::Fire, 26, &empty, 0x1234, 7, true, animal(Element::Fire));
         let mut t_sub = Terrain::new(5);
         for y in 0..5 {
             for x in 0..5 {
                 t_sub.cell_mut(x, y)[Element::Fire] = u16::MAX; // headroom so saturating_sub doesn't mask the result
             }
         }
-        apportion(&mut t_sub, Element::Fire, 26, &empty, 0x1234, 7, false);
+        apportion(&mut t_sub, Element::Fire, 26, &empty, 0x1234, 7, false, animal(Element::Fire));
 
         let winner = |t: &Terrain, target_amount: u16| {
             let mut found = None;

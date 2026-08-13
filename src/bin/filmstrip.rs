@@ -17,7 +17,7 @@ fn main() {
 
     std::fs::create_dir_all(&outdir).expect("create outdir");
 
-    let log = scripted_log(seed, ticks, per_race * 5);
+    let log = scripted_log(seed, ticks, per_race * 10);
     let mut w = build(seed, size, per_race);
 
     let mut manifest = format!("seed={seed:#x} size={size} cadence={cadence}\n");

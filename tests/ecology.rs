@@ -15,7 +15,7 @@ use pentagram::ecology::EcologyTuning;
 use pentagram::element::{Element, PerElement};
 use pentagram::fx::{Fx, V2};
 use pentagram::input::InputLog;
-use pentagram::race::attrs;
+use pentagram::race::{attrs, Kind, Race};
 use pentagram::replay::{build, record, scripted_log, verify};
 use pentagram::world::World;
 
@@ -53,7 +53,7 @@ fn feeding_starvation_and_reproduction_all_occur_under_the_shipped_table() {
 #[test]
 fn ten_thousand_ticks_replay_bit_identically_with_ecology_active() {
     let ticks = 10_000;
-    let log = scripted_log(0x5EED, ticks, PER_RACE * 5);
+    let log = scripted_log(0x5EED, ticks, PER_RACE * 10);
     let trace = record(SEED, SIZE, PER_RACE, &log, ticks);
     assert_eq!(trace.ticks(), ticks as usize);
     if let Err(d) = verify(&trace, &log) {
@@ -67,7 +67,7 @@ fn ten_thousand_ticks_replay_bit_identically_with_ecology_active() {
 #[test]
 fn a_retuned_ecology_changes_the_run() {
     let ticks = 2_000u64;
-    let log = scripted_log(0x9, ticks, PER_RACE * 5);
+    let log = scripted_log(0x9, ticks, PER_RACE * 10);
 
     let a = build(SEED, SIZE, PER_RACE);
     let mut b = a.clone();
@@ -104,7 +104,7 @@ fn a_retuned_ecology_changes_the_run() {
 /// of old age.
 #[test]
 fn reproduction_sustains_fire_past_its_own_maximum_lifespan() {
-    let fire = attrs(Element::Fire);
+    let fire = attrs(Race { element: Element::Fire, kind: Kind::Animal });
     let max_lifespan = fire.lifespan * (1000 + fire.lifespan_variance as u64) / 1000;
     let ticks = max_lifespan + max_lifespan / 2; // a further 50% margin past the ceiling.
 
@@ -122,11 +122,11 @@ fn reproduction_sustains_fire_past_its_own_maximum_lifespan() {
     let fire_seed = 40u32;
     for k in 0..fire_seed {
         let p = V2::new(Fx::from_int((k * 7 % 60) as i32), Fx::from_int((k * 13 % 60) as i32));
-        w.spawn(Element::Fire, p);
+        w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, p);
     }
     for k in 0..400u32 {
         let p = V2::new(Fx::from_int((k * 3 % 60) as i32), Fx::from_int((k * 11 % 60) as i32));
-        w.spawn(Element::Wood, p);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, p);
     }
 
     let log = InputLog::new();

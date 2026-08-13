@@ -8,8 +8,7 @@
 // crate-wide lint is what made this exception visible, which is the point.
 #![allow(clippy::float_arithmetic)]
 
-use pentagram::element::Element;
-use pentagram::race::{attrs, TERRAIN_PERIOD};
+use pentagram::race::{attrs, Race, TERRAIN_PERIOD};
 use pentagram::replay::{build, scripted_log};
 
 fn main() {
@@ -17,7 +16,7 @@ fn main() {
     let ticks: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60_000);
     let per_race: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
 
-    let log = scripted_log(0x50AC, ticks, per_race * 5);
+    let log = scripted_log(0x50AC, ticks, per_race * 10);
     let mut w = build(0xBEEF, 96, per_race);
 
     let start = std::time::Instant::now();
@@ -39,19 +38,23 @@ fn main() {
     );
 
     println!(
-        "\n{:<7} {:>5} {:>9} {:>9} {:>9} {:>8} {:>9}",
+        "\n{:<14} {:>5} {:>9} {:>9} {:>9} {:>8} {:>9}",
         "race", "alive", "granted", "floor", "ceiling", "forced", "clipped"
     );
-    println!("{}", "-".repeat(62));
+    println!("{}", "-".repeat(70));
 
+    // `population()` aggregates by element across both kinds — S3.1 has no
+    // per-kind population split yet — so the alive count printed here is
+    // shared between a race's Plant and Animal row.
     let pop = w.population();
-    for e in Element::ALL {
-        let b = attrs(e).deposit;
-        let g = w.last_deposit[e];
+    for race in Race::ALL {
+        let b = attrs(race).deposit;
+        let g = w.last_deposit[race];
         println!(
-            "{:<7} {:>5} {:>9} {:>9} {:>9} {:>8} {:>9}",
-            e.name(),
-            pop[e],
+            "{:<7}-{:<6} {:>5} {:>9} {:>9} {:>9} {:>8} {:>9}",
+            race.element.name(),
+            race.kind.name(),
+            pop[race.element],
             g.granted,
             b.floor,
             b.ceiling,
@@ -61,11 +64,12 @@ fn main() {
     }
 
     println!("\nlifespan / turnover");
-    for e in Element::ALL {
-        let a = attrs(e);
+    for race in Race::ALL {
+        let a = attrs(race);
         println!(
-            "  {:<6} {:>9} ticks  ({:>6} sim-min)   pressure {:>5}",
-            e.name(),
+            "  {:<6}-{:<6} {:>9} ticks  ({:>6} sim-min)   pressure {:>5}",
+            race.element.name(),
+            race.kind.name(),
             a.lifespan,
             a.lifespan / TERRAIN_PERIOD,
             a.terraform_pressure()

@@ -19,7 +19,7 @@ fn main() {
     println!("  territory {SIZE}×{SIZE} cells");
     println!("  seeded    {PER_RACE} per race\n");
 
-    let log = scripted_log(0x5EED, ticks, PER_RACE * 5);
+    let log = scripted_log(0x5EED, ticks, PER_RACE * 10);
     println!("input log: {} commands", log.len());
 
     // 1 — the log must survive the trip it will make between territories.

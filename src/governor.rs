@@ -118,7 +118,7 @@ impl Hashable for Grant {
 mod tests {
     use super::*;
     use crate::element::Element;
-    use crate::race::attrs;
+    use crate::race::{attrs, Kind, Race};
 
     fn band() -> RateBand {
         RateBand::new(100, 1000, 5000, 10)
@@ -234,27 +234,31 @@ mod tests {
     #[test]
     fn every_shipped_race_band_survives_the_hostile_pattern() {
         use crate::rand::{rand_below, Channel};
-        for e in Element::ALL {
-            let a = attrs(e);
-            for (label, b) in [("deposit", a.deposit), ("consume", a.consume)] {
-                let mut g = Governor::new(b);
-                for t in 0..5_000u64 {
-                    let demand = if rand_below(1, t, e.index() as u32, Channel::Governor, 3) == 0 {
-                        0
-                    } else {
-                        u64::from(u32::MAX)
-                    };
-                    let grant = g.settle(demand);
-                    assert!(
-                        grant.granted >= b.floor as u64 && grant.granted <= b.ceiling as u64,
-                        "{} {} tick {}: {} outside [{}, {}]",
-                        e.name(),
-                        label,
-                        t,
-                        grant.granted,
-                        b.floor,
-                        b.ceiling
-                    );
+        for kind in [Kind::Plant, Kind::Animal] {
+            for e in Element::ALL {
+                let race = Race { element: e, kind };
+                let a = attrs(race);
+                for (label, b) in [("deposit", a.deposit), ("consume", a.consume)] {
+                    let mut g = Governor::new(b);
+                    for t in 0..5_000u64 {
+                        let demand = if rand_below(1, t, race.index() as u32, Channel::Governor, 3) == 0 {
+                            0
+                        } else {
+                            u64::from(u32::MAX)
+                        };
+                        let grant = g.settle(demand);
+                        assert!(
+                            grant.granted >= b.floor as u64 && grant.granted <= b.ceiling as u64,
+                            "{}-{} {} tick {}: {} outside [{}, {}]",
+                            e.name(),
+                            kind.name(),
+                            label,
+                            t,
+                            grant.granted,
+                            b.floor,
+                            b.ceiling
+                        );
+                    }
                 }
             }
         }

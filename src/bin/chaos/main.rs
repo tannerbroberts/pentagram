@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use pentagram::element::Element;
 use pentagram::fx::{Fx, V2};
 use pentagram::input::{CmdKind, Command, InputLog};
-use pentagram::race::{RACES, TERRAIN_PERIOD};
+use pentagram::race::{Kind, Race, RACES, TERRAIN_PERIOD};
 use pentagram::rand::{rand_below, rand_signed, Channel};
 use pentagram::world::World;
 
@@ -256,6 +256,10 @@ fn handle(
 ) -> bool {
     let knobs = v.knobs();
     let e = v.element();
+    // S3.1 compile fix (§11 of the design doc): the view's cursor is still
+    // Element-scoped (five columns) — Kind is hardcoded to Animal here until
+    // S3.6 adds the real two-axis Kind toggle.
+    let race = Race { element: e, kind: Kind::Animal };
 
     match k {
         Key::Char('q') | Key::Char('\x03') | Key::Esc => return true,
@@ -266,19 +270,19 @@ fn handle(
         Key::Right | Key::Char('l') => v.col = (v.col + 1) % Element::COUNT,
 
         Key::Char('-') | Key::Char('_') => {
-            knobs[v.row].nudge(t, e, false, false);
+            knobs[v.row].nudge(t, race, false, false);
             sim.retuned = true;
         }
         Key::Char('+') | Key::Char('=') => {
-            knobs[v.row].nudge(t, e, true, false);
+            knobs[v.row].nudge(t, race, true, false);
             sim.retuned = true;
         }
         Key::Char('[') | Key::ShiftLeft => {
-            knobs[v.row].nudge(t, e, false, true);
+            knobs[v.row].nudge(t, race, false, true);
             sim.retuned = true;
         }
         Key::Char(']') | Key::ShiftRight => {
-            knobs[v.row].nudge(t, e, true, true);
+            knobs[v.row].nudge(t, race, true, true);
             sim.retuned = true;
         }
 
@@ -307,8 +311,8 @@ fn handle(
 
         Key::Char('r') => {
             let shipped = Tuning::new(t.restock[e]);
-            let val = knobs[v.row].value(&shipped, e);
-            (knobs[v.row].set)(t, e, val);
+            let val = knobs[v.row].value(&shipped, race);
+            (knobs[v.row].set)(t, race, val);
             v.say(format!("{} {} back to the shipped value", e.name(), knobs[v.row].name));
         }
         Key::Char('R') => {
@@ -329,10 +333,12 @@ fn handle(
             w.retune_climate(t.climate);
             w.retune_ecology(t.ecology);
             for el in Element::ALL {
+                // Kind::Animal only — see the `race` binding's own comment above.
+                let el_race = Race { element: el, kind: Kind::Animal };
                 for _ in 0..t.restock[el] {
                     let x = rand_below(seed, w.tick, w.next_id, Channel::SpawnPlacement, size.max(1) as u32);
                     let y = rand_below(seed, w.tick, w.next_id ^ 0x5A5A, Channel::SpawnPlacement, size.max(1) as u32);
-                    w.spawn(el, V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)));
+                    w.spawn(el_race, V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)));
                 }
             }
             sim.ticked = 0;
@@ -373,6 +379,7 @@ fn inputs(w: &World, t: &Tuning, wander_pct: u32, seed: u64, ticks: u64) -> Inpu
                 entity: 0,
                 kind: CmdKind::Spawn {
                     element: e,
+                    kind: Kind::Animal,
                     at: V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)),
                 },
             });
@@ -423,14 +430,15 @@ fn write_table(t: &Tuning) -> std::io::Result<String> {
          // TERRAIN_TUNING, CLIMATE_TUNING and ECOLOGY_TUNING constants below\n\
          // follow the same rule: copy fields into terrain.rs / climate.rs /\n\
          // ecology.rs by hand.\n\n\
-         pub const RACES: PerElement<RaceAttrs> = PerElement([\n",
+         pub const RACES: PerRace<RaceAttrs> = PerRace([\n",
     );
-    for e in Element::ALL {
-        let a = t.races[e];
+    for race in Race::ALL {
+        let a = t.races[race];
         let _ = write!(
             s,
             "    RaceAttrs {{\n        \
              element: Element::{},\n        \
+             kind: Kind::{},\n        \
              lifespan: {},\n        \
              lifespan_variance: {},\n        \
              speed: Fx::ratio({}, 100),\n        \
@@ -442,7 +450,8 @@ fn write_table(t: &Tuning) -> std::io::Result<String> {
              consume: RateBand::new({}, {}, {}, {}),\n        \
              consume_mix: ChannelMix::new({}, {}, {}, {}, {}),\n        \
              fantasy: {:?},\n    }},\n",
-            e.name(),
+            race.element.name(),
+            race.kind.name(),
             a.lifespan,
             a.lifespan_variance,
             (a.speed.raw() as i64 * 100 + 32_768) / 65_536,

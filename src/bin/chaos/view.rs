@@ -7,7 +7,7 @@
 use std::io::Write;
 
 use pentagram::element::{Element, PerElement};
-use pentagram::race::RateBand;
+use pentagram::race::{Kind, Race, RateBand};
 use pentagram::world::World;
 
 use crate::knobs::{abbrev, grouped, Tuning, PAGES};
@@ -299,8 +299,12 @@ fn races(out: &mut impl Write, v: &View, w: &World, t: &Tuning, _cols: usize) {
 
     let pop = w.population();
     for e in Element::ALL {
-        let g = w.last_deposit[e];
-        let band = t.races[e].deposit;
+        // S3.1 compile fix: this row stays Element-scoped and shows the
+        // Animal governor/band only, same Kind::Animal hardcoding as the
+        // rest of the S3.1 chaos TUI — see `main.rs`'s `race` binding.
+        let race = Race { element: e, kind: Kind::Animal };
+        let g = w.last_deposit[race];
+        let band = t.races[race].deposit;
         let c = col(RGB[e]);
         let state = if pop[e] == 0 {
             format!("{DIM}extinct — still churning at its floor{RESET}")
@@ -384,7 +388,7 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
         };
         let mut line = label;
         for e in Element::ALL {
-            let cell = k.short(k.value(t, e));
+            let cell = k.short(k.value(t, Race { element: e, kind: Kind::Animal }));
             if selected_row && e.index() == v.col {
                 line.push_str(&format!("{INVERT}{:>w$}{RESET}", cell, w = cw));
             } else if selected_row {
@@ -402,7 +406,7 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
     // deposit-unit edit breaks.
     let p: Vec<u64> = Element::ALL
         .iter()
-        .map(|e| t.races[*e].terraform_pressure())
+        .map(|e| t.races[Race { element: *e, kind: Kind::Animal }].terraform_pressure())
         .collect();
     let (lo, hi) = (
         p.iter().copied().min().unwrap_or(1).max(1),
@@ -434,7 +438,7 @@ fn footer(out: &mut impl Write, v: &View, t: &Tuning, run: &Run, _cols: usize) {
         col(RGB[e]),
         e.name(),
         k.name,
-        k.long(k.value(t, e)),
+        k.long(k.value(t, Race { element: e, kind: Kind::Animal })),
         stepping,
         k.help
     );

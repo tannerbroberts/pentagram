@@ -11,15 +11,23 @@
 
 use crate::element::Element;
 use crate::fx::{Fx, V2};
+use crate::race::Kind;
 
 pub const MAGIC: u32 = 0x5047_494C; // "PGIL"
-pub const VERSION: u32 = 1;
+/// v1 (pre-S3) `Spawn` had no `Kind` byte. v2 adds one; `from_bytes` still
+/// reads a v1 log, decoding every `Spawn` in it as `Kind::Animal` (§9 of
+/// `docs/S3_ECOLOGY_LAYERS_DESIGN.md` — the closest honest default for a
+/// world that predates the `Kind` axis). That compat path keeps old logs
+/// *readable*, not hash-reproducing: replaying a v1 log against an S3 world
+/// will not reproduce its originally recorded hashes, because the
+/// simulation itself changed.
+pub const VERSION: u32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmdKind {
     /// Steer. The vector is normalised on application, not on submission.
     SetHeading { dir: V2 },
-    Spawn { element: Element, at: V2 },
+    Spawn { element: Element, kind: Kind, at: V2 },
     Kill,
 }
 
@@ -118,8 +126,9 @@ impl InputLog {
                     out.extend_from_slice(&dir.x.raw().to_le_bytes());
                     out.extend_from_slice(&dir.y.raw().to_le_bytes());
                 }
-                CmdKind::Spawn { element, at } => {
+                CmdKind::Spawn { element, kind, at } => {
                     out.push(element as u8);
+                    out.push(kind as u8);
                     out.extend_from_slice(&at.x.raw().to_le_bytes());
                     out.extend_from_slice(&at.y.raw().to_le_bytes());
                 }
@@ -135,7 +144,10 @@ impl InputLog {
             return Err(LogError::BadMagic);
         }
         let v = r.u32()?;
-        if v != VERSION {
+        // v1 predates the `Kind` byte on `Spawn` — still readable, decoded
+        // as `Kind::Animal` below, but not hash-reproducing against an S3
+        // world (see `VERSION`'s own doc comment).
+        if v != VERSION && v != 1 {
             return Err(LogError::BadVersion(v));
         }
         let n = r.u64()? as usize;
@@ -143,7 +155,7 @@ impl InputLog {
         for _ in 0..n {
             let tick = r.u64()?;
             let entity = r.u32()?;
-            let kind = match r.u8()? {
+            let cmd_kind = match r.u8()? {
                 0 => CmdKind::SetHeading {
                     dir: V2::new(Fx::from_raw(r.i32()?), Fx::from_raw(r.i32()?)),
                 },
@@ -152,15 +164,25 @@ impl InputLog {
                     if e as usize >= Element::COUNT {
                         return Err(LogError::BadElement(e));
                     }
+                    let kind = if v == 1 {
+                        Kind::Animal
+                    } else {
+                        match r.u8()? {
+                            0 => Kind::Plant,
+                            1 => Kind::Animal,
+                            k => return Err(LogError::BadKind(k)),
+                        }
+                    };
                     CmdKind::Spawn {
                         element: Element::from_index(e as usize),
+                        kind,
                         at: V2::new(Fx::from_raw(r.i32()?), Fx::from_raw(r.i32()?)),
                     }
                 }
                 2 => CmdKind::Kill,
                 t => return Err(LogError::BadTag(t)),
             };
-            cmds.push(Command { tick, entity, kind });
+            cmds.push(Command { tick, entity, kind: cmd_kind });
         }
         let mut log = InputLog { cmds, sorted: false };
         log.finalize();
@@ -172,6 +194,7 @@ impl InputLog {
 pub enum LogError {
     BadMagic,
     BadVersion(u32),
+    BadKind(u8),
     BadTag(u8),
     BadElement(u8),
     Truncated,
@@ -228,6 +251,7 @@ mod tests {
             entity: 1,
             kind: CmdKind::Spawn {
                 element: Element::Earth,
+                kind: Kind::Plant,
                 at: V2::new(Fx::from_int(12), Fx::from_int(30)),
             },
         });
@@ -287,6 +311,34 @@ mod tests {
         assert_eq!(
             InputLog::from_bytes(&bytes[..bytes.len() - 3]),
             Err(LogError::Truncated)
+        );
+    }
+
+    /// §9 of `docs/S3_ECOLOGY_LAYERS_DESIGN.md`: a v1 log (pre-`Kind`, no
+    /// kind byte on `Spawn`) must still be *readable*, decoding every Spawn
+    /// as `Kind::Animal` — hand-built here since `to_bytes` only ever
+    /// writes the current `VERSION`.
+    #[test]
+    fn a_v1_log_decodes_spawn_as_kind_animal() {
+        let mut bytes = MAGIC.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // v1
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one command
+        bytes.extend_from_slice(&7u64.to_le_bytes()); // tick
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // entity
+        bytes.push(CmdKind::Spawn { element: Element::Wood, kind: Kind::Animal, at: V2::ZERO }.tag());
+        bytes.push(Element::Wood as u8);
+        // No kind byte here — that's the whole point of v1.
+        bytes.extend_from_slice(&Fx::from_int(4).raw().to_le_bytes());
+        bytes.extend_from_slice(&Fx::from_int(5).raw().to_le_bytes());
+
+        let log = InputLog::from_bytes(&bytes).expect("v1 log must still be readable");
+        assert_eq!(
+            log.as_slice()[0].kind,
+            CmdKind::Spawn {
+                element: Element::Wood,
+                kind: Kind::Animal,
+                at: V2::new(Fx::from_int(4), Fx::from_int(5)),
+            }
         );
     }
 

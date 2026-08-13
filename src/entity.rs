@@ -10,7 +10,7 @@ use crate::element::Element;
 use crate::fx::{Fx, V2};
 use crate::hash::{Hashable, Hasher};
 use crate::rand::{rand_range, rand_signed, Channel};
-use crate::race::RaceAttrs;
+use crate::race::{Kind, Race, RaceAttrs};
 #[cfg(test)]
 use crate::race::attrs;
 
@@ -29,6 +29,7 @@ pub const MAX_HP: i32 = 100;
 pub struct Entity {
     pub id: u32,
     pub element: Element,
+    pub kind: Kind,
     pub pos: V2,
     /// Unit vector. Movement is `heading * SPEED[element]`.
     pub heading: V2,
@@ -53,6 +54,7 @@ impl Entity {
         Entity {
             id,
             element,
+            kind: a.kind,
             pos,
             heading: initial_heading(seed, tick, id),
             age: 0,
@@ -76,12 +78,22 @@ impl Entity {
     pub fn is_expired(&self) -> bool {
         self.age >= self.lifespan
     }
+
+    /// This body's race — `(element, kind)`, the axis race-attribute lookups
+    /// resolve off. Recovers it from the two fields rather than storing it
+    /// redundantly, so every call site that needs it does so through one
+    /// accessor instead of hand-building the struct literal.
+    #[inline]
+    pub fn race(&self) -> Race {
+        Race { element: self.element, kind: self.kind }
+    }
 }
 
 impl Hashable for Entity {
     fn hash_into(&self, h: &mut Hasher) {
         h.u32(self.id)
             .u8(self.element as u8)
+            .u8(self.kind as u8)
             .i32(self.pos.x.raw())
             .i32(self.pos.y.raw())
             .i32(self.heading.x.raw())
@@ -119,13 +131,22 @@ pub fn initial_heading(seed: u64, tick: u64, id: u32) -> V2 {
     }
 }
 
+/// The closest continuation of what these tests asserted before the `Kind`
+/// axis existed — S3.1's Plant rows are literal copies of their Animal twin
+/// (`race.rs`'s `RACES` doc comment), so this choice does not change what any
+/// test below observes. Re-deciding per-`Kind` is S3.2's job.
+#[cfg(test)]
+fn animal(e: Element) -> Race {
+    Race { element: e, kind: Kind::Animal }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn spawn_is_reproducible() {
-        let f = attrs(Element::Fire);
+        let f = attrs(animal(Element::Fire));
         let a = Entity::spawn(7, Element::Fire, V2::ZERO, 99, 12, f);
         let b = Entity::spawn(7, Element::Fire, V2::ZERO, 99, 12, f);
         assert_eq!(a, b);
@@ -133,7 +154,7 @@ mod tests {
 
     #[test]
     fn different_ids_get_different_headings() {
-        let w = attrs(Element::Water);
+        let w = attrs(animal(Element::Water));
         let a = Entity::spawn(1, Element::Water, V2::ZERO, 5, 0, w);
         let b = Entity::spawn(2, Element::Water, V2::ZERO, 5, 0, w);
         assert_ne!(a.heading, b.heading);
@@ -143,7 +164,7 @@ mod tests {
     fn a_retuned_lifespan_reaches_the_bodies_born_after_it() {
         // The live view's whole premise: turn a knob, and the next thing born
         // is built to the new number.
-        let mut a = *attrs(Element::Fire);
+        let mut a = *attrs(animal(Element::Fire));
         a.lifespan_variance = 0;
         a.lifespan = 4242;
         let e = Entity::spawn(1, Element::Fire, V2::ZERO, 5, 0, &a);
@@ -166,21 +187,21 @@ mod tests {
 
     #[test]
     fn lifespan_stays_inside_the_variance_band() {
-        for e in Element::ALL {
-            let a = attrs(e);
+        for race in Race::ALL {
+            let a = attrs(race);
             let v = a.lifespan_variance as u128;
             let lo = (a.lifespan as u128) * (1000 - v) / 1000;
             let hi = (a.lifespan as u128) * (1000 + v) / 1000;
             for id in 0..400u32 {
                 let l = roll_lifespan(a, 11, 0, id) as u128;
-                assert!(l >= lo && l <= hi, "{} id {} → {}", e.name(), id, l);
+                assert!(l >= lo && l <= hi, "{}-{} id {} → {}", race.element.name(), race.kind.name(), id, l);
             }
         }
     }
 
     #[test]
     fn a_cohort_does_not_die_together() {
-        let a = attrs(Element::Fire);
+        let a = attrs(animal(Element::Fire));
         let spans: std::collections::BTreeSet<u64> =
             (0..200u32).map(|id| roll_lifespan(a, 1, 0, id)).collect();
         assert!(spans.len() > 100, "only {} distinct lifespans", spans.len());
@@ -197,7 +218,7 @@ mod tests {
         ];
         for w in order.windows(2) {
             assert!(
-                attrs(w[0]).speed > attrs(w[1]).speed,
+                attrs(animal(w[0])).speed > attrs(animal(w[1])).speed,
                 "{} should be faster than {}",
                 w[0].name(),
                 w[1].name()
@@ -207,9 +228,14 @@ mod tests {
 
     #[test]
     fn everything_has_a_positive_speed_and_radius() {
-        for e in Element::ALL {
-            assert!(attrs(e).speed > Fx::ZERO, "{} is immobile", e.name());
-            assert!(attrs(e).radius > Fx::ZERO, "{} has no body", e.name());
+        // Looped over every race, not just every element: S3.1's Plant rows
+        // are literal copies of their Animal twin (still positive speed —
+        // the kind-aware `speed == 0` rule for plants is S3.2's job), so
+        // this holds mechanically for `Race::ALL` too.
+        for race in Race::ALL {
+            let a = attrs(race);
+            assert!(a.speed > Fx::ZERO, "{}-{} is immobile", race.element.name(), race.kind.name());
+            assert!(a.radius > Fx::ZERO, "{}-{} has no body", race.element.name(), race.kind.name());
         }
     }
 
@@ -220,9 +246,10 @@ mod tests {
     // S3's `kind`/`size` additions extend an established pattern instead of
     // being the first-ever instance of it — see `EcologyTuning`'s
     // `hash_notices_every_field` (`src/ecology.rs`) for the sibling case.
+    // S3.1 extends this with a `kind` variant rather than writing a new test.
     #[test]
     fn hash_notices_every_field() {
-        let f = attrs(Element::Fire);
+        let f = attrs(animal(Element::Fire));
         let base = Entity::spawn(1, Element::Fire, V2::ZERO, 5, 0, f);
         let hash_of = |e: &Entity| {
             let mut h = Hasher::new();
@@ -235,6 +262,8 @@ mod tests {
         id.id += 1;
         let mut element = base;
         element.element = Element::Water;
+        let mut kind = base;
+        kind.kind = Kind::Plant;
         let mut pos_x = base;
         pos_x.pos.x = pos_x.pos.x + Fx::ONE;
         let mut pos_y = base;
@@ -259,6 +288,7 @@ mod tests {
         for (name, variant) in [
             ("id", id),
             ("element", element),
+            ("kind", kind),
             ("pos.x", pos_x),
             ("pos.y", pos_y),
             ("heading.x", heading_x),

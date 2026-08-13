@@ -12,9 +12,9 @@
 
 use pentagram::climate::ClimateTuning;
 use pentagram::ecology::EcologyTuning;
-use pentagram::element::{Element, PerElement};
+use pentagram::element::PerElement;
 use pentagram::fx::Fx;
-use pentagram::race::{Channel, Edge, RaceAttrs, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES};
+use pentagram::race::{Channel, Edge, PerRace, Race, RaceAttrs, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES};
 use pentagram::terrain::TerrainTuning;
 
 /// Everything the live view can change, in one struct.
@@ -26,7 +26,7 @@ use pentagram::terrain::TerrainTuning;
 /// ordinary input commands, which is exactly what a player would be.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tuning {
-    pub races: PerElement<RaceAttrs>,
+    pub races: PerRace<RaceAttrs>,
     pub restock: PerElement<u32>,
     pub terrain: TerrainTuning,
     pub climate: ClimateTuning,
@@ -74,17 +74,17 @@ pub struct Knob {
     pub step: Step,
     pub lo: i64,
     pub hi: i64,
-    pub get: fn(&Tuning, Element) -> i64,
-    pub set: fn(&mut Tuning, Element, i64),
+    pub get: fn(&Tuning, Race) -> i64,
+    pub set: fn(&mut Tuning, Race, i64),
 }
 
 impl Knob {
     #[inline]
-    pub fn value(&self, t: &Tuning, e: Element) -> i64 {
-        (self.get)(t, e)
+    pub fn value(&self, t: &Tuning, r: Race) -> i64 {
+        (self.get)(t, r)
     }
 
-    pub fn nudge(&self, t: &mut Tuning, e: Element, up: bool, coarse: bool) {
+    pub fn nudge(&self, t: &mut Tuning, e: Race, up: bool, coarse: bool) {
         let v = self.value(t, e);
         let next = match self.step {
             Step::Add(n) => {
@@ -150,8 +150,8 @@ macro_rules! knob {
             step: $step,
             lo: $lo,
             hi: $hi,
-            get: |$t: &Tuning, $e: Element| -> i64 { $get },
-            set: |$tm: &mut Tuning, $em: Element, $v: i64| { $set },
+            get: |$t: &Tuning, $e: Race| -> i64 { $get },
+            set: |$tm: &mut Tuning, $em: Race, $v: i64| { $set },
         }
     };
 }
@@ -192,9 +192,9 @@ static BODY: [Knob; 15] = [
           |t, e| (t.races[e].radius.raw() as i64 * 100 + 32_768) / 65_536,
           |t, e, v| t.races[e].radius = Fx::ratio(v as i32, 100)),
     knob!("restock to", Fmt::Int, Step::Add(5), 0, 250,
-          "VIEW KNOB: bodies of this race the view keeps spawning back, as ordinary input commands",
-          |t, e| t.restock[e] as i64,
-          |t, e, v| t.restock[e] = v as u32),
+          "VIEW KNOB: bodies of this race's element the view keeps spawning back (Kind::Animal), as ordinary input commands",
+          |t, e| t.restock[e.element] as i64,
+          |t, e, v| t.restock[e.element] = v as u32),
 
     knob!("deposit unit", Fmt::Int, Step::Scale, 1, 100_000_000,
           "total a body writes to the terrain over its ENTIRE life, split across the channels",
@@ -259,29 +259,29 @@ static MIX: [Knob; 10] = [
 static TERRAIN_AND_CLIMATE: [Knob; 7] = [
     knob!("diffuse rate", Fmt::Permille, Step::Add(1), 0, 1000,
           "permille of the concentration difference across an edge that moves each terrain tick",
-          |t, e| t.terrain.diffuse_rate[e] as i64,
-          |t, e, v| t.terrain.diffuse_rate[e] = v as u16),
+          |t, e| t.terrain.diffuse_rate[e.element] as i64,
+          |t, e, v| t.terrain.diffuse_rate[e.element] = v as u16),
     knob!("diffuse cap", Fmt::Int, Step::Add(5), 0, u16::MAX as i64,
           "flat units per edge per terrain tick — no edge can ever carry more than this in one tick",
-          |t, e| t.terrain.diffuse_cap[e] as i64,
-          |t, e, v| t.terrain.diffuse_cap[e] = v as u16),
+          |t, e| t.terrain.diffuse_cap[e.element] as i64,
+          |t, e, v| t.terrain.diffuse_cap[e.element] = v as u16),
 
     knob!("base lo", Fmt::Int, Step::Add(1), 0, u16::MAX as i64,
           "low end of the one-time per-cell geography draw for this element",
-          |t, e| t.climate.base_range[e].0 as i64,
-          |t, e, v| t.climate.base_range[e].0 = v as u16),
+          |t, e| t.climate.base_range[e.element].0 as i64,
+          |t, e, v| t.climate.base_range[e.element].0 = v as u16),
     knob!("base hi", Fmt::Int, Step::Add(1), 0, u16::MAX as i64,
           "high end of the one-time per-cell geography draw for this element",
-          |t, e| t.climate.base_range[e].1 as i64,
-          |t, e, v| t.climate.base_range[e].1 = v as u16),
+          |t, e| t.climate.base_range[e.element].1 as i64,
+          |t, e, v| t.climate.base_range[e.element].1 = v as u16),
     knob!("climate floor", Fmt::Int, Step::Add(1), 0, u16::MAX as i64,
           "always-on climate influx added every terrain tick, regardless of season",
-          |t, e| t.climate.floor[e] as i64,
-          |t, e, v| t.climate.floor[e] = v as u16),
+          |t, e| t.climate.floor[e.element] as i64,
+          |t, e, v| t.climate.floor[e.element] = v as u16),
     knob!("season peak", Fmt::Int, Step::Add(50), 0, u16::MAX as i64,
           "peak seasonal bonus applied to this element while it is in season",
-          |t, e| t.climate.season_peak[e] as i64,
-          |t, e, v| t.climate.season_peak[e] = v as u16),
+          |t, e| t.climate.season_peak[e.element] as i64,
+          |t, e, v| t.climate.season_peak[e.element] = v as u16),
     knob!("season length", Fmt::Ticks, Step::Scale, 1, TICKS_PER_DAY as i64 * 90,
           "GLOBAL: terrain ticks per season — five seasons, one per element, make one full lap",
           |t, _e| t.climate.season_ticks as i64,
@@ -297,36 +297,36 @@ static TERRAIN_AND_CLIMATE: [Knob; 7] = [
 static ECOLOGY: [Knob; 8] = [
     knob!("forage radius", Fmt::Cells, Step::Add(20), 0, 4_000,
           "how far a body can reach to eat prey on the ring edge it eats",
-          |t, e| (t.ecology.forage_radius[e].raw() as i64 * 100 + 32_768) / 65_536,
-          |t, e, v| t.ecology.forage_radius[e] = Fx::ratio(v as i32, 100)),
+          |t, e| (t.ecology.forage_radius[e.element].raw() as i64 * 100 + 32_768) / 65_536,
+          |t, e, v| t.ecology.forage_radius[e.element] = Fx::ratio(v as i32, 100)),
     knob!("satiation", Fmt::Ticks, Step::Scale, 1, TICKS_PER_DAY as i64,
           "minimum ticks between one body's successful meals",
-          |t, e| t.ecology.satiation[e] as i64,
-          |t, e, v| t.ecology.satiation[e] = v as u32),
+          |t, e| t.ecology.satiation[e.element] as i64,
+          |t, e, v| t.ecology.satiation[e.element] = v as u32),
     knob!("feed gain", Fmt::Int, Step::Add(5), 0, 100,
           "hp restored by one successful meal, out of a 0..=100 scale",
-          |t, e| t.ecology.feed_gain[e] as i64,
-          |t, e, v| t.ecology.feed_gain[e] = v as i32),
+          |t, e| t.ecology.feed_gain[e.element] as i64,
+          |t, e, v| t.ecology.feed_gain[e.element] = v as i32),
     knob!("starve after", Fmt::Ticks, Step::Scale, 1, TICKS_PER_DAY as i64 * 7,
           "ticks without a meal before starvation drain begins",
-          |t, e| t.ecology.starve_after[e] as i64,
-          |t, e, v| t.ecology.starve_after[e] = v as u32),
+          |t, e| t.ecology.starve_after[e.element] as i64,
+          |t, e, v| t.ecology.starve_after[e.element] = v as u32),
     knob!("starve rate", Fmt::Int, Step::Add(1), 0, 100,
           "hp lost per tick once starvation has begun",
-          |t, e| t.ecology.starve_rate[e] as i64,
-          |t, e, v| t.ecology.starve_rate[e] = v as i32),
+          |t, e| t.ecology.starve_rate[e.element] as i64,
+          |t, e, v| t.ecology.starve_rate[e.element] = v as i32),
     knob!("repro threshold", Fmt::Int, Step::Add(5), 0, 100,
           "hp a meal must reach, from below, to spawn an offspring",
-          |t, e| t.ecology.repro_threshold[e] as i64,
-          |t, e, v| t.ecology.repro_threshold[e] = v as i32),
+          |t, e| t.ecology.repro_threshold[e.element] as i64,
+          |t, e, v| t.ecology.repro_threshold[e.element] = v as i32),
     knob!("attrition rate", Fmt::Permille, Step::Add(1), 0, 1000,
           "permille of what eats this element's terrain concentration converted to hp damage each terrain tick",
-          |t, e| t.ecology.attrition_rate[e] as i64,
-          |t, e, v| t.ecology.attrition_rate[e] = v as u16),
+          |t, e| t.ecology.attrition_rate[e.element] as i64,
+          |t, e, v| t.ecology.attrition_rate[e.element] = v as u16),
     knob!("suppression rate", Fmt::Permille, Step::Add(1), 0, 1000,
           "permille of this element's suppressor's terrain concentration added to hunger each terrain tick",
-          |t, e| t.ecology.suppression_rate[e] as i64,
-          |t, e, v| t.ecology.suppression_rate[e] = v as u16),
+          |t, e| t.ecology.suppression_rate[e.element] as i64,
+          |t, e, v| t.ecology.suppression_rate[e.element] = v as u16),
 ];
 
 pub static PAGES: &[Page] = &[
