@@ -7,10 +7,10 @@
 use std::io::Write;
 
 use pentagram::element::{Element, PerElement};
-use pentagram::race::{Kind, Race, RateBand};
+use pentagram::race::{Kind, PerRace, Race, RateBand};
 use pentagram::world::World;
 
-use crate::knobs::{abbrev, grouped, Tuning, PAGES};
+use crate::knobs::{abbrev, grouped, Axis, Tuning, PAGES};
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Half-cell glyphs, indexed by how crowded the sampled cell is: a lone body
@@ -45,8 +45,9 @@ pub struct View {
     pub page: usize,
     pub row: usize,
     pub col: usize,
+    pub kind: Kind,
     pub show_map: bool,
-    pub history: PerElement<Vec<u32>>,
+    pub history: PerRace<Vec<u32>>,
     /// Transient message shown in the footer, with the frames it has left.
     pub notice: Option<(String, u32)>,
 }
@@ -57,8 +58,9 @@ impl View {
             page: 0,
             row: 0,
             col: 0,
+            kind: Kind::Animal,
             show_map: true,
-            history: PerElement([vec![], vec![], vec![], vec![], vec![]]),
+            history: PerRace(Race::ALL.map(|_| Vec::new())),
             notice: None,
         }
     }
@@ -71,6 +73,10 @@ impl View {
         Element::from_index(self.col)
     }
 
+    pub fn race(&self) -> Race {
+        Race { element: self.element(), kind: self.kind }
+    }
+
     pub fn knobs(&self) -> &'static [crate::knobs::Knob] {
         PAGES[self.page].knobs
     }
@@ -80,10 +86,15 @@ impl View {
     }
 
     pub fn sample(&mut self, w: &World) {
-        let pop = w.population();
-        for e in Element::ALL {
-            let h = self.history.get_mut(e);
-            h.push(pop[e]);
+        let mut pop: PerRace<u32> = PerRace::filled(0);
+        for e in &w.entities {
+            if e.alive {
+                *pop.get_mut(e.race()) += 1;
+            }
+        }
+        for r in Race::ALL {
+            let h = self.history.get_mut(r);
+            h.push(pop[r]);
             if h.len() > HISTORY {
                 h.remove(0);
             }
@@ -292,17 +303,17 @@ fn races(out: &mut impl Write, v: &View, w: &World, t: &Tuning, _cols: usize) {
 
     let peak = Element::ALL
         .iter()
-        .flat_map(|e| v.history[*e].iter().copied())
+        .flat_map(|e| v.history[Race { element: *e, kind: v.kind }].iter().copied())
         .max()
         .unwrap_or(1)
         .max(1);
 
     let pop = w.population();
     for e in Element::ALL {
-        // S3.1 compile fix: this row stays Element-scoped and shows the
-        // Animal governor/band only, same Kind::Animal hardcoding as the
-        // rest of the S3.1 chaos TUI — see `main.rs`'s `race` binding.
-        let race = Race { element: e, kind: Kind::Animal };
+        // This panel shows whichever Kind is currently toggled (`v.kind`),
+        // 5 rows at a time — not both kinds merged and not stacked to ten
+        // rows. Press `x` to flip it.
+        let race = Race { element: e, kind: v.kind };
         let g = w.last_deposit[race];
         let band = t.races[race].deposit;
         let c = col(RGB[e]);
@@ -320,7 +331,7 @@ fn races(out: &mut impl Write, v: &View, w: &World, t: &Tuning, _cols: usize) {
             "{c}{:<7}{RESET}{:>5}  {c}{:<16}{RESET} {} {:>7}/{:<7} {}{CLEAR_EOL}",
             e.name(),
             pop[e],
-            spark(&v.history[e], peak, 16),
+            spark(&v.history[race], peak, 16),
             gauge(g.granted, band, &c, 26),
             g.granted,
             band.ceiling,
@@ -365,12 +376,17 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
     let knobs = v.knobs();
     let cw = ((cols.saturating_sub(20)) / 5).clamp(8, 14);
 
+    let scope = match PAGES[v.page].axis {
+        Axis::Race => format!(", kind: {}, x: toggle", v.kind.name()),
+        Axis::Element => ", element-scoped (kind n/a)".to_string(),
+    };
     let _ = writeln!(
         out,
-        "{DIM}── knobs ── {}   (tab: page {}/{}){RESET}{CLEAR_EOL}",
+        "{DIM}── knobs ── {}   (tab: page {}/{}{}){RESET}{CLEAR_EOL}",
         PAGES[v.page].title,
         v.page + 1,
-        PAGES.len()
+        PAGES.len(),
+        scope
     );
 
     let mut hdr = format!("{:<18}", "");
@@ -388,7 +404,7 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
         };
         let mut line = label;
         for e in Element::ALL {
-            let cell = k.short(k.value(t, Race { element: e, kind: Kind::Animal }));
+            let cell = k.short(k.value(t, Race { element: e, kind: v.kind }));
             if selected_row && e.index() == v.col {
                 line.push_str(&format!("{INVERT}{:>w$}{RESET}", cell, w = cw));
             } else if selected_row {
@@ -406,7 +422,7 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
     // deposit-unit edit breaks.
     let p: Vec<u64> = Element::ALL
         .iter()
-        .map(|e| t.races[Race { element: *e, kind: Kind::Animal }].terraform_pressure())
+        .map(|e| t.races[Race { element: *e, kind: v.kind }].terraform_pressure())
         .collect();
     let (lo, hi) = (
         p.iter().copied().min().unwrap_or(1).max(1),
@@ -428,6 +444,7 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
 fn footer(out: &mut impl Write, v: &View, t: &Tuning, run: &Run, _cols: usize) {
     let k = &v.knobs()[v.row];
     let e = v.element();
+    let race = v.race();
     let stepping = match k.step {
         crate::knobs::Step::Add(n) => format!("-/+ ±{n}   [/] ±{}", n * 10),
         crate::knobs::Step::Scale => "-/+ ±10%   [/] ×2".to_string(),
@@ -438,7 +455,7 @@ fn footer(out: &mut impl Write, v: &View, t: &Tuning, run: &Run, _cols: usize) {
         col(RGB[e]),
         e.name(),
         k.name,
-        k.long(k.value(t, Race { element: e, kind: Kind::Animal })),
+        k.long(k.value(t, race)),
         stepping,
         k.help
     );
@@ -451,7 +468,7 @@ fn footer(out: &mut impl Write, v: &View, t: &Tuning, run: &Run, _cols: usize) {
             let _ = writeln!(
                 out,
                 "{DIM}↑↓←→/hjkl move · -/+ [/] adjust · space pause · < > speed {} t/s · \
-                 . advance 1 min · w wander {}% · tab page · m map · r/R reset · z restart · \
+                 . advance 1 min · w wander {}% · tab page · x kind · m map · r/R reset · z restart · \
                  T write table · q quit{RESET}{CLEAR_EOL}",
                 run.speed, run.wander
             );

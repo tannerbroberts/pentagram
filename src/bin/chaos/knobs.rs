@@ -10,12 +10,23 @@
 //! in every profile, so a knob with no ceiling is a panic waiting for a curious
 //! user. Every `hi` here is chosen to keep the worst case inside `u64`.
 
+use pentagram::behavior::BehaviorTuning;
 use pentagram::climate::ClimateTuning;
-use pentagram::ecology::EcologyTuning;
-use pentagram::element::PerElement;
+use pentagram::ecology::{EcologyTuning, PropagationTuning};
 use pentagram::fx::Fx;
 use pentagram::race::{Channel, Edge, PerRace, Race, RaceAttrs, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES};
 use pentagram::terrain::TerrainTuning;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Axis {
+    /// Every row differs per (element, kind) -- races/behavior knobs.
+    Race,
+    /// Every row is shared by both kinds of an element -- terrain/climate/
+    /// ecology/propagation knobs. The Kind toggle has no effect on this
+    /// page's values; the header should say so rather than silently
+    /// implying two independent numbers that are actually the same cell.
+    Element,
+}
 
 /// Everything the live view can change, in one struct.
 ///
@@ -27,20 +38,24 @@ use pentagram::terrain::TerrainTuning;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tuning {
     pub races: PerRace<RaceAttrs>,
-    pub restock: PerElement<u32>,
+    pub restock: PerRace<u32>,
     pub terrain: TerrainTuning,
     pub climate: ClimateTuning,
     pub ecology: EcologyTuning,
+    pub propagation: PropagationTuning,
+    pub behavior: BehaviorTuning,
 }
 
 impl Tuning {
     pub fn new(per_race: u32) -> Tuning {
         Tuning {
             races: RACES,
-            restock: PerElement::filled(per_race),
+            restock: PerRace::filled(per_race),
             terrain: TerrainTuning::default(),
             climate: ClimateTuning::default(),
             ecology: EcologyTuning::default(),
+            propagation: PropagationTuning::default(),
+            behavior: BehaviorTuning::default(),
         }
     }
 }
@@ -137,6 +152,7 @@ impl Knob {
 pub struct Page {
     pub title: &'static str,
     pub knobs: &'static [Knob],
+    pub axis: Axis,
 }
 
 macro_rules! knob {
@@ -192,9 +208,9 @@ static BODY: [Knob; 15] = [
           |t, e| (t.races[e].radius.raw() as i64 * 100 + 32_768) / 65_536,
           |t, e, v| t.races[e].radius = Fx::ratio(v as i32, 100)),
     knob!("restock to", Fmt::Int, Step::Add(5), 0, 250,
-          "VIEW KNOB: bodies of this race's element the view keeps spawning back (Kind::Animal), as ordinary input commands",
-          |t, e| t.restock[e.element] as i64,
-          |t, e, v| t.restock[e.element] = v as u32),
+          "VIEW KNOB: bodies of this race the view keeps spawning back, as ordinary input commands",
+          |t, e| t.restock[e] as i64,
+          |t, e, v| t.restock[e] = v as u32),
 
     knob!("deposit unit", Fmt::Int, Step::Scale, 1, 100_000_000,
           "total a body writes to the terrain over its ENTIRE life, split across the channels",
@@ -329,11 +345,55 @@ static ECOLOGY: [Knob; 8] = [
           |t, e, v| t.ecology.suppression_rate[e.element] = v as u16),
 ];
 
+static PROPAGATION: [Knob; 6] = [
+    knob!("period", Fmt::Int, Step::Add(1), 0, 1000,
+          "terrain ticks between propagation attempts; 0 = never attempts",
+          |t, e| t.propagation.period[e.element] as i64,
+          |t, e, v| t.propagation.period[e.element] = v as u64),
+    knob!("chance", Fmt::Permille, Step::Add(25), 0, 1000,
+          "per-mille, per eligible plant, per attempt",
+          |t, e| t.propagation.chance[e.element] as i64,
+          |t, e, v| t.propagation.chance[e.element] = v as u16),
+    knob!("offspring size", Fmt::Permille, Step::Add(25), 0, 1000,
+          "per-mille of full size a new offspring is born at",
+          |t, e| t.propagation.offspring_size[e.element] as i64,
+          |t, e, v| t.propagation.offspring_size[e.element] = v as u16),
+    knob!("root min", Fmt::Int, Step::Add(50), 0, u16::MAX as i64,
+          "minimum terrain stock of the plant's own element required at the candidate cell",
+          |t, e| t.propagation.root_min[e.element] as i64,
+          |t, e, v| t.propagation.root_min[e.element] = v as u16),
+    knob!("dispersal", Fmt::Cells, Step::Add(5), 0, 2000,
+          "max scatter offset from the parent, in cells",
+          |t, e| (t.propagation.dispersal[e.element].raw() as i64 * 100 + 32_768) / 65_536,
+          |t, e, v| t.propagation.dispersal[e.element] = Fx::ratio(v as i32, 100)),
+    knob!("crowd max", Fmt::Int, Step::Add(1), 0, 1000,
+          "max same-race bodies already occupying the candidate cell",
+          |t, e| t.propagation.crowd_max[e.element] as i64,
+          |t, e, v| t.propagation.crowd_max[e.element] = v as u16),
+];
+
+static BEHAVIOR: [Knob; 3] = [
+    knob!("flee threshold", Fmt::Int, Step::Add(200), 0, u16::MAX as i64,
+          "terrain stock of what eats this race, at its own cell, above which it flees",
+          |t, e| t.behavior.flee_threshold[e] as i64,
+          |t, e, v| t.behavior.flee_threshold[e] = v as u16),
+    knob!("sense radius", Fmt::Cells, Step::Add(20), 0, 4_000,
+          "how far a body can sense prey, in cells -- larger than forage radius on purpose",
+          |t, e| (t.behavior.sense_radius[e].raw() as i64 * 100 + 32_768) / 65_536,
+          |t, e, v| t.behavior.sense_radius[e] = Fx::ratio(v as i32, 100)),
+    knob!("turn rate", Fmt::Permille, Step::Add(25), 0, 1000,
+          "per-tick steering blend toward the desired heading; 0 never turns, 1000 snaps",
+          |t, e| (t.behavior.turn_rate[e].raw() as i64 * 1000) / 65_536,
+          |t, e, v| t.behavior.turn_rate[e] = Fx::ratio(v as i32, 1000)),
+];
+
 pub static PAGES: &[Page] = &[
-    Page { title: "body & rates", knobs: &BODY },
-    Page { title: "channel mix ‰  (edits rebalance the rest to keep the sum at 1000)", knobs: &MIX },
-    Page { title: "terrain & climate", knobs: &TERRAIN_AND_CLIMATE },
-    Page { title: "ecology (S2)", knobs: &ECOLOGY },
+    Page { title: "body & rates", knobs: &BODY, axis: Axis::Race },
+    Page { title: "channel mix ‰  (edits rebalance the rest to keep the sum at 1000)", knobs: &MIX, axis: Axis::Race },
+    Page { title: "terrain & climate", knobs: &TERRAIN_AND_CLIMATE, axis: Axis::Element },
+    Page { title: "ecology (S2)", knobs: &ECOLOGY, axis: Axis::Element },
+    Page { title: "propagation (S3.5)", knobs: &PROPAGATION, axis: Axis::Element },
+    Page { title: "behavior (S3.4)", knobs: &BEHAVIOR, axis: Axis::Race },
 ];
 
 // ----------------------------------------------------------------------

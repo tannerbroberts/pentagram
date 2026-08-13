@@ -30,10 +30,12 @@ mod view;
 use std::io::{BufWriter, Write};
 use std::time::{Duration, Instant};
 
+use pentagram::behavior::BehaviorTuning;
+use pentagram::ecology::PropagationTuning;
 use pentagram::element::Element;
 use pentagram::fx::{Fx, V2};
 use pentagram::input::{CmdKind, Command, InputLog};
-use pentagram::race::{Kind, Race, RACES, TERRAIN_PERIOD};
+use pentagram::race::{Kind, PerRace, Race, RACES, TERRAIN_PERIOD};
 use pentagram::rand::{rand_below, rand_signed, Channel};
 use pentagram::world::World;
 
@@ -104,6 +106,7 @@ impl Args {
                          < >            halve / double the sim speed\n  \
                          space          pause      .   advance one simulated minute\n  \
                          tab            knob page  m   show or hide the map\n  \
+                         x              toggle Plant/Animal on the current page\n  \
                          w              cycle how much the view steers bodies around\n  \
                          r / R          reset the selected knob / the whole table\n  \
                          z              restart the world at tick 0 with the current knobs\n  \
@@ -176,6 +179,8 @@ fn main() {
         w.retune_terrain(t.terrain);
         w.retune_climate(t.climate);
         w.retune_ecology(t.ecology);
+        w.retune_behavior(t.behavior);
+        w.retune_propagation(t.propagation);
 
         let ticks = if sim.stepping > 0 {
             let n = sim.stepping.min(TERRAIN_PERIOD);
@@ -256,10 +261,7 @@ fn handle(
 ) -> bool {
     let knobs = v.knobs();
     let e = v.element();
-    // S3.1 compile fix (§11 of the design doc): the view's cursor is still
-    // Element-scoped (five columns) — Kind is hardcoded to Animal here until
-    // S3.6 adds the real two-axis Kind toggle.
-    let race = Race { element: e, kind: Kind::Animal };
+    let race = v.race();
 
     match k {
         Key::Char('q') | Key::Char('\x03') | Key::Esc => return true,
@@ -301,6 +303,10 @@ fn handle(
             v.row = 0;
         }
         Key::Char('m') => v.show_map = !v.show_map,
+        Key::Char('x') => {
+            v.kind = if v.kind == Kind::Animal { Kind::Plant } else { Kind::Animal };
+            v.say(format!("viewing {} rows", v.kind.name()));
+        }
         Key::Char('w') => {
             sim.wander = (sim.wander + 1) % WANDER_STEPS.len();
             let pct = WANDER_STEPS[sim.wander];
@@ -310,7 +316,7 @@ fn handle(
         }
 
         Key::Char('r') => {
-            let shipped = Tuning::new(t.restock[e]);
+            let shipped = Tuning::new(t.restock[race]);
             let val = knobs[v.row].value(&shipped, race);
             (knobs[v.row].set)(t, race, val);
             v.say(format!("{} {} back to the shipped value", e.name(), knobs[v.row].name));
@@ -322,6 +328,8 @@ fn handle(
                 terrain: pentagram::terrain::TerrainTuning::default(),
                 climate: pentagram::climate::ClimateTuning::default(),
                 ecology: pentagram::ecology::EcologyTuning::default(),
+                propagation: PropagationTuning::default(),
+                behavior: BehaviorTuning::default(),
             };
             sim.retuned = false;
             v.say("whole table back to shipped defaults");
@@ -332,19 +340,19 @@ fn handle(
             w.retune_terrain(t.terrain);
             w.retune_climate(t.climate);
             w.retune_ecology(t.ecology);
-            for el in Element::ALL {
-                // Kind::Animal only — see the `race` binding's own comment above.
-                let el_race = Race { element: el, kind: Kind::Animal };
-                for _ in 0..t.restock[el] {
+            w.retune_behavior(t.behavior);
+            w.retune_propagation(t.propagation);
+            for r in Race::ALL {
+                for _ in 0..t.restock[r] {
                     let x = rand_below(seed, w.tick, w.next_id, Channel::SpawnPlacement, size.max(1) as u32);
                     let y = rand_below(seed, w.tick, w.next_id ^ 0x5A5A, Channel::SpawnPlacement, size.max(1) as u32);
-                    w.spawn(el_race, V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)));
+                    w.spawn(r, V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)));
                 }
             }
             sim.ticked = 0;
             sim.since = Instant::now();
             sim.retuned = false;
-            v.history = pentagram::element::PerElement([vec![], vec![], vec![], vec![], vec![]]);
+            v.history = PerRace(Race::ALL.map(|_| Vec::new()));
             v.say("restarted at tick 0 — this run is reproducible from these knobs");
         }
         Key::Char('T') => match write_table(t) {
@@ -365,21 +373,27 @@ fn inputs(w: &World, t: &Tuning, wander_pct: u32, seed: u64, ticks: u64) -> Inpu
     let mut log = InputLog::new();
     let tick = w.tick;
     let size = w.size.floor_int().max(1) as u32;
-    let pop = w.population();
+
+    let mut pop: PerRace<u32> = PerRace::filled(0);
+    for e in &w.entities {
+        if e.alive {
+            *pop.get_mut(e.race()) += 1;
+        }
+    }
 
     let allowance = (ticks / 20).clamp(1, RESTOCK_MAX) as u32;
-    for e in Element::ALL {
-        let deficit = t.restock[e].saturating_sub(pop[e]).min(allowance);
+    for r in Race::ALL {
+        let deficit = t.restock[r].saturating_sub(pop[r]).min(allowance);
         for k in 0..deficit {
-            let salt = (e.index() as u32) * 7919 + k;
+            let salt = (r.index() as u32) * 7919 + k;
             let x = rand_below(seed, tick, salt, Channel::SpawnPlacement, size);
             let y = rand_below(seed, tick, salt ^ 0x5A5A, Channel::SpawnPlacement, size);
             log.push(Command {
                 tick,
                 entity: 0,
                 kind: CmdKind::Spawn {
-                    element: e,
-                    kind: Kind::Animal,
+                    element: r.element,
+                    kind: r.kind,
                     at: V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)),
                 },
             });
@@ -429,7 +443,8 @@ fn write_table(t: &Tuning) -> std::io::Result<String> {
          // into the RACES table in race.rs, keeping the comments there. The\n\
          // TERRAIN_TUNING, CLIMATE_TUNING and ECOLOGY_TUNING constants below\n\
          // follow the same rule: copy fields into terrain.rs / climate.rs /\n\
-         // ecology.rs by hand.\n\n\
+         // ecology.rs by hand. PROPAGATION_TUNING and BEHAVIOR_TUNING follow the\n\
+         // same copy-by-hand rule, into ecology.rs and behavior.rs respectively.\n\n\
          pub const RACES: PerRace<RaceAttrs> = PerRace([\n",
     );
     for race in Race::ALL {
@@ -532,6 +547,61 @@ fn write_table(t: &Tuning) -> std::io::Result<String> {
         ec.attrition_rate[Element::ALL[3]], ec.attrition_rate[Element::ALL[4]],
         ec.suppression_rate[Element::ALL[0]], ec.suppression_rate[Element::ALL[1]], ec.suppression_rate[Element::ALL[2]],
         ec.suppression_rate[Element::ALL[3]], ec.suppression_rate[Element::ALL[4]],
+    );
+
+    let pt = &t.propagation;
+    let _ = write!(
+        s,
+        "\npub const PROPAGATION_TUNING: PropagationTuning = PropagationTuning {{\n    \
+         period: PerElement([{}, {}, {}, {}, {}]),\n    \
+         chance: PerElement([{}, {}, {}, {}, {}]),\n    \
+         offspring_size: PerElement([{}, {}, {}, {}, {}]),\n    \
+         root_min: PerElement([{}, {}, {}, {}, {}]),\n    \
+         dispersal: PerElement([Fx::ratio({}, 100), Fx::ratio({}, 100), Fx::ratio({}, 100), \
+         Fx::ratio({}, 100), Fx::ratio({}, 100)]),\n    \
+         crowd_max: PerElement([{}, {}, {}, {}, {}]),\n}};\n",
+        pt.period[Element::ALL[0]], pt.period[Element::ALL[1]], pt.period[Element::ALL[2]],
+        pt.period[Element::ALL[3]], pt.period[Element::ALL[4]],
+        pt.chance[Element::ALL[0]], pt.chance[Element::ALL[1]], pt.chance[Element::ALL[2]],
+        pt.chance[Element::ALL[3]], pt.chance[Element::ALL[4]],
+        pt.offspring_size[Element::ALL[0]], pt.offspring_size[Element::ALL[1]], pt.offspring_size[Element::ALL[2]],
+        pt.offspring_size[Element::ALL[3]], pt.offspring_size[Element::ALL[4]],
+        pt.root_min[Element::ALL[0]], pt.root_min[Element::ALL[1]], pt.root_min[Element::ALL[2]],
+        pt.root_min[Element::ALL[3]], pt.root_min[Element::ALL[4]],
+        cells(pt.dispersal[Element::ALL[0]]), cells(pt.dispersal[Element::ALL[1]]),
+        cells(pt.dispersal[Element::ALL[2]]), cells(pt.dispersal[Element::ALL[3]]),
+        cells(pt.dispersal[Element::ALL[4]]),
+        pt.crowd_max[Element::ALL[0]], pt.crowd_max[Element::ALL[1]], pt.crowd_max[Element::ALL[2]],
+        pt.crowd_max[Element::ALL[3]], pt.crowd_max[Element::ALL[4]],
+    );
+
+    // BehaviorTuning is PerRace-shaped (10 rows, not 5) — build each field's
+    // array one line per race, same as the RACES loop above, rather than the
+    // 5-wide inline style the Element-scoped constants use.
+    let bt = &t.behavior;
+    let mut flee = String::new();
+    let mut sense = String::new();
+    let mut turn = String::new();
+    for race in Race::ALL {
+        let _ = writeln!(flee, "        {}, // {} {}", bt.flee_threshold[race], race.element.name(), race.kind.name());
+        let _ = writeln!(
+            sense,
+            "        Fx::ratio({}, 100), // {} {}",
+            cells(bt.sense_radius[race]), race.element.name(), race.kind.name()
+        );
+        let _ = writeln!(
+            turn,
+            "        Fx::ratio({}, 1000), // {} {}",
+            (bt.turn_rate[race].raw() as i64 * 1000) / 65_536, race.element.name(), race.kind.name()
+        );
+    }
+    let _ = write!(
+        s,
+        "\npub const BEHAVIOR_TUNING: BehaviorTuning = BehaviorTuning {{\n    \
+         flee_threshold: PerRace([\n{}    ]),\n    \
+         sense_radius: PerRace([\n{}    ]),\n    \
+         turn_rate: PerRace([\n{}    ]),\n}};\n",
+        flee, sense, turn,
     );
 
     std::fs::write(&path, s)?;
