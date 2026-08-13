@@ -23,7 +23,7 @@ use crate::governor::{Governor, Grant};
 use crate::hash::{Hashable, Hasher};
 use crate::input::{CmdKind, Command, InputLog};
 use crate::race::{attrs, Channel as DepChannel, Kind, PerRace, Race, RaceAttrs, MILLI, RACES, TERRAIN_PERIOD};
-use crate::rand::{rand_signed, Channel};
+use crate::rand::{rand_chance, rand_signed, Channel};
 use crate::terrain::{Occupancy, Terrain, TerrainTuning};
 
 /// Per-tick positional noise, so entities do not travel on perfect rails.
@@ -463,9 +463,8 @@ impl World {
                     continue;
                 };
                 // A Plant is never a predator. Animal-vs-Animal predation
-                // stays exactly as eligible as it is today (ring edge +
-                // satiation + forage_radius, nothing more) — gating that with
-                // a tunable hunt-weight roll is S3.3's job, not this one. See
+                // additionally rolls a per-race hunt-weight gate below
+                // (S3.3) — grazing Plant prey stays fully unconditional. See
                 // `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
                 if self.entities[pred].kind != Kind::Animal {
                     continue;
@@ -498,6 +497,21 @@ impl World {
                 let reach = ecology.forage_radius[pred_el];
                 if d.len_sq() > reach * reach {
                     continue;
+                }
+                // S3.3: the final, kind-specific gate. Grazing (Plant prey) is
+                // unconditional; hunting (Animal prey) additionally needs a
+                // per-race hunt-weight roll to succeed. Rolled on
+                // (seed, tick, predator id) only — never on prey id — so the
+                // result is the same no matter which prey candidate this
+                // predator is being tested against this tick (required so a
+                // future Hunt-drive steering pass, S3.4, can agree with this
+                // phase about which prey class a predator will actually take).
+                if self.entities[prey].kind == Kind::Animal {
+                    let pred_race = self.entities[pred].race();
+                    let weight = ecology.hunt_weight[pred_race] as u32;
+                    if !rand_chance(self.seed, self.tick, self.entities[pred].id, Channel::Hunt, weight, 1000) {
+                        continue;
+                    }
                 }
                 eaten[prey] = true;
                 fed[pred] = true;
@@ -891,6 +905,7 @@ mod tests {
         // so Fire is resolved as prey (by Earth) before it is later
         // considered as predator (of Wood) in the same inner-loop pass.
         let mut w = World::new(9, 32);
+        w.retune_ecology(EcologyTuning { hunt_weight: PerRace::filled(1000), ..EcologyTuning::default() });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
         let fire_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center); // Fire eats Wood.
         let earth_id = w.spawn(Race { element: Element::Earth, kind: Kind::Animal }, center); // Earth eats Fire.
@@ -915,6 +930,7 @@ mod tests {
     #[test]
     fn feeding_kills_prey_feeds_the_predator_and_fires_on_consume() {
         let mut w = World::new(1, 32);
+        w.retune_ecology(EcologyTuning { hunt_weight: PerRace::filled(1000), ..EcologyTuning::default() });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
         let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center); // Fire eats Wood.
         let prey_id = w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center); // Same cell: certainly in reach.
@@ -938,6 +954,7 @@ mod tests {
     #[test]
     fn a_freshly_fed_predator_does_not_eat_again_until_satiated() {
         let mut w = World::new(4, 32);
+        w.retune_ecology(EcologyTuning { hunt_weight: PerRace::filled(1000), ..EcologyTuning::default() });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
         let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
         w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
@@ -988,6 +1005,7 @@ mod tests {
             // spawn's hp, which would spawn a second predator mid-test and
             // confound the feedings count this test is pinning down.
             repro_threshold: PerElement::filled(i32::MAX),
+            hunt_weight: PerRace::filled(1000),
             ..EcologyTuning::default()
         });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
@@ -1062,6 +1080,39 @@ mod tests {
     }
 
     #[test]
+    fn hunt_weight_zero_blocks_animal_predation_but_never_grazing() {
+        // Fire eats Wood. Spawn a satiated, in-reach Fire::Animal predator
+        // against BOTH a Wood::Animal and a Wood::Plant, with hunt_weight
+        // zeroed for every Animal race — the Animal prey must survive every
+        // tick (the roll can never succeed at weight 0), while the Plant
+        // prey, ungated, still gets grazed.
+        let mut w = World::new(20, 32);
+        w.retune_ecology(EcologyTuning { hunt_weight: PerRace::filled(0), ..EcologyTuning::default() });
+        let center = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
+        let prey_animal_id = w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
+        w.spawn(Race { element: Element::Wood, kind: Kind::Plant }, center);
+        let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
+        w.entities[pi].hunger = w.ecology.satiation[Element::Fire];
+
+        let log = InputLog::new();
+        for _ in 0..20 {
+            w.step(&log);
+            let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
+            w.entities[pi].hunger = w.ecology.satiation[Element::Fire]; // stay eligible every tick
+        }
+
+        assert!(
+            w.entities.iter().any(|e| e.id == prey_animal_id),
+            "Animal prey must never be eaten when hunt_weight is zero"
+        );
+        assert!(
+            !w.entities.iter().any(|e| e.element == Element::Wood && e.kind == Kind::Plant),
+            "Plant prey should still be grazed — grazing is unconditional on hunt_weight"
+        );
+    }
+
+    #[test]
     fn a_plant_never_moves() {
         // Structural, not "speed happens to be zero": jitter alone would
         // perturb an unrooted body even at speed zero, so this pins down
@@ -1085,6 +1136,7 @@ mod tests {
         w.retune_ecology(EcologyTuning {
             satiation: PerElement::filled(0),
             feed_gain: PerElement::filled(MAX_HP), // one meal alone would already overshoot
+            hunt_weight: PerRace::filled(1000),
             ..EcologyTuning::default()
         });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
@@ -1101,6 +1153,9 @@ mod tests {
     #[test]
     fn a_meal_that_crosses_repro_threshold_spawns_an_offspring() {
         let mut w = World::new(3, 32);
+        // Isolate the repro-threshold property under test from S3.3's
+        // hunt-weight roll, same as the satiation/dedup tests above.
+        w.retune_ecology(EcologyTuning { hunt_weight: PerRace::filled(1000), ..EcologyTuning::default() });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
         let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
         w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
@@ -1151,6 +1206,7 @@ mod tests {
         w.retune_ecology(EcologyTuning {
             starve_after: PerElement::filled(w.ecology.satiation[Element::Fire] + margin),
             starve_rate: PerElement::filled(1000),
+            hunt_weight: PerRace::filled(1000),
             ..EcologyTuning::default()
         });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));

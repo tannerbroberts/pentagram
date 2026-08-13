@@ -357,10 +357,17 @@ match) — a Plant can be eaten, never eat. `apply_attrition`/`apply_suppression
 (`ecology.rs`) are deliberately unchanged: plants still take terrain-based
 ring/star damage exactly like animals, on purpose.
 
-Not yet landed: hunt-weight-gated Animal-vs-Animal predation (a satiated,
-in-reach Animal predator still always eats Animal prey today, same as before
-the `Kind` split — S3.3's `hunt_weight` knob and `Channel::Hunt` roll change
-that); the animal FSM (`src/behavior.rs`, Flee/Hunt/Graze drive-selection —
+`EcologyTuning::hunt_weight` (`PerRace<u16>`) now gates the Animal-vs-Animal
+edge of `World::phase_feeding` too, via a new `Channel::Hunt` roll evaluated
+once per predator per tick (not per prey pair, so the outcome agrees with
+itself across every prey candidate a given predator is tested against in the
+same tick). Grazing (Animal-vs-Plant) remains fully unconditional — the roll
+only ever gates the Animal-prey edge. The shipped default is a uniform,
+deliberately near-zero 150‰ across every Animal row (Plant rows are unread
+and stay zero); real per-race differentiation is left to a future
+live-tuning pass.
+
+Not yet landed: the animal FSM (`src/behavior.rs`, Flee/Hunt/Graze drive-selection —
 S3.4); plant propagation (`phase_flora`, `Entity.size`, `PropagationTuning` —
 S3.5); and the `chaos` live view's two-axis (Element × Kind) support — it
 currently hardcodes every spawn to `Kind::Animal` and shows five columns, not

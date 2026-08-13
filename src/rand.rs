@@ -34,6 +34,11 @@ pub enum Channel {
     Terrain = 8,
     /// S1: climate's one-time static-geography draw (see `climate.rs`).
     Climate = 9,
+    /// S3.3: per-predator-per-tick roll gating Animal-vs-Animal predation
+    /// (`World::phase_feeding`) against a race's `hunt_weight`. Grazing Plant
+    /// prey never rolls this channel — only the Animal-prey edge is a dial.
+    /// See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
+    Hunt = 10,
     /// Reserved for ad-hoc debugging. Never read by shipped simulation code.
     Debug = 255,
 }

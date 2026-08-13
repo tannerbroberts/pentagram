@@ -45,6 +45,19 @@
 //! Animal predator still always eats Animal prey today, same as before) is
 //! still S3.3's job, not shipped yet.
 //!
+//! **Update, S3.3** — that gap is now closed too. `EcologyTuning::hunt_weight`
+//! (`PerRace<u16>`) now gates the Animal-vs-Animal edge of
+//! `World::phase_feeding` via a per-predator-per-tick roll on the new
+//! `Channel::Hunt` (rolled once per predator per tick, on `(seed, tick,
+//! predator id)` only, so it agrees with itself across every prey candidate
+//! tested against that predator this tick — never rolled per prey pair);
+//! grazing (Animal-vs-Plant) remains fully unconditional, exactly as before.
+//! The shipped default is a uniform 150‰ across every Animal row —
+//! deliberately "near zero" per the design brief, not a derived constant —
+//! with Plant rows left at zero since they are never read. Real per-race
+//! differentiation ("this animal is more carnivorous than that one") is
+//! future live-tuning work, not decided here.
+//!
 //! Every number below is a first guess, in the same spirit `race.rs` and
 //! `terrain.rs` state of their own tables: a starting point for the live
 //! tuning loop, not a derived constant.
@@ -53,7 +66,15 @@ use crate::element::PerElement;
 use crate::entity::Entity;
 use crate::fx::Fx;
 use crate::hash::{Hashable, Hasher};
+use crate::race::{Kind, PerRace, Race};
 use crate::terrain::Terrain;
+
+/// First-guess default for `EcologyTuning::hunt_weight`'s Animal rows — "near
+/// zero" per the design brief (docs/S3_ECOLOGY_LAYERS_DESIGN.md's forks list,
+/// item 3), not a derived constant. Which animal ships "more carnivorous"
+/// than another is an open live-tuning question (§13.6), not decided here —
+/// every Animal row ships this same uniform value until that tuning pass.
+const HUNT_WEIGHT_DEFAULT: u16 = 150;
 
 /// The rate knobs `World::phase_feeding` and the starvation half of
 /// `World::phase_aging` read. `PerElement`-shaped throughout, so it drops
@@ -97,10 +118,30 @@ pub struct EcologyTuning {
     /// degraded foraging, felt through the starvation machinery this file
     /// already owns rather than as direct damage.
     pub suppression_rate: PerElement<u16>,
+    /// Permille chance, per satiated in-reach Animal predator per tick, that
+    /// an Animal prey candidate is actually hunted rather than passed over —
+    /// the per-race dial that makes "carnivorous" a tunable spectrum instead
+    /// of a hardcoded herbivore/carnivore topology (`Element::eats()` is
+    /// reused as the edge; this only gates how often an Animal predator takes
+    /// that edge against Animal, not Plant, prey — grazing stays
+    /// unconditional). Rolled once per predator per tick, not per prey pair —
+    /// the roll depends only on (seed, tick, predator id), so it agrees with
+    /// itself across every prey candidate a predator is tested against in the
+    /// same tick. Plant rows are unread: a Plant is never a predator
+    /// (`World::phase_feeding`'s `Kind::Animal` gate), so their entries exist
+    /// only so `PerRace` stays uniformly 10-wide, not because anything
+    /// consults them. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5, §13.6.
+    pub hunt_weight: PerRace<u16>,
 }
 
 impl Default for EcologyTuning {
     fn default() -> EcologyTuning {
+        let mut hunt_weight = PerRace::filled(0u16);
+        for r in Race::ALL {
+            if r.kind == Kind::Animal {
+                *hunt_weight.get_mut(r) = HUNT_WEIGHT_DEFAULT;
+            }
+        }
         EcologyTuning {
             forage_radius: PerElement::filled(Fx::ratio(400, 100)),
             satiation: PerElement::filled(crate::race::RaceAttrs::FEED_PERIOD as u32),
@@ -131,6 +172,7 @@ impl Default for EcologyTuning {
             // `hunger` instead of a terrain stock — same first-guess
             // intensity, new target.
             suppression_rate: PerElement::filled(14),
+            hunt_weight,
         }
     }
 }
@@ -159,6 +201,9 @@ impl Hashable for EcologyTuning {
             h.u16(*v);
         }
         for (_, v) in self.suppression_rate.iter() {
+            h.u16(*v);
+        }
+        for (_, v) in self.hunt_weight.iter() {
             h.u16(*v);
         }
     }
@@ -234,6 +279,18 @@ mod tests {
     }
 
     #[test]
+    fn hunt_weight_defaults_to_near_zero_for_animals_and_zero_for_plants() {
+        let t = EcologyTuning::default();
+        for r in Race::ALL {
+            let w = t.hunt_weight[r];
+            match r.kind {
+                Kind::Animal => assert!(w > 0 && w < 1000, "{}-Animal hunt_weight should be a real, sub-certain dial, got {}", r.element.name(), w),
+                Kind::Plant => assert_eq!(w, 0, "{}-Plant hunt_weight is unread and should stay zero", r.element.name()),
+            }
+        }
+    }
+
+    #[test]
     fn hash_notices_every_field() {
         let a = EcologyTuning::default();
         let base = {
@@ -258,6 +315,8 @@ mod tests {
         attrition_rate.attrition_rate[Element::Fire] += 1;
         let mut suppression_rate = a;
         suppression_rate.suppression_rate[Element::Fire] += 1;
+        let mut hunt_weight = a;
+        hunt_weight.hunt_weight[Race { element: Element::Fire, kind: Kind::Animal }] += 1;
 
         for (name, tuning) in [
             ("forage_radius", forage),
@@ -268,6 +327,7 @@ mod tests {
             ("repro_threshold", repro_threshold),
             ("attrition_rate", attrition_rate),
             ("suppression_rate", suppression_rate),
+            ("hunt_weight", hunt_weight),
         ] {
             let mut h = Hasher::new();
             tuning.hash_into(&mut h);

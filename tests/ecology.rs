@@ -15,7 +15,7 @@ use pentagram::ecology::EcologyTuning;
 use pentagram::element::{Element, PerElement};
 use pentagram::fx::{Fx, V2};
 use pentagram::input::InputLog;
-use pentagram::race::{attrs, Kind, Race};
+use pentagram::race::{attrs, Kind, PerRace, Race};
 use pentagram::replay::{build, record, scripted_log, verify};
 use pentagram::world::World;
 
@@ -116,6 +116,7 @@ fn reproduction_sustains_fire_past_its_own_maximum_lifespan() {
         starve_after: PerElement::filled(1_200), // comfortably inside `ticks`, so it's a real pressure.
         starve_rate: PerElement::filled(1),
         repro_threshold: PerElement::filled(60),
+        hunt_weight: PerRace::filled(1000),
         ..EcologyTuning::default() // shipped attrition/suppression defaults — this test exercises them too.
     });
 
