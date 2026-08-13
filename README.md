@@ -428,6 +428,15 @@ it currently hardcodes every spawn to `Kind::Animal` and shows five columns,
 not ten (S3.6). See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §12 for the full
 staged rollout this fits into.
 
+> **Windowed client update:** `chaos-ui` (`src/bin/chaos-ui.rs`, `eframe`/`egui`)
+> is a second client alongside the terminal `chaos` live view, driving the exact
+> same tuning table — now `src/tuning.rs`, in the library, so neither client
+> copies it and drifts. It adds a real 2D map: every body drawn at its actual
+> position, terrain coloured by what has soaked into each cell, with
+> per-race/per-plant/per-terrain-element visibility toggles and a map-wide
+> terrain concentration summary. It is a spectator/tuning surface only — no
+> player-embodiment layer, nothing here steers or claims a body.
+
 ## Next
 
 Nothing past S3.2 has a design yet. The "Known and deliberate" section above

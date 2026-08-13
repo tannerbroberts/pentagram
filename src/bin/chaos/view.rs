@@ -10,7 +10,7 @@ use pentagram::element::{Element, PerElement};
 use pentagram::race::{Kind, PerRace, Race, RateBand};
 use pentagram::world::World;
 
-use crate::knobs::{abbrev, grouped, Axis, Tuning, PAGES};
+use pentagram::tuning::{abbrev, grouped, Axis, Tuning, PAGES, RGB};
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Half-cell glyphs, indexed by how crowded the sampled cell is: a lone body
@@ -20,15 +20,6 @@ const LOWER: [char; 5] = ['.', '▁', '▄', '▄', '▄'];
 /// Population samples kept. One per frame at 20 fps, so about a minute of wall
 /// clock — long enough to see a boom and the bust that follows it.
 pub const HISTORY: usize = 48;
-
-/// Element colours, matching the design document.
-const RGB: PerElement<(u8, u8, u8)> = PerElement([
-    (127, 176, 105), // Wood
-    (226, 105, 74),  // Fire
-    (211, 164, 69),  // Earth
-    (173, 164, 206), // Metal
-    (89, 160, 198),  // Water
-]);
 
 const DIM: &str = "\x1b[38;2;110;118;134m";
 const BRIGHT: &str = "\x1b[38;2;232;234;239m";
@@ -77,7 +68,7 @@ impl View {
         Race { element: self.element(), kind: self.kind }
     }
 
-    pub fn knobs(&self) -> &'static [crate::knobs::Knob] {
+    pub fn knobs(&self) -> &'static [pentagram::tuning::Knob] {
         PAGES[self.page].knobs
     }
 
@@ -446,8 +437,8 @@ fn footer(out: &mut impl Write, v: &View, t: &Tuning, run: &Run, _cols: usize) {
     let e = v.element();
     let race = v.race();
     let stepping = match k.step {
-        crate::knobs::Step::Add(n) => format!("-/+ ±{n}   [/] ±{}", n * 10),
-        crate::knobs::Step::Scale => "-/+ ±10%   [/] ×2".to_string(),
+        pentagram::tuning::Step::Add(n) => format!("-/+ ±{n}   [/] ±{}", n * 10),
+        pentagram::tuning::Step::Scale => "-/+ ±10%   [/] ×2".to_string(),
     };
     let _ = writeln!(
         out,

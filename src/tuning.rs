@@ -1,21 +1,28 @@
 //! The tuning table, as a thing you can point at.
 //!
 //! Every knob is one row in [`PAGES`]: a name, how to format it, how big a
-//! nudge is, its safe range, and a getter/setter pair. Adding a knob to the
-//! live view means adding a row here and nothing else — the grid, the cursor,
-//! the stepping and the detail line all fall out of this table.
+//! nudge is, its safe range, and a getter/setter pair. This lives in the
+//! library — not in a binary — so that the terminal live view and a windowed
+//! client can both drive the exact same knobs from the exact same table,
+//! rather than one of them copying it and drifting. Adding a knob means
+//! adding a row here and nothing else — any client's grid, cursor, stepping
+//! and detail line all fall out of this table.
 //!
 //! Ranges are not decoration. `deposit_unit` feeds `demand`, which is summed in
 //! milli-units over a terrain period; the crate builds with `overflow-checks`
 //! in every profile, so a knob with no ceiling is a panic waiting for a curious
 //! user. Every `hi` here is chosen to keep the worst case inside `u64`.
 
-use pentagram::behavior::BehaviorTuning;
-use pentagram::climate::ClimateTuning;
-use pentagram::ecology::{EcologyTuning, PropagationTuning};
-use pentagram::fx::Fx;
-use pentagram::race::{Channel, Edge, PerRace, Race, RaceAttrs, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES};
-use pentagram::terrain::TerrainTuning;
+use std::fmt::Write as _;
+
+use crate::behavior::BehaviorTuning;
+use crate::climate::ClimateTuning;
+use crate::ecology::{EcologyTuning, PropagationTuning};
+use crate::element::Element;
+use crate::fx::Fx;
+use crate::race::{
+    Channel, Edge, PerRace, Race, RaceAttrs, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Axis {
@@ -28,10 +35,10 @@ pub enum Axis {
     Element,
 }
 
-/// Everything the live view can change, in one struct.
+/// Everything a client can change, in one struct.
 ///
 /// `races` is the real tuning table and goes straight into the world.
-/// `restock` and `wander` are the *view's* knobs, not the simulation's: Stage 0
+/// `restock` and `wander` are the *client's* knobs, not the simulation's: Stage 0
 /// has no reproduction and no goals, so without a hand on the tiller the map
 /// empties out and the survivors travel in straight lines. Both are applied as
 /// ordinary input commands, which is exactly what a player would be.
@@ -39,7 +46,7 @@ pub enum Axis {
 pub struct Tuning {
     pub races: PerRace<RaceAttrs>,
     pub restock: PerRace<u32>,
-    pub terrain: TerrainTuning,
+    pub terrain: crate::terrain::TerrainTuning,
     pub climate: ClimateTuning,
     pub ecology: EcologyTuning,
     pub propagation: PropagationTuning,
@@ -51,7 +58,7 @@ impl Tuning {
         Tuning {
             races: RACES,
             restock: PerRace::filled(per_race),
-            terrain: TerrainTuning::default(),
+            terrain: crate::terrain::TerrainTuning::default(),
             climate: ClimateTuning::default(),
             ecology: EcologyTuning::default(),
             propagation: PropagationTuning::default(),
@@ -441,4 +448,217 @@ pub fn grouped(v: i64) -> String {
         out.push(c);
     }
     format!("{sign}{out}")
+}
+
+// ----------------------------------------------------------------------
+// Element colours, shared by every client that draws a map or a legend.
+// ----------------------------------------------------------------------
+
+/// Element colours, matching the design document. `terrain.rs` owns the one
+/// definition (it needs the values itself, for [`crate::terrain::blend_rgb`]);
+/// re-exported here so every client — terminal or windowed — reaches it
+/// through the tuning table instead of a second copy drifting out of sync.
+pub use crate::terrain::RGB;
+
+// ----------------------------------------------------------------------
+// Writing the live table back out as Rust source.
+// ----------------------------------------------------------------------
+
+/// Write the live table back out as Rust, to a *new* file. `src/race.rs` is
+/// hand-written and full of comments explaining why each number is what it is;
+/// clobbering that from a UI would throw away the part that matters.
+pub fn write_table(t: &Tuning) -> std::io::Result<String> {
+    // `CHAOS_ROOT` is what the wrapper exports, and it is the only thing that
+    // reliably identifies *which* checkout is running. Without it, write beside
+    // the caller rather than guessing at a path that may belong to a different
+    // copy of the tree.
+    let path = match std::env::var("CHAOS_ROOT") {
+        Ok(root) => format!("{root}/src/race.tuned.rs"),
+        Err(_) => "race.tuned.rs".to_string(),
+    };
+
+    let mut s = String::from(
+        "// Written by the chaos live view. Not compiled — copy the rows you want\n\
+         // into the RACES table in race.rs, keeping the comments there. The\n\
+         // TERRAIN_TUNING, CLIMATE_TUNING and ECOLOGY_TUNING constants below\n\
+         // follow the same rule: copy fields into terrain.rs / climate.rs /\n\
+         // ecology.rs by hand. PROPAGATION_TUNING and BEHAVIOR_TUNING follow the\n\
+         // same copy-by-hand rule, into ecology.rs and behavior.rs respectively.\n\n\
+         pub const RACES: PerRace<RaceAttrs> = PerRace([\n",
+    );
+    for race in Race::ALL {
+        let a = t.races[race];
+        let _ = write!(
+            s,
+            "    RaceAttrs {{\n        \
+             element: Element::{},\n        \
+             kind: Kind::{},\n        \
+             lifespan: {},\n        \
+             lifespan_variance: {},\n        \
+             speed: Fx::ratio({}, 100),\n        \
+             radius: Fx::ratio({}, 100),\n        \
+             deposit_unit: {},\n        \
+             deposit: RateBand::new({}, {}, {}, {}),\n        \
+             deposit_mix: ChannelMix::new({}, {}, {}, {}, {}),\n        \
+             consume_unit: {},\n        \
+             consume: RateBand::new({}, {}, {}, {}),\n        \
+             consume_mix: ChannelMix::new({}, {}, {}, {}, {}),\n        \
+             fantasy: {:?},\n    }},\n",
+            race.element.name(),
+            race.kind.name(),
+            a.lifespan,
+            a.lifespan_variance,
+            (a.speed.raw() as i64 * 100 + 32_768) / 65_536,
+            (a.radius.raw() as i64 * 100 + 32_768) / 65_536,
+            a.deposit_unit,
+            a.deposit.floor,
+            a.deposit.nominal,
+            a.deposit.ceiling,
+            a.deposit.burst_ticks,
+            mix(&a, false, 0), mix(&a, false, 1), mix(&a, false, 2), mix(&a, false, 3), mix(&a, false, 4),
+            a.consume_unit,
+            a.consume.floor,
+            a.consume.nominal,
+            a.consume.ceiling,
+            a.consume.burst_ticks,
+            mix(&a, true, 0), mix(&a, true, 1), mix(&a, true, 2), mix(&a, true, 3), mix(&a, true, 4),
+            a.fantasy,
+        );
+    }
+    s.push_str("]);\n\n");
+
+    let tt = &t.terrain;
+    let _ = write!(
+        s,
+        "pub const TERRAIN_TUNING: TerrainTuning = TerrainTuning {{\n    \
+         diffuse_rate: PerElement([{}, {}, {}, {}, {}]),\n    \
+         diffuse_cap: PerElement([{}, {}, {}, {}, {}]),\n}};\n\n",
+        tt.diffuse_rate[Element::ALL[0]], tt.diffuse_rate[Element::ALL[1]], tt.diffuse_rate[Element::ALL[2]],
+        tt.diffuse_rate[Element::ALL[3]], tt.diffuse_rate[Element::ALL[4]],
+        tt.diffuse_cap[Element::ALL[0]], tt.diffuse_cap[Element::ALL[1]], tt.diffuse_cap[Element::ALL[2]],
+        tt.diffuse_cap[Element::ALL[3]], tt.diffuse_cap[Element::ALL[4]],
+    );
+
+    let ct = &t.climate;
+    let _ = write!(
+        s,
+        "pub const CLIMATE_TUNING: ClimateTuning = ClimateTuning {{\n    \
+         base_range: PerElement([{:?}, {:?}, {:?}, {:?}, {:?}]),\n    \
+         floor: PerElement([{}, {}, {}, {}, {}]),\n    \
+         season_peak: PerElement([{}, {}, {}, {}, {}]),\n    \
+         season_ticks: {},\n}};\n",
+        ct.base_range[Element::ALL[0]], ct.base_range[Element::ALL[1]], ct.base_range[Element::ALL[2]],
+        ct.base_range[Element::ALL[3]], ct.base_range[Element::ALL[4]],
+        ct.floor[Element::ALL[0]], ct.floor[Element::ALL[1]], ct.floor[Element::ALL[2]],
+        ct.floor[Element::ALL[3]], ct.floor[Element::ALL[4]],
+        ct.season_peak[Element::ALL[0]], ct.season_peak[Element::ALL[1]], ct.season_peak[Element::ALL[2]],
+        ct.season_peak[Element::ALL[3]], ct.season_peak[Element::ALL[4]],
+        ct.season_ticks,
+    );
+
+    let ec = &t.ecology;
+    let _ = write!(
+        s,
+        "pub const ECOLOGY_TUNING: EcologyTuning = EcologyTuning {{\n    \
+         forage_radius: PerElement([Fx::ratio({}, 100), Fx::ratio({}, 100), Fx::ratio({}, 100), \
+         Fx::ratio({}, 100), Fx::ratio({}, 100)]),\n    \
+         satiation: PerElement([{}, {}, {}, {}, {}]),\n    \
+         feed_gain: PerElement([{}, {}, {}, {}, {}]),\n    \
+         starve_after: PerElement([{}, {}, {}, {}, {}]),\n    \
+         starve_rate: PerElement([{}, {}, {}, {}, {}]),\n    \
+         repro_threshold: PerElement([{}, {}, {}, {}, {}]),\n    \
+         attrition_rate: PerElement([{}, {}, {}, {}, {}]),\n    \
+         suppression_rate: PerElement([{}, {}, {}, {}, {}]),\n}};\n",
+        cells(ec.forage_radius[Element::ALL[0]]), cells(ec.forage_radius[Element::ALL[1]]),
+        cells(ec.forage_radius[Element::ALL[2]]), cells(ec.forage_radius[Element::ALL[3]]),
+        cells(ec.forage_radius[Element::ALL[4]]),
+        ec.satiation[Element::ALL[0]], ec.satiation[Element::ALL[1]], ec.satiation[Element::ALL[2]],
+        ec.satiation[Element::ALL[3]], ec.satiation[Element::ALL[4]],
+        ec.feed_gain[Element::ALL[0]], ec.feed_gain[Element::ALL[1]], ec.feed_gain[Element::ALL[2]],
+        ec.feed_gain[Element::ALL[3]], ec.feed_gain[Element::ALL[4]],
+        ec.starve_after[Element::ALL[0]], ec.starve_after[Element::ALL[1]], ec.starve_after[Element::ALL[2]],
+        ec.starve_after[Element::ALL[3]], ec.starve_after[Element::ALL[4]],
+        ec.starve_rate[Element::ALL[0]], ec.starve_rate[Element::ALL[1]], ec.starve_rate[Element::ALL[2]],
+        ec.starve_rate[Element::ALL[3]], ec.starve_rate[Element::ALL[4]],
+        ec.repro_threshold[Element::ALL[0]], ec.repro_threshold[Element::ALL[1]], ec.repro_threshold[Element::ALL[2]],
+        ec.repro_threshold[Element::ALL[3]], ec.repro_threshold[Element::ALL[4]],
+        ec.attrition_rate[Element::ALL[0]], ec.attrition_rate[Element::ALL[1]], ec.attrition_rate[Element::ALL[2]],
+        ec.attrition_rate[Element::ALL[3]], ec.attrition_rate[Element::ALL[4]],
+        ec.suppression_rate[Element::ALL[0]], ec.suppression_rate[Element::ALL[1]], ec.suppression_rate[Element::ALL[2]],
+        ec.suppression_rate[Element::ALL[3]], ec.suppression_rate[Element::ALL[4]],
+    );
+
+    let pt = &t.propagation;
+    let _ = write!(
+        s,
+        "\npub const PROPAGATION_TUNING: PropagationTuning = PropagationTuning {{\n    \
+         period: PerElement([{}, {}, {}, {}, {}]),\n    \
+         chance: PerElement([{}, {}, {}, {}, {}]),\n    \
+         offspring_size: PerElement([{}, {}, {}, {}, {}]),\n    \
+         root_min: PerElement([{}, {}, {}, {}, {}]),\n    \
+         dispersal: PerElement([Fx::ratio({}, 100), Fx::ratio({}, 100), Fx::ratio({}, 100), \
+         Fx::ratio({}, 100), Fx::ratio({}, 100)]),\n    \
+         crowd_max: PerElement([{}, {}, {}, {}, {}]),\n}};\n",
+        pt.period[Element::ALL[0]], pt.period[Element::ALL[1]], pt.period[Element::ALL[2]],
+        pt.period[Element::ALL[3]], pt.period[Element::ALL[4]],
+        pt.chance[Element::ALL[0]], pt.chance[Element::ALL[1]], pt.chance[Element::ALL[2]],
+        pt.chance[Element::ALL[3]], pt.chance[Element::ALL[4]],
+        pt.offspring_size[Element::ALL[0]], pt.offspring_size[Element::ALL[1]], pt.offspring_size[Element::ALL[2]],
+        pt.offspring_size[Element::ALL[3]], pt.offspring_size[Element::ALL[4]],
+        pt.root_min[Element::ALL[0]], pt.root_min[Element::ALL[1]], pt.root_min[Element::ALL[2]],
+        pt.root_min[Element::ALL[3]], pt.root_min[Element::ALL[4]],
+        cells(pt.dispersal[Element::ALL[0]]), cells(pt.dispersal[Element::ALL[1]]),
+        cells(pt.dispersal[Element::ALL[2]]), cells(pt.dispersal[Element::ALL[3]]),
+        cells(pt.dispersal[Element::ALL[4]]),
+        pt.crowd_max[Element::ALL[0]], pt.crowd_max[Element::ALL[1]], pt.crowd_max[Element::ALL[2]],
+        pt.crowd_max[Element::ALL[3]], pt.crowd_max[Element::ALL[4]],
+    );
+
+    // BehaviorTuning is PerRace-shaped (10 rows, not 5) — build each field's
+    // array one line per race, same as the RACES loop above, rather than the
+    // 5-wide inline style the Element-scoped constants use.
+    let bt = &t.behavior;
+    let mut flee = String::new();
+    let mut sense = String::new();
+    let mut turn = String::new();
+    for race in Race::ALL {
+        let _ = writeln!(flee, "        {}, // {} {}", bt.flee_threshold[race], race.element.name(), race.kind.name());
+        let _ = writeln!(
+            sense,
+            "        Fx::ratio({}, 100), // {} {}",
+            cells(bt.sense_radius[race]), race.element.name(), race.kind.name()
+        );
+        let _ = writeln!(
+            turn,
+            "        Fx::ratio({}, 1000), // {} {}",
+            (bt.turn_rate[race].raw() as i64 * 1000) / 65_536, race.element.name(), race.kind.name()
+        );
+    }
+    let _ = write!(
+        s,
+        "\npub const BEHAVIOR_TUNING: BehaviorTuning = BehaviorTuning {{\n    \
+         flee_threshold: PerRace([\n{}    ]),\n    \
+         sense_radius: PerRace([\n{}    ]),\n    \
+         turn_rate: PerRace([\n{}    ]),\n}};\n",
+        flee, sense, turn,
+    );
+
+    std::fs::write(&path, s)?;
+    Ok(path)
+}
+
+/// Whole cells, one fractional digit lost to the same rounding `write_table`
+/// already accepts for `speed`/`radius` — this file round-trips for a human
+/// to copy by hand, not bit-for-bit.
+fn cells(v: Fx) -> i64 {
+    (v.raw() as i64 * 100 + 32_768) / 65_536
+}
+
+fn mix(a: &RaceAttrs, consume: bool, i: usize) -> u16 {
+    let c = Channel::ALL[i];
+    if consume {
+        a.consume_mix.permille(c)
+    } else {
+        a.deposit_mix.permille(c)
+    }
 }

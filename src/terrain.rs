@@ -51,9 +51,10 @@ use crate::hash::{Hashable, Hasher};
 use crate::race::{PerRace, Race};
 use crate::rand::{rand_below, Channel};
 
-/// Element colours. The same five constants `chaos/view.rs::RGB` defines —
-/// kept here too so a future filmstrip renderer and the live view can both
-/// read one definition once they're unified (S1's second pass).
+/// Element colours. The single definition — `tuning::RGB` re-exports this
+/// rather than keeping its own copy, so the filmstrip renderer (`blend_rgb`,
+/// below) and every live-view client read one table instead of two that can
+/// drift apart.
 pub const RGB: PerElement<(u8, u8, u8)> = PerElement([
     (127, 176, 105), // Wood
     (226, 105, 74),  // Fire

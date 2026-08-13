@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "Stage 0 — deterministic simulation skeleton"
 
-# Zero dependencies, deliberately. Every external crate is a place a float,
-# a HashMap iteration, or a wall-clock read can enter the simulation.
+# The simulation library remains zero-dependency, deliberately: every external
+# crate is a place a float, a HashMap iteration, or a wall-clock read can enter
+# the simulation. `eframe` exists only for the `chaos-ui` binary — a usability
+# dependency, explicitly accepted as temporary, quarantined to presentation.
+# Nothing under src/ outside bin/ may import it.
 [dependencies]
+eframe = "0.29"
 
 # Overflow behaviour MUST match between debug and release. Rust's default is
 # panic-in-debug / wrap-in-release, which is two different simulations from one
