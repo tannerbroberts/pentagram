@@ -31,6 +31,7 @@
 //! `phase_terrain`. [`world`] is the tick loop, and its phase order is a
 //! wire format, not an implementation detail.
 
+pub mod behavior;
 pub mod climate;
 pub mod ecology;
 pub mod element;
@@ -45,6 +46,7 @@ pub mod replay;
 pub mod terrain;
 pub mod world;
 
+pub use behavior::{BehaviorTuning, Drive};
 pub use climate::{Climate, ClimateTuning};
 pub use ecology::EcologyTuning;
 pub use element::{Element, PerElement};

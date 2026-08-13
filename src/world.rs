@@ -12,6 +12,7 @@
 //! tick. `terrain` (S1) runs the six fixed-order operators described in
 //! `docs/S1_TERRAIN_DESIGN.md` and `terrain.rs`'s own doc comment.
 
+use crate::behavior::{BehaviorTuning, Drive};
 use crate::climate::{Climate, ClimateTuning};
 use crate::ecology::EcologyTuning;
 #[cfg(test)]
@@ -50,6 +51,19 @@ pub struct Stats {
     /// S2: deaths where hunger had already crossed `starve_after` — a subset
     /// of `deaths`, not an addition to it.
     pub starved: u64,
+    /// S3.4: an Animal's FSM drive this tick was Graze — no danger sensed
+    /// above `flee_threshold`, and either not hungry or no prey sensed
+    /// within `sense_radius`.
+    pub grazed: u64,
+    /// S3.4: an Animal's FSM drive this tick was Hunt — hungry, with prey
+    /// (either Kind) sensed within `sense_radius`, steering toward it.
+    /// Whether the catch itself succeeds is `World::phase_feeding`'s
+    /// separate satiation/reach/hunt-weight gating.
+    pub hunted: u64,
+    /// S3.4: an Animal's FSM drive this tick was Flee — the body's own cell
+    /// held enough of what eats it (`element.eaten_by()`) to cross
+    /// `flee_threshold`, steering away from the worst neighbouring cell.
+    pub fled: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +97,10 @@ pub struct World {
     /// S2: feeding/starvation/reproduction rates. Covered by
     /// [`World::state_hash`] the same way `terrain_tuning` is.
     pub ecology: EcologyTuning,
+
+    /// S3.4: the animal FSM's rate/reach knobs. Covered by
+    /// [`World::state_hash`] the same way `ecology` is.
+    pub behavior: BehaviorTuning,
 
     deposit_gov: PerRace<Governor>,
     consume_gov: PerRace<Governor>,
@@ -118,6 +136,7 @@ impl World {
             climate: Climate::new(seed, size_cells, &climate_tuning),
             climate_tuning,
             ecology: EcologyTuning::default(),
+            behavior: BehaviorTuning::default(),
             deposit_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).deposit))),
             consume_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).consume))),
             deposit_demand: PerRace::filled(0),
@@ -163,6 +182,13 @@ impl World {
     /// and starvation carry no governor-style internal state to reconcile.
     pub fn retune_ecology(&mut self, ecology: EcologyTuning) {
         self.ecology = ecology;
+    }
+
+    /// Swap the behavior tuning table. A straight field replacement, same as
+    /// `retune_ecology` — the FSM carries no internal state to reconcile,
+    /// only read fresh every tick.
+    pub fn retune_behavior(&mut self, behavior: BehaviorTuning) {
+        self.behavior = behavior;
     }
 
     /// A deterministic starting population, spread evenly across the ten
@@ -306,19 +332,51 @@ impl World {
     fn phase_movement(&mut self) {
         let (seed, tick, size) = (self.seed, self.tick, self.size);
         let races = self.races;
+        let ecology = self.ecology;
+        let behavior = self.behavior;
         let mut acted: PerRace<u64> = PerRace::filled(0);
+        let (mut grazed, mut hunted, mut fled) = (0u64, 0u64, 0u64);
 
-        for e in self.entities.iter_mut() {
-            if !e.alive {
+        // S3.4: snapshot-then-apply. Every Animal's desired heading is
+        // derived from an immutable read of this tick's pre-movement
+        // positions, before any body in this same phase has moved —
+        // otherwise steering would depend on iteration order rather than
+        // only on (seed, tick, ids), the same reasoning phase_feeding's own
+        // snapshot-then-apply already documents. See
+        // `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §6.
+        let n = self.entities.len();
+        let mut drives: Vec<Option<(Drive, Option<V2>)>> = vec![None; n];
+        for i in 0..n {
+            if self.entities[i].alive && self.entities[i].kind == Kind::Animal {
+                drives[i] = Some(crate::behavior::drive(&self.entities, &self.terrain, &ecology, &behavior, i));
+            }
+        }
+
+        for i in 0..n {
+            if !self.entities[i].alive {
                 continue;
             }
-            if e.kind == Kind::Plant {
+            if self.entities[i].kind == Kind::Plant {
                 // Rooted: a structural skip, not `speed == 0` alone — the
                 // jitter term below would still random-walk a zero-speed
                 // body if this ran. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4.
                 continue;
             }
-            let race = e.race();
+            let race = self.entities[i].race();
+
+            if let Some((d, desired)) = drives[i] {
+                match d {
+                    Drive::Graze => grazed += 1,
+                    Drive::Hunt => hunted += 1,
+                    Drive::Flee => fled += 1,
+                }
+                if let Some(target) = desired {
+                    let heading = self.entities[i].heading;
+                    self.entities[i].heading = crate::behavior::steer(heading, target, behavior.turn_rate[race]);
+                }
+            }
+
+            let e = &mut self.entities[i];
             let step = e.heading.scale(races[race].speed);
             let jitter = V2::new(
                 rand_signed(seed, tick, e.id, Channel::MoveJitter) * JITTER,
@@ -349,6 +407,10 @@ impl World {
                 *acted.get_mut(race) += 1;
             }
         }
+
+        self.stats.grazed += grazed;
+        self.stats.hunted += hunted;
+        self.stats.fled += fled;
 
         for (race, n) in acted.iter() {
             if *n > 0 {
@@ -671,6 +733,7 @@ impl World {
         self.terrain_tuning.hash_into(&mut h);
         self.climate_tuning.hash_into(&mut h);
         self.ecology.hash_into(&mut h);
+        self.behavior.hash_into(&mut h);
         for (_, g) in self.deposit_gov.iter() {
             g.hash_into(&mut h);
         }
@@ -869,6 +932,14 @@ mod tests {
             feed_gain: PerElement::filled(1),
             ..EcologyTuning::default()
         });
+        assert_ne!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn state_hash_notices_a_retuned_behavior() {
+        let a = world();
+        let mut b = a.clone();
+        b.retune_behavior(BehaviorTuning { flee_threshold: PerRace::filled(1), ..BehaviorTuning::default() });
         assert_ne!(a.state_hash(), b.state_hash());
     }
 
@@ -1128,6 +1199,22 @@ mod tests {
 
         let e = w.entities.iter().find(|e| e.id == id).expect("plant should still be alive");
         assert_eq!(e.pos, start, "a rooted plant must never move, bit-for-bit");
+    }
+
+    #[test]
+    fn the_fsm_actually_drives_something_over_a_run() {
+        // Not S3.7's full exit condition (that needs every drive to fire
+        // under the shipped table over a longer, more careful run) — just
+        // proof phase_movement's wiring is live, not dead code: with a
+        // mixed population running long enough, at least Graze fires (it's
+        // the default), and the mechanism doesn't panic or desync.
+        let mut w = World::new(77, 64);
+        w.seed_population(10);
+        let log = InputLog::new();
+        for _ in 0..3000 {
+            w.step(&log);
+        }
+        assert!(w.stats.grazed > 0, "grazed should have fired at least once");
     }
 
     #[test]

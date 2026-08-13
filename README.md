@@ -367,12 +367,36 @@ deliberately near-zero 150‰ across every Animal row (Plant rows are unread
 and stay zero); real per-race differentiation is left to a future
 live-tuning pass.
 
-Not yet landed: the animal FSM (`src/behavior.rs`, Flee/Hunt/Graze drive-selection —
-S3.4); plant propagation (`phase_flora`, `Entity.size`, `PropagationTuning` —
-S3.5); and the `chaos` live view's two-axis (Element × Kind) support — it
-currently hardcodes every spawn to `Kind::Animal` and shows five columns, not
-ten (S3.6). See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §12 for the full staged
-rollout these fit into.
+Every Animal body now has steering intelligence (`src/behavior.rs`, S3.4): a
+`Drive` — `Graze`, `Hunt`, or `Flee` — is recomputed fresh every tick from
+`(hunger, sensed neighbourhood, terrain)` rather than stored on `Entity`, in
+fixed priority, always Flee > Hunt > Graze. Flee reuses
+`ecology::apply_attrition`'s own danger signal — the terrain concentration of
+`element.eaten_by()` at the body's cell — and steers away from whichever of
+its four grid neighbours holds the most of it once `BehaviorTuning::
+flee_threshold` is crossed. Hunt gates on the same `hunger >=
+ecology.satiation[element]` test `World::phase_feeding` already uses, plus a
+prey element sensed within a new, deliberately larger
+`BehaviorTuning::sense_radius` (sensing at a distance and catching within
+`EcologyTuning::forage_radius`'s bite range are different things); sensing
+does not distinguish prey `Kind`, so whether a caught body ends up grazed or
+hunt-weight-gated stays entirely `phase_feeding`'s downstream decision. Graze
+is the default — no danger above threshold, and either not hungry or no prey
+sensed — and steers nowhere, today's unmodified wander. Steering itself
+(`behavior::steer`) is a bounded per-tick turn toward the desired heading via
+`BehaviorTuning::turn_rate`, never a snap, the same bounded-propagation
+discipline diffusion caps apply to terrain. `World::phase_movement` derives
+every Animal's drive from an immutable snapshot of this tick's pre-movement
+positions before any body in the same phase has moved, so steering never
+depends on iteration order; three new `Stats` counters (`grazed`, `hunted`,
+`fled`) track which drive fired.
+
+Not yet landed: plant propagation (`phase_flora`, `Entity.size`,
+`PropagationTuning` — S3.5); and the `chaos` live view's two-axis (Element ×
+Kind) support — it currently hardcodes every spawn to `Kind::Animal` and
+shows five columns, not ten (S3.6). See
+`docs/S3_ECOLOGY_LAYERS_DESIGN.md` §12 for the full staged rollout these fit
+into.
 
 ## Next
 
