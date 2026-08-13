@@ -1,0 +1,57 @@
+//! Pentagram — Stage 0: the determinism skeleton.
+//!
+//! Exit condition for this stage: 10 000 ticks replay bit-identical from
+//! `(seed, input_log)`, asserted at every tick rather than only at the end.
+//!
+//! # The invariants this crate exists to hold
+//!
+//! | | | Where it lives |
+//! |---|---|---|
+//! | I   | Bounded propagation — nothing acts instantly at a distance | [`terrain::apply_diffusion`] |
+//! | II  | No floating point in simulation state | [`fx`] |
+//! | III | Randomness is stateless | [`rand`] |
+//! | IV  | Iteration order is defined | [`world`], [`element::PerElement`] |
+//! | V   | Inputs replicate; state does not | [`input`] |
+//! | VI  | Every tick is reproducible | [`replay`] |
+//! | VII | Bounded churn — rates are floored and capped | [`governor`] |
+//!
+//! # Reading order
+//!
+//! [`fx`] and [`rand`] are the foundation — everything else is downstream of
+//! those two files being correct. [`element`] is the five-cycle. [`race`] and
+//! [`governor`] carry the design's rate model. [`terrain`] and [`climate`]
+//! are Stage 1's field and `phase_terrain`'s six fixed-order operator slots —
+//! see `docs/S1_TERRAIN_DESIGN.md`. Terrain is not its own actor: only four
+//! of those six slots (deposit, consume, climate, diffusion) live in
+//! `terrain`/`climate` themselves; the other two are `ecology`'s
+//! `apply_attrition`/`apply_suppression`, which read terrain and act on
+//! bodies rather than the other way around. [`ecology`] is Stage 2's
+//! feeding/starvation/reproduction rates plus those two terrain-tick-gated
+//! operators, read by `world`'s `phase_feeding`, `phase_aging`, and
+//! `phase_terrain`. [`world`] is the tick loop, and its phase order is a
+//! wire format, not an implementation detail.
+
+pub mod climate;
+pub mod ecology;
+pub mod element;
+pub mod entity;
+pub mod fx;
+pub mod governor;
+pub mod hash;
+pub mod input;
+pub mod race;
+pub mod rand;
+pub mod replay;
+pub mod terrain;
+pub mod world;
+
+pub use climate::{Climate, ClimateTuning};
+pub use ecology::EcologyTuning;
+pub use element::{Element, PerElement};
+pub use fx::{Fx, V2};
+pub use governor::{Governor, Grant};
+pub use input::{CmdKind, Command, InputLog};
+pub use race::{attrs, RaceAttrs, RateBand, TERRAIN_PERIOD};
+pub use replay::{record, verify, Divergence, Trace};
+pub use terrain::{Terrain, TerrainTuning};
+pub use world::World;
