@@ -124,19 +124,44 @@ impl Hashable for Entity {
 pub const MATURITY_PERMILLE: u64 = 250;
 
 /// S3.5: `Entity.size`'s pure growth function, purely derived from
-/// `(birth_size, age, lifespan)`, never accumulated -- so it can be, and is
-/// (`World::phase_aging`), recomputed from scratch every tick. Linear growth
-/// from `birth_size` at age 0 to 1000 at `MATURITY_PERMILLE` of lifespan,
-/// then held at 1000. `birth_size == 1000` collapses this to a constant 1000
-/// at every age with no special-casing needed -- the shape every Animal, and
-/// any Plant already past maturity, actually takes.
-pub fn grown_size(birth_size: u16, age: u64, lifespan: u64) -> u16 {
+/// `(birth_size, age, lifespan, ceiling)`, never accumulated -- so it can
+/// be, and is (`World::phase_aging`), recomputed from scratch every tick.
+/// Linear growth from `birth_size` at age 0 to `ceiling` at
+/// `MATURITY_PERMILLE` of lifespan, then held at `ceiling`. `birth_size ==
+/// ceiling` collapses this to a constant at every age with no
+/// special-casing needed -- the shape every Animal (ceiling always 1000)
+/// actually takes.
+///
+/// S3.8: `ceiling` is no longer hardcoded to 1000 -- callers pass a
+/// per-tick value (`growth_ceiling`, for a Plant) so growth can be capped
+/// below full size when the local terrain doesn't yet support it. If
+/// `ceiling <= birth_size` there's no growth room this tick (e.g. poor
+/// local stock), so this returns `birth_size` unchanged rather than
+/// shrinking below it -- since size is recomputed fresh every tick, an
+/// improving ceiling later still resumes growth from here.
+pub fn grown_size(birth_size: u16, age: u64, lifespan: u64, ceiling: u16) -> u16 {
+    if ceiling <= birth_size {
+        return birth_size;
+    }
     let maturity_age = lifespan.saturating_mul(MATURITY_PERMILLE) / 1000;
     if maturity_age == 0 || age >= maturity_age {
-        return 1000;
+        return ceiling;
     }
     let birth = birth_size as u64;
-    (birth + (1000 - birth) * age / maturity_age).min(1000) as u16
+    let target = ceiling as u64;
+    (birth + (target - birth) * age / maturity_age).min(target) as u16
+}
+
+/// The size ceiling a growing Plant's local own-element terrain stock
+/// currently supports, in permille (capped at 1000, matching `grown_size`'s
+/// scale). `growth_ref == 0` disables scaling entirely (always full 1000,
+/// same as an Animal). Pure integer math -- Invariant II.
+#[inline]
+pub fn growth_ceiling(own_element_stock: u16, growth_ref: u16) -> u16 {
+    if growth_ref == 0 {
+        return 1000;
+    }
+    ((own_element_stock as u32 * 1000) / growth_ref as u32).min(1000) as u16
 }
 
 /// Deterministic per-individual lifespan. Variance is per-mille around the
@@ -349,14 +374,14 @@ mod tests {
     // `phase_aging` actually calls it.
     #[test]
     fn grown_size_starts_at_birth_size() {
-        assert_eq!(grown_size(200, 0, 4000), 200);
+        assert_eq!(grown_size(200, 0, 4000, 1000), 200);
     }
 
     #[test]
     fn grown_size_reaches_and_holds_full_size_at_maturity() {
         // maturity_age = 4000 * 250 / 1000 = 1000.
-        assert_eq!(grown_size(200, 1000, 4000), 1000);
-        assert_eq!(grown_size(200, 1000000, 4000), 1000, "held at 1000 past maturity");
+        assert_eq!(grown_size(200, 1000, 4000, 1000), 1000);
+        assert_eq!(grown_size(200, 1000000, 4000, 1000), 1000, "held at 1000 past maturity");
     }
 
     #[test]
@@ -364,19 +389,43 @@ mod tests {
         // maturity_age = 4000 * 250 / 1000 = 1000; age 500 is halfway there.
         let birth = 200u64;
         let expected = (birth + (1000 - birth) * 500 / 1000) as u16;
-        assert_eq!(grown_size(200, 500, 4000), expected);
+        assert_eq!(grown_size(200, 500, 4000, 1000), expected);
     }
 
     #[test]
     fn grown_size_at_full_birth_size_is_constant_at_every_age() {
         for age in [0, 1, 500, 1000, 5000] {
-            assert_eq!(grown_size(1000, age, 4000), 1000, "age {age}");
+            assert_eq!(grown_size(1000, age, 4000, 1000), 1000, "age {age}");
         }
     }
 
     #[test]
     fn grown_size_does_not_panic_on_zero_lifespan() {
-        assert_eq!(grown_size(200, 0, 0), 1000);
-        assert_eq!(grown_size(200, 5, 0), 1000);
+        assert_eq!(grown_size(200, 0, 0, 1000), 1000);
+        assert_eq!(grown_size(200, 5, 0, 1000), 1000);
+    }
+
+    // S3.8: growth toward a ceiling other than a hardcoded 1000.
+    #[test]
+    fn grown_size_stops_at_a_ceiling_below_1000() {
+        // maturity_age = 4000 * 250 / 1000 = 1000.
+        assert_eq!(grown_size(200, 1000, 4000, 500), 500);
+        assert_eq!(grown_size(200, 1000000, 4000, 500), 500, "held at ceiling past maturity");
+    }
+
+    #[test]
+    fn grown_size_never_drops_below_birth_size_when_ceiling_is_below_it() {
+        assert_eq!(grown_size(600, 1000, 4000, 500), 600, "no growth room -- stays at birth size");
+        assert_eq!(grown_size(600, 0, 4000, 500), 600);
+    }
+
+    #[test]
+    fn growth_ceiling_scales_linearly_and_caps_at_1000() {
+        assert_eq!(growth_ceiling(1000, 1000), 1000, "stock == growth_ref reaches full");
+        assert_eq!(growth_ceiling(500, 1000), 500, "stock == growth_ref/2 is about half");
+        assert_eq!(growth_ceiling(2000, 1000), 1000, "stock > growth_ref still caps at 1000");
+        assert_eq!(growth_ceiling(0, 1000), 0, "no stock, no ceiling room");
+        assert_eq!(growth_ceiling(12345, 0), 1000, "growth_ref == 0 always gives full 1000");
+        assert_eq!(growth_ceiling(0, 0), 1000, "growth_ref == 0 always gives full 1000");
     }
 }

@@ -276,10 +276,11 @@ pub struct PropagationTuning {
     pub chance: PerElement<u16>,
     /// Permille of full size a new offspring is born at (`Entity.size`).
     pub offspring_size: PerElement<u16>,
-    /// Minimum terrain stock of the plant's own element required at the
-    /// candidate cell for rooting to succeed -- the same raw stock scale
-    /// `EcologyTuning::attrition_rate` reads (up to `u16::MAX`), not a
-    /// per-mille fraction.
+    /// Minimum terrain stock of the plant's *habitat* element (`Element::
+    /// habitat`, the ingredient it draws down from terrain to sustain
+    /// itself -- not its own element) required at the candidate cell for
+    /// rooting to succeed -- the same raw stock scale `EcologyTuning::
+    /// attrition_rate` reads (up to `u16::MAX`), not a per-mille fraction.
     pub root_min: PerElement<u16>,
     /// Max scatter offset from the parent, same shape as `world::BIRTH_SCATTER`.
     pub dispersal: PerElement<Fx>,
@@ -289,6 +290,16 @@ pub struct PropagationTuning {
     /// deposit more of their element, which makes rooting easier, which
     /// allows more plants.
     pub crowd_max: PerElement<u16>,
+    /// Own-element terrain stock at which a growing Plant's size ceiling
+    /// reaches full (1000 permille) -- the "made of" mechanic: a Plant's
+    /// growth potential scales with how much of its own element the local
+    /// terrain already holds (self-reinforcing, since Plants are
+    /// existence-dominant depositors of that same element). 0 disables
+    /// scaling (ceiling is always 1000, matching an Animal). Same raw stock
+    /// scale `root_min` uses, not a per-mille fraction. First-guess
+    /// default, like every other number in this table -- a starting point
+    /// for live tuning, not a derived constant.
+    pub growth_ref: PerElement<u16>,
 }
 
 impl Default for PropagationTuning {
@@ -300,6 +311,7 @@ impl Default for PropagationTuning {
             root_min: PerElement::filled(300),
             dispersal: PerElement::filled(Fx::ratio(300, 100)),
             crowd_max: PerElement::filled(3),
+            growth_ref: PerElement::filled(1000),
         }
     }
 }
@@ -322,6 +334,9 @@ impl Hashable for PropagationTuning {
             h.i32(v.raw());
         }
         for (_, v) in self.crowd_max.iter() {
+            h.u16(*v);
+        }
+        for (_, v) in self.growth_ref.iter() {
             h.u16(*v);
         }
     }
@@ -514,6 +529,8 @@ mod tests {
         dispersal.dispersal[Element::Fire] += Fx::ONE;
         let mut crowd_max = a;
         crowd_max.crowd_max[Element::Fire] += 1;
+        let mut growth_ref = a;
+        growth_ref.growth_ref[Element::Fire] += 1;
 
         for (name, tuning) in [
             ("period", period),
@@ -522,6 +539,7 @@ mod tests {
             ("root_min", root_min),
             ("dispersal", dispersal),
             ("crowd_max", crowd_max),
+            ("growth_ref", growth_ref),
         ] {
             let mut h = Hasher::new();
             tuning.hash_into(&mut h);

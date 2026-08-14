@@ -14,12 +14,16 @@
 //!   N/E/S/W visiting order, so a tie breaks structurally rather than by
 //!   iteration accident) holds the most of that same element.
 //! - **Hunt** gates on the *same* `hunger >= ecology.satiation[element]` test
-//!   `World::phase_feeding` already uses, plus a prey body of
-//!   `element.eats()` sensed within `sense_radius[race]` — deliberately
-//!   larger than `EcologyTuning::forage_radius`, since sensing at a distance
-//!   and catching within bite range are different things. Nearest by
-//!   `len_sq()` wins; ties break by lowest id (Invariant IV). Sensing does
-//!   not distinguish prey `Kind` — whether a caught body ends up grazed or
+//!   `World::phase_feeding` already uses, plus a prey body sensed within
+//!   `sense_radius[race]` — deliberately larger than `EcologyTuning::
+//!   forage_radius`, since sensing at a distance and catching within bite
+//!   range are different things. A candidate counts as prey if it's a
+//!   same-element `Kind::Plant` (`element.eats_plant()`, grazing) or a
+//!   ring-adjacent `Kind::Animal` (`element.eats_animal()`, hunting) — the
+//!   same Kind-aware split `World::phase_feeding` pairs on, so sensing and
+//!   catching never disagree about who's valid prey. Nearest by `len_sq()`
+//!   wins; ties break by lowest id (Invariant IV). Which relation matched is
+//!   not reported back — whether a caught body ends up grazed or
 //!   hunt-weight-gated is entirely `World::phase_feeding`'s decision,
 //!   downstream of and unaware of this module.
 //! - **Graze** is the default: no danger above threshold, and either not
@@ -152,15 +156,23 @@ pub fn drive(entities: &[Entity], terrain: &Terrain, ecology: &EcologyTuning, tu
     }
 
     // Hunt — the same satiation gate phase_feeding already uses, plus a
-    // sensed prey body within reach. Sensing does not care about the
-    // candidate's Kind.
+    // sensed prey body within reach. Sensing now does care about the
+    // candidate's Kind, in order to pick the right relation per Kind: a
+    // same-element Plant (eats_plant, grazing) or a ring-adjacent Animal
+    // (eats_animal, hunting).
     if e.hunger >= ecology.satiation[e.element] {
-        let prey_el = e.element.eats();
+        let plant_prey_el = e.element.eats_plant();
+        let animal_prey_el = e.element.eats_animal();
         let reach = tuning.sense_radius[race];
         let reach_sq = reach * reach;
         let mut nearest: Option<(usize, Fx)> = None;
         for (j, other) in entities.iter().enumerate() {
-            if j == i || !other.alive || other.element != prey_el {
+            if j == i || !other.alive {
+                continue;
+            }
+            let is_prey = (other.kind == Kind::Plant && other.element == plant_prey_el)
+                || (other.kind == Kind::Animal && other.element == animal_prey_el);
+            if !is_prey {
                 continue;
             }
             let d = other.pos - e.pos;

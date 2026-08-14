@@ -342,8 +342,20 @@ impl World {
                     // immediately. Animals collapse to a constant 1000 since
                     // birth_size equals full size, so the formula never
                     // moves them.
+                    // S3.8: a growing Plant's ceiling is no longer a flat
+                    // 1000 -- it's capped by how much of the Plant's own
+                    // element the local terrain currently holds (the "made
+                    // of" mechanic, `growth_ceiling`/`growth_ref`). An
+                    // Animal's ceiling stays a flat 1000, unchanged.
                     let birth_size = if e.kind == Kind::Plant { propagation.offspring_size[e.element] } else { 1000 };
-                    e.size = crate::entity::grown_size(birth_size, e.age, e.lifespan);
+                    let ceiling = if e.kind == Kind::Plant {
+                        let (x, y) = self.terrain.cell_of(e.pos);
+                        let stock = self.terrain.cell(x, y)[e.element];
+                        crate::entity::growth_ceiling(stock, propagation.growth_ref[e.element])
+                    } else {
+                        1000
+                    };
+                    e.size = crate::entity::grown_size(birth_size, e.age, e.lifespan, ceiling);
                     if e.is_expired() || e.hp <= 0 {
                         e.alive = false;
                         Some((e.race(), starving))
@@ -517,29 +529,35 @@ impl World {
     }
 
     /// 5 — feeding (S2). A body whose `hunger` has reached `ecology.satiation`
-    /// and which is within `ecology.forage_radius` of prey on the ring edge
-    /// it eats (`Element::eats`) consumes it outright: the prey dies exactly
-    /// as it would from age or starvation (`charge_death`), and the
-    /// predator's `hp` rises and fires `OnConsume` — the channel every
-    /// race's deposit/consume mix has carried a nonzero share for since
-    /// Stage 0, with nothing to fire it until now. A meal that carries a
-    /// body's `hp` up across `repro_threshold` spawns one offspring through
-    /// the ordinary `World::spawn` path, so it charges `OnBirth` the same
-    /// way a command-spawned or seeded body always has. Without the
-    /// `satiation` gate every predator in reach eats every single tick it
-    /// can, which empirically collapses every prey population within a few
-    /// hundred ticks. The shipped `EcologyTuning` defaults are, like
-    /// `TerrainTuning`'s and `ClimateTuning`'s before them, a first guess
-    /// for the live tuning loop — a uniform five-way predation ring is a
-    /// hard balance problem, and nothing here promises the shipped numbers
-    /// converge to a stable population on their own.
+    /// and which is within `ecology.forage_radius` of prey it can pair
+    /// against consumes it outright: the prey dies exactly as it would from
+    /// age or starvation (`charge_death`), and the predator's `hp` rises and
+    /// fires `OnConsume` — the channel every race's deposit/consume mix has
+    /// carried a nonzero share for since Stage 0, with nothing to fire it
+    /// until now. Pairing is now split by prey Kind (S3.8): an Animal grazes
+    /// a same-element Plant (`Element::eats_plant`, the Kind-sibling's
+    /// product) or hunts a ring-adjacent Animal (`Element::eats_animal`, the
+    /// original ring relation) — a Plant is never a predator either way. A
+    /// meal that carries a body's `hp` up across `repro_threshold` spawns one
+    /// offspring through the ordinary `World::spawn` path, so it charges
+    /// `OnBirth` the same way a command-spawned or seeded body always has.
+    /// Without the `satiation` gate every predator in reach eats every
+    /// single tick it can, which empirically collapses every prey
+    /// population within a few hundred ticks. The shipped `EcologyTuning`
+    /// defaults are, like `TerrainTuning`'s and `ClimateTuning`'s before
+    /// them, a first guess for the live tuning loop — a uniform five-way
+    /// predation ring is a hard balance problem, and nothing here promises
+    /// the shipped numbers converge to a stable population on their own.
     ///
     /// Pairwise, same O(n²) shape as `phase_collisions` and for the same
     /// reason — correct and fast enough here, and a future uniform-grid
-    /// broadphase would want to serve both passes at once.
-    /// `element.rs`'s ring arithmetic guarantees at most one direction of any
-    /// pair can be a predation match (no element eats its own eater — see
-    /// `nothing_beats_itself_and_the_two_edges_never_coincide`), so every
+    /// broadphase would want to serve both passes at once. At most one
+    /// direction of any pair can be a predation match: for a same-element
+    /// Animal/Plant pair only the Animal side is ever eligible to be
+    /// predator (the Kind check below), and for an Animal/Animal pair
+    /// `element.rs`'s ring arithmetic guarantees at most one direction can
+    /// match (no element eats its own eater — see
+    /// `nothing_beats_itself_and_the_two_edges_never_coincide`). So every
     /// ordered pair is checked once, in ascending-id order (Invariant IV),
     /// for a result that depends on that fixed order and never on how many
     /// candidates a body could have fed on.
@@ -563,25 +581,30 @@ impl World {
                 if !self.entities[j].alive || eaten[j] {
                     continue;
                 }
-                // Pairing derivation is still purely element-based (the ring
-                // edge, `Element::eats`) — Kind only gates *who is allowed to
-                // be the predator side* of that edge, below.
+                // Pairing derivation is Kind-aware and relation-correct: an
+                // Animal vs. a same-element Plant pairs on `eats_plant`
+                // (grazing), an Animal vs. a ring-adjacent Animal pairs on
+                // `eats_animal` (hunting), and every other Kind combination
+                // (Plant-vs-Plant, or the non-Animal side of a cross-Kind
+                // pair) never pairs. A Plant is never a predator. Animal-vs-
+                // Animal predation additionally rolls a per-race hunt-weight
+                // gate below (S3.3) — grazing Plant prey stays fully
+                // unconditional. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
                 let a = self.entities[i].element;
                 let b = self.entities[j].element;
-                let (pred, prey) = if a.eats() == b {
-                    (i, j)
-                } else if b.eats() == a {
-                    (j, i)
-                } else {
-                    continue;
+                let ka = self.entities[i].kind;
+                let kb = self.entities[j].kind;
+                let pair = match (ka, kb) {
+                    (Kind::Animal, Kind::Plant) if a.eats_plant() == b => Some((i, j)),
+                    (Kind::Plant, Kind::Animal) if b.eats_plant() == a => Some((j, i)),
+                    (Kind::Animal, Kind::Animal) if a.eats_animal() == b => Some((i, j)),
+                    (Kind::Animal, Kind::Animal) if b.eats_animal() == a => Some((j, i)),
+                    _ => None,
                 };
-                // A Plant is never a predator. Animal-vs-Animal predation
-                // additionally rolls a per-race hunt-weight gate below
-                // (S3.3) — grazing Plant prey stays fully unconditional. See
-                // `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §5.
-                if self.entities[pred].kind != Kind::Animal {
-                    continue;
-                }
+                let (pred, prey) = match pair {
+                    Some(p) => p,
+                    None => continue,
+                };
                 // `eaten[pred]` matters even though the outer loop's
                 // `eaten[i]` guard looks like it should already cover this:
                 // that guard runs once, before this inner loop starts, but
@@ -717,7 +740,11 @@ impl World {
             let candidate = self.clamp_to_bounds(e.pos + V2::new(dx, dy));
 
             let (cx, cy) = self.terrain.cell_of(candidate);
-            let stock = self.terrain.cell(cx, cy)[el];
+            // S3.8: root_min gates on the candidate cell's stock of the
+            // Plant's *habitat* element (what it draws down from terrain to
+            // sustain itself), not its own element -- terrain rich in what
+            // this plant consumes is good habitat for it.
+            let stock = self.terrain.cell(cx, cy)[el.habitat()];
             if (stock as u32) < propagation.root_min[el] as u32 {
                 self.stats.rooted_rejected += 1;
                 continue;
@@ -1324,17 +1351,19 @@ mod tests {
 
     #[test]
     fn hunt_weight_zero_blocks_animal_predation_but_never_grazing() {
-        // Fire eats Wood. Spawn a satiated, in-reach Fire::Animal predator
-        // against BOTH a Wood::Animal and a Wood::Plant, with hunt_weight
-        // zeroed for every Animal race — the Animal prey must survive every
-        // tick (the roll can never succeed at weight 0), while the Plant
-        // prey, ungated, still gets grazed.
+        // Fire.eats_animal() == Wood (ring): Fire::Animal hunts Wood::Animal.
+        // Fire.eats_plant() == Fire (same element): Fire::Animal grazes
+        // Fire::Plant. Spawn a satiated, in-reach Fire::Animal predator
+        // against BOTH prey, with hunt_weight zeroed for every Animal race —
+        // the Animal prey must survive every tick (the roll can never
+        // succeed at weight 0), while the Plant prey, ungated, still gets
+        // grazed.
         let mut w = World::new(20, 32);
         w.retune_ecology(EcologyTuning { hunt_weight: PerRace::filled(0), ..EcologyTuning::default() });
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
         let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, center);
         let prey_animal_id = w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, center);
-        w.spawn(Race { element: Element::Wood, kind: Kind::Plant }, center);
+        w.spawn(Race { element: Element::Fire, kind: Kind::Plant }, center);
         let pi = w.entities.iter().position(|e| e.id == pred_id).unwrap();
         w.entities[pi].hunger = w.ecology.satiation[Element::Fire];
 
@@ -1350,7 +1379,7 @@ mod tests {
             "Animal prey must never be eaten when hunt_weight is zero"
         );
         assert!(
-            !w.entities.iter().any(|e| e.element == Element::Wood && e.kind == Kind::Plant),
+            !w.entities.iter().any(|e| e.element == Element::Fire && e.kind == Kind::Plant),
             "Plant prey should still be grazed — grazing is unconditional on hunt_weight"
         );
     }
@@ -1596,9 +1625,17 @@ mod tests {
         // test's loop small while still exercising the real `phase_aging`
         // call site, not just the pure `grown_size` function in isolation
         // (`entity.rs` covers that in isolation already).
+        //
+        // S3.8: growth is now additionally capped by `growth_ceiling`, a
+        // function of the local *own*-element (Fire) terrain stock — seed
+        // it at (at least) `growth_ref` so the ceiling is a full 1000 and
+        // this test still proves the age/lifespan growth curve, not the new
+        // stock-scaling behavior (`entity.rs` covers that in isolation).
         let mut w = World::new(34, 32);
         let race = Race { element: Element::Fire, kind: Kind::Plant };
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
+        let (cx, cy) = w.terrain.cell_of(center);
+        w.terrain.cell_mut(cx, cy)[Element::Fire] = w.propagation.growth_ref[Element::Fire];
         let id = w.spawn_sized(race, center, 100);
 
         let log = InputLog::new();

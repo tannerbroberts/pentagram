@@ -469,6 +469,27 @@ there is really only one.
 > — S3 neither fixes nor worsens it; the failure predates the Kind split
 > and is unrelated to it.
 
+> **S3.8 update: eats_plant/eats_animal split, habitat-gated rooting,
+> terrain-scaled growth.** `Element::eats()` used to pair both Animal-vs-
+> Plant grazing and Animal-vs-Animal hunting in `World::phase_feeding` and
+> `behavior::drive`'s Hunt sensing — one ring relation doing two jobs.
+> `element.rs` now splits it: `eats_plant()` is grazing, same element, no
+> ring offset (an Animal eats its Kind-sibling Plant's product); `eats_animal()`
+> is hunting, the original ring relation, unchanged. `PropagationTuning::
+> root_min` (`World::phase_flora`'s rooting gate) now reads the candidate
+> cell's stock of the Plant's *habitat* element (`Element::habitat()`, the
+> ingredient it draws from terrain) instead of its own element — terrain
+> pre-seeding in `tests/layers.rs` moved accordingly (a Wood-Plant now needs
+> Water stock, not Wood). `terrain.rs`'s `apply_consume` is renamed the same
+> way (`r.element.habitat()`), same math as before. Separately, a growing
+> Plant's size ceiling is no longer a flat 1000: `entity::grown_size` takes
+> a `ceiling` parameter, and `World::phase_aging` computes it per-tick from
+> the *own*-element local terrain stock via the new `entity::growth_ceiling`
+> and `PropagationTuning::growth_ref` (first-guess default 1000) — a Plant
+> literally made of more of its own element locally can grow bigger, self-
+> reinforcing since Plants are existence-dominant depositors of that
+> element.
+
 ## Next
 
 Nothing past S3 has a design yet. The "Known and deliberate" section above

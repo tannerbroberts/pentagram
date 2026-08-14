@@ -106,7 +106,7 @@ fn at_least_one_plant_roots_before_the_shipped_table_starves_it() {
     let mut w = World::new(0x53AA, SIZE);
     for x in 0..SIZE {
         for y in 0..SIZE {
-            w.terrain.cell_mut(x, y)[Element::Wood] = 2_000;
+            w.terrain.cell_mut(x, y)[Element::Wood.habitat()] = 2_000;
         }
     }
     for k in 0..50u32 {
@@ -171,7 +171,7 @@ fn plant_population_growth_is_bounded_by_crowd_max() {
     let mut w = World::new(0x53AA, SIZE);
     for x in 0..SIZE {
         for y in 0..SIZE {
-            w.terrain.cell_mut(x, y)[Element::Wood] = 2_000;
+            w.terrain.cell_mut(x, y)[Element::Wood.habitat()] = 2_000;
         }
     }
     for k in 0..50u32 {

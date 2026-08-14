@@ -83,6 +83,32 @@ impl Element {
         self.generates()
     }
 
+    /// Animal-vs-Plant diet: same element, no ring offset. "Eats" is
+    /// animal-only behavior -- an Animal of element X eats the Kind-sibling
+    /// Plant of the same element X's product, not a ring-adjacent element.
+    #[inline]
+    pub const fn eats_plant(self) -> Element {
+        self
+    }
+
+    /// Animal-vs-Animal predation: the original ring-backward relation,
+    /// unchanged. Kept under its own name because grazing (eats_plant) and
+    /// hunting no longer share one relation.
+    #[inline]
+    pub const fn eats_animal(self) -> Element {
+        self.eats()
+    }
+
+    /// What a race draws down from terrain to sustain itself -- one
+    /// ring-step removed from what it deposits (mathematically identical to
+    /// eats_animal, kept as its own name because this is terrain
+    /// consumption, not predation). Read by apply_consume (every race) and
+    /// phase_flora's rooting gate (Plants only).
+    #[inline]
+    pub const fn habitat(self) -> Element {
+        self.eats()
+    }
+
     /// Does `self` hold an advantage over `other` — on either edge?
     #[inline]
     pub fn beats(self, other: Element) -> bool {
@@ -198,6 +224,27 @@ mod tests {
             for b in Element::ALL {
                 assert!(!(a.beats(b) && b.beats(a)), "{} and {}", a.name(), b.name());
             }
+        }
+    }
+
+    #[test]
+    fn eats_plant_is_always_the_same_element() {
+        for e in Element::ALL {
+            assert_eq!(e.eats_plant(), e);
+        }
+    }
+
+    #[test]
+    fn eats_animal_matches_the_original_ring() {
+        for e in Element::ALL {
+            assert_eq!(e.eats_animal(), e.eats());
+        }
+    }
+
+    #[test]
+    fn habitat_matches_eats_animal() {
+        for e in Element::ALL {
+            assert_eq!(e.habitat(), e.eats_animal());
         }
     }
 

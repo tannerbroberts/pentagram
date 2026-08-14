@@ -29,10 +29,11 @@
 //! left open.
 //!
 //! **Deposit writes `race.element` (self); consume removes
-//! `race.element.eats()`** (the ring, read backward) — a Fire body's
-//! deposit is a scorch mark on the Fire layer, its consumption burns down
-//! the Wood layer under it. This is this design's interpretive call, not a
-//! README fact (see the design doc §9.2).
+//! `race.element.habitat()`** (same ring-backward math as `eats()`/
+//! `eats_animal()`, read here as terrain consumption rather than predation)
+//! — a Fire body's deposit is a scorch mark on the Fire layer, its
+//! consumption burns down the Wood layer under it. This is this design's
+//! interpretive call, not a README fact (see the design doc §9.2).
 //!
 //! Diffusion is not per-cell — it reads neighbours — so it snapshots the
 //! *whole grid* into a scratch double-buffer before writing anything back.
@@ -365,9 +366,11 @@ pub fn apply_deposit(
 }
 
 /// Operator 2. Each race's `last_consume[r].granted` becomes per-cell
-/// decrements to `r.element.eats()` — the ring, read backward — at the same
-/// cells operator 1 used (a Fire body's consumption burns down the Wood
-/// layer under it, not the Fire layer).
+/// decrements to `r.element.habitat()` — the same ring-backward math as
+/// `eats()`/`eats_animal()`, but read here as terrain consumption/habitat
+/// drawdown rather than predation — at the same cells operator 1 used (a
+/// Fire body's consumption burns down the Wood layer under it, not the Fire
+/// layer).
 pub fn apply_consume(
     terrain: &mut Terrain,
     occ: &Occupancy,
@@ -378,7 +381,7 @@ pub fn apply_consume(
     for r in Race::ALL {
         apportion(
             terrain,
-            r.element.eats(),
+            r.element.habitat(),
             last_consume[r].granted,
             &occ.weight[r],
             seed,
