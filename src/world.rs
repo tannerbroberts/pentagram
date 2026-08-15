@@ -185,7 +185,21 @@ impl World {
     /// one knob that does *not* reach back — every body already alive keeps the
     /// span it rolled at birth, so lowering it thins the population by
     /// attrition rather than by mass execution.
-    pub fn retune(&mut self, races: PerRace<RaceAttrs>) {
+    pub fn retune(&mut self, mut races: PerRace<RaceAttrs>) {
+        // Bug 4 (Invariant VIII audit): a bare field replacement, unlike the
+        // tuning-knob path (`tuning.rs`'s `Conversion::set_share_rebalanced`
+        // knobs), does nothing on its own to keep `deposit_share +
+        // body_share + waste_share == 1000` — and a `Conversion` that
+        // breaks that sum makes `terrain::apply_conversion`'s `waste_amt`
+        // remainder subtraction underflow and panic (`overflow-checks =
+        // true` in every profile). This is the second of the two
+        // enforcement points the fix adds — real, not a `debug_assert` that
+        // compiles out in release — so a live retune that somehow carries
+        // an invalid `Conversion` (through a path other than the knob
+        // table) is corrected here rather than accepted as-is.
+        for r in Race::ALL {
+            races[r].conversion.clamp_shares();
+        }
         self.races = races;
         for r in Race::ALL {
             self.consume_gov.get_mut(r).set_band(races[r].consume);
@@ -474,26 +488,34 @@ impl World {
                     e.size = crate::entity::grown_size(birth_size, e.age, e.lifespan, ceiling);
                     if e.is_expired() || e.hp <= 0 {
                         e.alive = false;
-                        Some((e.race(), starving, e.pos, e.material))
+                        // Invariant VIII (bug 1): a corpse's carried stock
+                        // and bundled items are material too -- taken out of
+                        // the dying `Entity` here (carried is `Copy`, items
+                        // is moved out via `mem::take` since `Entity` isn't)
+                        // so `charge_death` below can deposit them at the
+                        // death position along with `material`.
+                        let carried = e.carried;
+                        let items = std::mem::take(&mut e.items);
+                        Some((e.race(), starving, e.pos, e.material, carried, items))
                     } else {
                         None
                     }
                 }
             };
-            if let Some((race, starving, pos, material)) = dead {
+            if let Some((race, starving, pos, material, carried, items)) = dead {
                 if starving {
                     self.stats.starved += 1;
                 }
-                self.charge_death(race, pos, material);
+                self.charge_death(race, pos, material, &carried, &items);
             }
         }
     }
 
     /// Charge the `OnDeath` habitat-draw demand for one body's race, count
-    /// the death, and return the body's own held material to terrain.
-    /// Shared by natural/starvation death (`phase_aging`) and predation
-    /// (`phase_feeding`) — a corpse terraforms the same way regardless of
-    /// what ended the body.
+    /// the death, and return the body's own held material, carried stock and
+    /// items to terrain. Shared by natural/starvation death (`phase_aging`)
+    /// and predation (`phase_feeding`) — a corpse decomposes the same way
+    /// regardless of what ended the body.
     ///
     /// Invariant VIII: `material` is the dying body's own `Entity.material`
     /// at the moment of death, deposited back to terrain as `race.element`
@@ -507,11 +529,36 @@ impl World {
     /// *before* calling this, so `material` is already `0` for prey eaten
     /// this tick — the material moved to the predator, it did not also fall
     /// to the ground, so there is no double count.
-    fn charge_death(&mut self, race: Race, pos: V2, material: u64) {
+    ///
+    /// `carried` (loose stock of other elements) and `items` (bundled
+    /// `Item`s) are a second, previously-unaccounted pool every death path
+    /// used to just drop on the floor of `phase_reap`'s `retain` — bug 1 of
+    /// the Invariant VIII conservation audit. **Design decision:** unlike
+    /// `material`, a predator never inherits its prey's `carried`/`items` —
+    /// both always fall to the ground at the death position, regardless of
+    /// cause of death (old age, starvation, or predation). Chosen over
+    /// "the predator loots the corpse" for two reasons: it is the simpler,
+    /// more uniform rule (one code path, `charge_death`, handles every death
+    /// the same way, rather than predation needing a second transfer
+    /// mechanism on top of the one `phase_feeding` already has for
+    /// `material`); and thematically it is the more defensible reading —
+    /// predation ("you are what you eat") plausibly transfers the prey's
+    /// own flesh, but there is no reason a predator's stomach also
+    /// inherits a stack of ore the prey happened to be carrying or a
+    /// bundled item in its pouch. Both pools are deposited at `pos`, each at
+    /// its own element, exactly like an ordinary `BreakItem`/mined-stock
+    /// return would.
+    fn charge_death(&mut self, race: Race, pos: V2, material: u64, carried: &PerElement<u64>, items: &[Item]) {
         let a = self.races[race];
         self.stats.deaths += 1;
         *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnDeath);
         crate::terrain::deposit_at(&mut self.terrain, race.element, material, pos);
+        for (e, &amt) in carried.iter() {
+            crate::terrain::deposit_at(&mut self.terrain, e, amt, pos);
+        }
+        for item in items {
+            crate::terrain::deposit_at(&mut self.terrain, item.element, item.quantity, pos);
+        }
     }
 
     /// 3 — move, jitter, and reflect off the bounds.
@@ -791,6 +838,46 @@ impl World {
             }
         }
 
+        // Invariant VIII, Animal predation only ("you are what you eat"):
+        // each predator's material transfer must see its own prey's *final*
+        // material — including whatever that prey itself gained as a
+        // predator earlier in this very tick — not the prey's raw
+        // pre-transfer value. `ate` only ever has fed[pred] set once per
+        // predator and eaten[prey] set once per prey (bug 5's own analysis:
+        // each entity ate at most one prey and was eaten by at most one
+        // predator this tick), so the pairings found this tick form simple
+        // chains, never branching. Resolving `i`'s transfer-in by first
+        // recursively resolving `ate[i]` (its prey) — memoized by
+        // `resolved`, so a chain is only ever walked once no matter which
+        // end of it this loop reaches first — makes the result a pure
+        // function of this tick's `ate` pairing data, not of ascending
+        // array-index iteration order (Invariant IV/VI): a 3-body chain
+        // X-eats-Y-eats-Z now always credits X with X+Y+Z's material,
+        // regardless of whether X or Y happens to sit at the lower array
+        // index. Without this, whichever of X/Y resolved first under plain
+        // ascending-index iteration could read the other's material before
+        // its own chain-gain had been folded in, silently misrouting mass
+        // typed as the wrong element once `charge_death` deposited the
+        // orphaned remainder under the intermediate body's own race.
+        fn resolve_material(i: usize, entities: &mut [Entity], ate: &[Option<usize>], resolved: &mut [bool]) {
+            if resolved[i] {
+                return;
+            }
+            resolved[i] = true;
+            if let Some(prey) = ate[i] {
+                resolve_material(prey, entities, ate, resolved);
+                let gained = entities[prey].material;
+                entities[i].material = entities[i].material.saturating_add(gained);
+                entities[prey].material = 0;
+            }
+        }
+        let mut resolved = vec![false; n];
+        for (i, &was_fed) in fed.iter().enumerate() {
+            if was_fed {
+                resolve_material(i, &mut self.entities, &ate, &mut resolved);
+            }
+        }
+
         let mut births: Vec<(Race, V2, u32)> = Vec::new();
         for (i, &was_fed) in fed.iter().enumerate() {
             if !was_fed {
@@ -805,19 +892,6 @@ impl World {
             self.stats.feedings += 1;
             *self.consume_demand.get_mut(race) += races[race].consume_per(DepChannel::OnConsume);
 
-            // Invariant VIII, Animal predation only ("you are what you
-            // eat"): the prey's entire current material transfers to the
-            // predator, in full, before the prey is marked dead below — so
-            // `charge_death`'s terrain-return sees `material == 0` for it
-            // and does not also deposit the same units to the ground.
-            // Grazing (Plant prey) is included here too, same mechanism,
-            // same rule.
-            if let Some(prey_idx) = ate[i] {
-                let gained = self.entities[prey_idx].material;
-                self.entities[i].material = self.entities[i].material.saturating_add(gained);
-                self.entities[prey_idx].material = 0;
-            }
-
             if before < ecology.repro_threshold[el] && after >= ecology.repro_threshold[el] {
                 births.push((race, self.entities[i].pos, self.entities[i].id));
             }
@@ -828,9 +902,21 @@ impl World {
                 let race = self.entities[i].race();
                 let pos = self.entities[i].pos;
                 let material = self.entities[i].material;
+                // Invariant VIII (bug 1): carried/items always fall to the
+                // ground on death, including predation — see
+                // `charge_death`'s doc comment for why a predator does not
+                // inherit them. `material` above already reflects
+                // `resolve_material`'s chain resolution: for a prey that was
+                // itself a predator earlier in the chain, its material was
+                // already transferred out (zeroed) before its own predator's
+                // transfer ran, so this is correctly `0` for every eaten
+                // body whose material moved on, and nonzero only for a
+                // grazed/hunted body that never got its own transfer-in.
+                let carried = self.entities[i].carried;
+                let items = std::mem::take(&mut self.entities[i].items);
                 self.entities[i].alive = false;
                 self.entities[i].hp = 0;
-                self.charge_death(race, pos, material);
+                self.charge_death(race, pos, material, &carried, &items);
             }
         }
 
@@ -1110,6 +1196,49 @@ mod tests {
             let mut sorted = ids.clone();
             sorted.sort_unstable();
             assert_eq!(ids, sorted, "id ordering broken at tick {}", w.tick);
+        }
+    }
+
+    // Bug 4 regression: `World::retune` used to be a bare field replacement
+    // with no validation at all — a `PerRace<RaceAttrs>` whose `Conversion`
+    // shares summed to something other than 1000 (exactly the shape a live
+    // tuning session could produce before `tuning.rs`'s knobs were switched
+    // to `Conversion::set_share_rebalanced`, or that any other future
+    // caller of `retune` could still hand in directly) was accepted as-is,
+    // and `terrain::apply_conversion`'s `waste_amt = produced - deposit_amt
+    // - body_amt` then underflowed and panicked (`overflow-checks = true`
+    // in every profile) the moment that race actually converted anything.
+    #[test]
+    fn retune_corrects_a_conversion_whose_shares_would_have_broken_the_sum_and_panicked() {
+        let mut w = world();
+        let race = Race { element: Element::Wood, kind: Kind::Plant };
+        let mut races = w.races;
+        // 900 + 900 + 50 = 1850, not 1000 -- exactly the "two adjacent
+        // keystrokes" shape the bug report describes, simulated here as a
+        // single bad `retune` call rather than two separate knob edits.
+        races[race].conversion = crate::race::Conversion::new(1, 1, 900, 900, 50);
+        assert!(!races[race].conversion.is_valid(), "test setup should start invalid");
+
+        w.retune(races);
+
+        assert!(
+            w.races[race].conversion.is_valid(),
+            "retune must reject/correct an invalid conversion, not accept it: {:?}",
+            w.races[race].conversion
+        );
+        assert_eq!(
+            w.races[race].conversion.deposit_share as u32
+                + w.races[race].conversion.body_share as u32
+                + w.races[race].conversion.waste_share as u32,
+            1000
+        );
+
+        // The real regression: this must not panic. Run long enough that
+        // Wood-Plant bodies actually draw down habitat and convert through
+        // `terrain::apply_conversion` at least once.
+        let log = InputLog::new();
+        for _ in 0..500 {
+            w.step(&log);
         }
     }
 
@@ -2007,5 +2136,156 @@ mod tests {
         w.break_item(id, 0); // no items at all yet
         let e = w.entities.iter().find(|e| e.id == id).unwrap();
         assert!(e.items.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Invariant VIII conservation audit: bug 1 (carried/items dropped on
+    // death) and bug 5 (predation chain resolution order). Same discipline
+    // as the Mine/Smelt/MakeItem/BreakItem section above -- hand-built
+    // scenarios that pin the exact conservation arithmetic down.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn charge_death_deposits_material_carried_and_items_at_the_death_position() {
+        // Bug 1 regression: every death path used to capture and conserve
+        // only `Entity.material` via `charge_death` -- `carried`
+        // (mined-but-unsmelted stock of other elements) and `items`
+        // (bundled `Item`s) were never inspected, then silently dropped by
+        // `phase_reap`'s `retain(|e| e.alive)`. Exercises `charge_death`
+        // directly, pinning its own accounting down independent of which
+        // death path calls it.
+        let mut w = World::new(1, 16);
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(3), Fx::from_int(3));
+        let mut carried = PerElement::filled(0u64);
+        carried[Element::Wood] = 40;
+        carried[Element::Water] = 7;
+        let items = vec![
+            Item { element: Element::Metal, quantity: 12 },
+            Item { element: Element::Earth, quantity: 3 },
+        ];
+
+        w.charge_death(race, pos, 25, &carried, &items);
+
+        let (x, y) = w.terrain.cell_of(pos);
+        assert_eq!(w.terrain.cell(x, y)[Element::Fire], 25, "material, as before this fix");
+        assert_eq!(w.terrain.cell(x, y)[Element::Wood], 40, "carried Wood reaches terrain");
+        assert_eq!(w.terrain.cell(x, y)[Element::Water], 7, "carried Water reaches terrain");
+        assert_eq!(w.terrain.cell(x, y)[Element::Metal], 12, "bundled item (Metal) reaches terrain");
+        assert_eq!(w.terrain.cell(x, y)[Element::Earth], 3, "bundled item (Earth) reaches terrain");
+    }
+
+    #[test]
+    fn natural_death_deposits_the_dying_bodys_carried_stock_and_items_to_terrain() {
+        // Bug 1, the `phase_aging` (old-age/starvation) death path
+        // end-to-end: a body that expires of old age this tick must still
+        // hand its carried stock and items to terrain, exactly like its own
+        // `material` already did.
+        let mut w = World::new(2, 16);
+        let race = Race { element: Element::Water, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(4), Fx::from_int(4));
+        let id = w.spawn(race, pos);
+        let idx = w.entities.iter().position(|e| e.id == id).unwrap();
+        w.entities[idx].carried[Element::Wood] = 15;
+        w.entities[idx].items.push(Item { element: Element::Fire, quantity: 9 });
+        // Force old-age expiry this tick: `phase_aging` increments `age` by
+        // one before checking `is_expired`.
+        w.entities[idx].age = w.entities[idx].lifespan - 1;
+
+        w.phase_aging();
+
+        assert!(!w.entities[idx].alive, "test setup should have killed the body of old age this tick");
+        let (x, y) = w.terrain.cell_of(pos);
+        assert_eq!(w.terrain.cell(x, y)[Element::Wood], 15, "carried stock reaches terrain on natural death");
+        assert_eq!(w.terrain.cell(x, y)[Element::Fire], 9, "bundled item reaches terrain on natural death");
+    }
+
+    #[test]
+    fn predation_death_drops_the_preys_carried_and_items_to_terrain_not_to_the_predator() {
+        // Bug 1, the `phase_feeding` (predation) death path, and the design
+        // decision `charge_death`'s doc comment documents: unlike
+        // `material` ("you are what you eat"), a predator never inherits
+        // its prey's `carried`/`items` -- both always fall to the ground at
+        // the death position, the same as any other death.
+        let mut w = World::new(3, 16);
+        w.retune_ecology(EcologyTuning {
+            satiation: PerElement::filled(0),
+            hunt_weight: PerRace::filled(1000),
+            ..EcologyTuning::default()
+        });
+        let pos = V2::new(Fx::from_int(5), Fx::from_int(5));
+        let pred_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, pos); // Fire eats Wood.
+        let prey_id = w.spawn(Race { element: Element::Wood, kind: Kind::Animal }, pos);
+        let pred_idx = w.entities.iter().position(|e| e.id == pred_id).unwrap();
+        let prey_idx = w.entities.iter().position(|e| e.id == prey_id).unwrap();
+        w.entities[prey_idx].carried[Element::Earth] = 30;
+        w.entities[prey_idx].items.push(Item { element: Element::Metal, quantity: 6 });
+        w.entities[pred_idx].carried[Element::Water] = 99; // predator's own -- must stay untouched.
+
+        w.phase_feeding();
+
+        assert!(!w.entities[prey_idx].alive, "test setup should have the predator eat this tick");
+        assert_eq!(w.entities[pred_idx].carried[Element::Water], 99, "predator's own carried stock is untouched");
+        assert_eq!(w.entities[pred_idx].carried[Element::Earth], 0, "predator does not inherit prey's carried stock");
+        assert!(w.entities[pred_idx].items.is_empty(), "predator does not inherit prey's items");
+
+        let (x, y) = w.terrain.cell_of(pos);
+        assert_eq!(w.terrain.cell(x, y)[Element::Earth], 30, "prey's carried stock falls to the ground");
+        assert_eq!(w.terrain.cell(x, y)[Element::Metal], 6, "prey's item falls to the ground");
+    }
+
+    #[test]
+    fn a_three_body_predation_chain_resolves_in_causal_order_not_array_index() {
+        // Bug 5 regression. Ring relation (`Element::eats_animal`, `i - 1`):
+        // Metal(3) eats Earth(2); Earth(2) eats Fire(1). Spawn order fixes
+        // the array index deliberately *opposite* the predation chain --
+        // Z=Fire at index 0, X=Metal at index 1, Y=Earth at index 2 — so
+        // pairing discovery still finds both edges (Y eats Z is found while
+        // the outer scan sits at Z's index, before Y is itself eaten by X;
+        // X eats Y is found once the scan reaches X's index), but naive
+        // ascending-array-index *resolution* of the fed list would visit X
+        // (index 1) before Y (index 2) and read Y's stale, pre-chain
+        // material — exactly the bug: X ends up short, and the orphaned
+        // amount would previously have leaked onto terrain typed as Y's own
+        // element (Earth) via `charge_death`, not Z's original element
+        // (Fire), with no Conversion/mining/smelting action responsible.
+        let mut w = World::new(0x5EED, 32);
+        w.retune_ecology(EcologyTuning {
+            satiation: PerElement::filled(0),
+            hunt_weight: PerRace::filled(1000),
+            ..EcologyTuning::default()
+        });
+        let pos = V2::new(Fx::from_int(10), Fx::from_int(10));
+        let z_id = w.spawn(Race { element: Element::Fire, kind: Kind::Animal }, pos);
+        let x_id = w.spawn(Race { element: Element::Metal, kind: Kind::Animal }, pos);
+        let y_id = w.spawn(Race { element: Element::Earth, kind: Kind::Animal }, pos);
+        let z_idx = w.entities.iter().position(|e| e.id == z_id).unwrap();
+        let x_idx = w.entities.iter().position(|e| e.id == x_id).unwrap();
+        let y_idx = w.entities.iter().position(|e| e.id == y_id).unwrap();
+        assert_eq!((z_idx, x_idx, y_idx), (0, 1, 2), "test setup requires this exact array order");
+
+        w.entities[z_idx].material = 100;
+        w.entities[y_idx].material = 50;
+        w.entities[x_idx].material = 0;
+
+        w.phase_feeding();
+
+        assert!(!w.entities[z_idx].alive, "Z should have been eaten (by Y)");
+        assert!(!w.entities[y_idx].alive, "Y should have been eaten (by X)");
+        assert!(w.entities[x_idx].alive, "X is the surviving top predator");
+        assert_eq!(
+            w.entities[x_idx].material, 150,
+            "X must inherit the full chain: its own 0 + Y's 50 + Z's 100, regardless of array index order"
+        );
+        assert_eq!(w.entities[y_idx].material, 0, "Y's material transferred out in full, none left to leak to terrain");
+        assert_eq!(w.entities[z_idx].material, 0, "Z's material transferred out in full");
+
+        // No phantom cross-element gain: neither intermediate body's own
+        // element layer received a stray deposit from this chain -- the old
+        // bug would have deposited Z's orphaned 100 units onto the Earth
+        // layer (Y's element) via `charge_death`.
+        assert_eq!(w.terrain.total(Element::Fire), 0, "no phantom Fire deposit from the chain");
+        assert_eq!(w.terrain.total(Element::Earth), 0, "no phantom Earth deposit from the chain");
+        assert_eq!(w.terrain.total(Element::Metal), 0, "X is alive -- none of its material has hit terrain yet");
     }
 }

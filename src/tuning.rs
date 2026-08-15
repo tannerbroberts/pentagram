@@ -21,7 +21,7 @@ use crate::ecology::{EcologyTuning, PropagationTuning};
 use crate::element::Element;
 use crate::fx::Fx;
 use crate::race::{
-    Channel, Edge, PerRace, Race, RaceAttrs, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES,
+    Channel, Edge, PerRace, Race, RaceAttrs, Share, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -232,18 +232,26 @@ static BODY: [Knob; 16] = [
           "own-element units produced per batch — never exceeds ratio in; a conversion cannot manufacture mass",
           |t, e| t.races[e].conversion.ratio_out as i64,
           |t, e, v| t.races[e].conversion.ratio_out = (v as u32).min(t.races[e].conversion.ratio_in)),
+    // Bug 4 (Invariant VIII audit): these three used to each write their own
+    // field directly and independently -- nothing stopped two adjacent
+    // keystrokes from pushing the sum past 1000, which
+    // `terrain::apply_conversion`'s `waste_amt` remainder subtraction then
+    // underflows (a live panic under this crate's `overflow-checks = true`).
+    // `Conversion::set_share_rebalanced` mirrors `ChannelMix::set_rebalanced`
+    // (the `MIX` page below already uses that pattern for `consume_mix`) --
+    // the invariant holds after every single keystroke instead.
     knob!("dep share", Fmt::Permille, Step::Add(25), 0, 1000,
           "permille of produced material written to terrain as background deposit",
           |t, e| t.races[e].conversion.deposit_share as i64,
-          |t, e, v| t.races[e].conversion.deposit_share = v as u16),
+          |t, e, v| t.races[e].conversion.set_share_rebalanced(Share::Deposit, v as u16)),
     knob!("body share", Fmt::Permille, Step::Add(25), 0, 1000,
           "permille of produced material added to the body's own held material",
           |t, e| t.races[e].conversion.body_share as i64,
-          |t, e, v| t.races[e].conversion.body_share = v as u16),
+          |t, e, v| t.races[e].conversion.set_share_rebalanced(Share::Body, v as u16)),
     knob!("waste share", Fmt::Permille, Step::Add(25), 0, 1000,
           "permille of produced material returned to terrain as an explicit waste byproduct",
           |t, e| t.races[e].conversion.waste_share as i64,
-          |t, e, v| t.races[e].conversion.waste_share = v as u16),
+          |t, e, v| t.races[e].conversion.set_share_rebalanced(Share::Waste, v as u16)),
 
     // Items/inventory (Invariant VIII extension): the one new per-race rate
     // knob mining adds — see `race::RaceAttrs::mining_rate`'s own doc

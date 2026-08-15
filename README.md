@@ -15,7 +15,7 @@ chaos watch            same, rebuilding whenever src/ changes
 chaos edit             open the tuning table in $EDITOR
 chaos verify           the determinism exit condition
 chaos soak [ticks]     long headless run + per-race report
-chaos test             full suite (205 tests, 3 gated behind --ignored)
+chaos test             full suite (218 tests, 3 gated behind --ignored)
 ```
 
 `chaos` lives in `~/.local/bin`; set `CHAOS_ROOT` to point it at a different
@@ -71,8 +71,10 @@ Fire      53   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇  │╵▓▓▓
   - *inside its band* — demand was met in full out of banked burst budget.
 
 **The pressure line** under the knob grid is the §3.1 parity metric,
-`deposit_unit / lifespan`, recomputed live. Lifespan and deposit-unit edits are
-the ones that break parity, and this says so the moment they do.
+`RaceAttrs::terraform_pressure()` (produced-per-life, via the race's own
+`Conversion` ratio, divided by lifespan), recomputed live. Lifespan and
+conversion-ratio edits are the ones that break parity, and this says so the
+moment they do.
 
 > S1 update: the map now paints the terrain grid's dominant-element colour as
 > a background behind every body, blended the same way the filmstrip renderer
@@ -611,6 +613,42 @@ there is really only one.
 > every ring-conversion that actually fired that run — not a raw
 > before/after equality, which would trivially fail the moment any
 > conversion happens.
+
+> **Invariant VIII verification pass.** A first adversarial review of the
+> update above (10 independent passes over the same diff) found 5 real
+> conservation gaps the original proof didn't cover, all now fixed: (1)
+> `Entity.carried`/`items` were never inspected on death — every death path
+> conserved only `material`, and `phase_reap`'s `retain` silently dropped the
+> rest; both pools now deposit to terrain at the death position on every
+> death path, predation included (a predator inherits prey `material` but
+> never its `carried`/`items` — see `World::charge_death`'s doc comment for
+> why). (2) `terrain::apply_conversion`'s deposit/waste side discarded
+> `apportion`'s actual-applied return, so a saturated target cell silently
+> clipped a deposit with no accounting — a new `Terrain::overflow` ledger now
+> banks the shortfall and retries it on later ticks instead of losing it. (3)
+> `apply_diffusion` protected a source cell's total outgoing flow from
+> exceeding its own stock but had no equivalent check on the destination
+> side, so several source cells could together overpack one destination —
+> a third pass now scales incoming flow down proportionally the same way the
+> existing source-side pass already did. (4) `race::Conversion`'s three
+> shares (must sum to 1000) were validated only in `race.rs`'s own tests
+> against the static table, never in `World::retune` or `tuning.rs`'s live
+> knobs — a live-tuning edit could push the sum past 1000 and panic
+> (`overflow-checks = true`). `Conversion::set_share_rebalanced` (mirroring
+> `ChannelMix::set_rebalanced`) and `Conversion::clamp_shares` (called from
+> `World::retune`) close both the knob-side and the retune-side gap. (5)
+> `phase_feeding`'s predation material transfer resolved bodies in ascending
+> array-index order, not causal predation-chain order — a same-tick 3-body
+> chain could have its top predator's transfer run before an intermediate
+> body's own chain-gain had landed, orphaning the difference and leaking it
+> onto terrain under the wrong element. A memoized recursive resolve now
+> walks each chain in its actual dependency order regardless of array index.
+> `tests/conservation.rs` gained a second scenario,
+> `material_is_conserved_through_a_natural_death_and_a_predation_chain`,
+> because the original scenario's own window produced zero deaths (predation
+> disabled, run short of every race's starvation grace period — see the
+> standalone `tests/rev9_deaths_probe.rs`), which is exactly why bug 1, the
+> most severe of the five, was invisible to it.
 
 ## Next
 

@@ -131,6 +131,19 @@ pub struct Terrain {
     /// 6). Allocated once at construction and never resized, so a terrain
     /// tick after the first does zero allocation for diffusion.
     scratch: Vec<PerElement<u16>>,
+    /// Invariant VIII (bug 2 fix): `apply_conversion`'s deposit/waste side
+    /// writes to a race's occupied cells via `apportion`, which saturates a
+    /// cell rather than exceed `u16::MAX` (Invariant II) — a cell already
+    /// near the ceiling can silently accept less than requested. Rather
+    /// than let that shortfall simply vanish, `apply_conversion` banks it
+    /// here, per race, and retries it (added on top of that race's own next
+    /// deposit) every subsequent terrain tick until it fully lands.
+    /// Diffusion (operator 6, same tick, right after conversion) keeps
+    /// draining saturated cells toward their neighbours in the meantime, so
+    /// a banked shortfall is delayed, never stuck forever. Hashed like
+    /// every other piece of terrain state (Invariant VI) — two worlds that
+    /// diverge only in banked overflow are not actually in the same state.
+    overflow: PerRace<u64>,
 }
 
 impl Terrain {
@@ -141,6 +154,7 @@ impl Terrain {
             side,
             cells: vec![PerElement::filled(0u16); n],
             scratch: vec![PerElement::filled(0u16); n],
+            overflow: PerRace::filled(0),
         }
     }
 
@@ -193,6 +207,13 @@ impl Terrain {
         self.hash_into(&mut h);
         h.finish()
     }
+
+    /// A race's currently-banked deposit/waste shortfall (bug 2 fix) --
+    /// see `overflow`'s own doc comment. Exposed read-only, mainly for
+    /// tests; `apply_conversion` is the only writer.
+    pub fn overflow(&self, r: Race) -> u64 {
+        self.overflow[r]
+    }
 }
 
 impl Hashable for Terrain {
@@ -202,6 +223,9 @@ impl Hashable for Terrain {
             for (_, v) in c.iter() {
                 h.u16(*v);
             }
+        }
+        for (_, v) in self.overflow.iter() {
+            h.u64(*v);
         }
     }
 }
@@ -264,11 +288,14 @@ impl Occupancy {
 /// (`saturating_add`/`saturating_sub`, Invariant II's usual discipline), so
 /// a cell that is already near `u16::MAX` (add) or already low on `target`
 /// (subtract) can silently accept less than its computed share. Invariant
-/// VIII: `apply_conversion`'s habitat drawdown is the caller that actually
-/// depends on this return value being honest — crediting a race's produced
-/// output must track what was *really* removed from its habitat, not what
-/// was merely requested, or a habitat layer running low would let that race
-/// manufacture output from stock it never actually had.
+/// VIII: `apply_conversion` depends on this return value being honest on
+/// *both* sides it calls this with — the habitat-drawdown (subtract) side,
+/// where crediting a race's produced output must track what was *really*
+/// removed from its habitat rather than what was merely requested (or a
+/// habitat layer running low would let that race manufacture output from
+/// stock it never actually had), and the deposit/waste (add) side, where a
+/// shortfall against an already-near-saturated target cell must be banked
+/// (`Terrain::overflow`) rather than silently dropped.
 fn apportion(
     terrain: &mut Terrain,
     target: Element,
@@ -411,7 +438,13 @@ fn apportion(
 ///   `waste_amt`.
 /// - `deposit_amt + waste_amt` (both `r.element`) apply to terrain via
 ///   `apportion` — two different bookkeeping reasons landing on the same
-///   layer, at the same cells.
+///   layer, at the same cells. This add-side `apportion` call saturates
+///   exactly like the habitat-drawdown call above, and its actual-applied
+///   return value is captured the same way: any shortfall (a race's
+///   occupied cells already near `u16::MAX`) is banked in
+///   `Terrain`'s per-race `overflow` and retried on top of that race's own
+///   deposit every subsequent tick, rather than silently discarded — see
+///   `Terrain::overflow`'s own doc comment.
 /// - `body_amt` cannot be applied here: `terrain.rs` does not own `Entity`
 ///   state. It comes back out through this function's `PerRace<u64>`
 ///   return value for `World` to credit onto each living body's own
@@ -434,41 +467,62 @@ pub fn apply_conversion(
     for r in Race::ALL {
         let n = last_consume[r].granted;
         let conv = races[r].conversion;
-        if n == 0 || conv.ratio_in == 0 {
-            continue;
-        }
-        let batches = n / conv.ratio_in as u64;
-        if batches == 0 {
-            continue;
-        }
-        let requested = batches * conv.ratio_out as u64;
 
-        // Net habitat drawdown -- see the doc comment above for why this is
-        // `requested`, not `n` or `batches * ratio_in`. `produced` is
-        // whatever `apportion` actually managed to remove -- capped by the
-        // real stock at this race's occupied cells, never the requested
-        // amount unconditionally (see the doc comment's note on why this
-        // matters for conservation).
-        let produced = apportion(terrain, r.element.habitat(), requested, &occ.weight[r], seed, terrain_tick, false, r);
-        if produced == 0 {
-            continue;
+        // This tick's own production -- all zero if there is nothing to
+        // convert (`n == 0`, no whole batch fits, or the habitat side
+        // couldn't actually deliver any stock). Deliberately *not* an early
+        // `continue` on any of these anymore (bug 2 fix): a race with zero
+        // production this tick can still be sitting on a banked overflow
+        // shortfall from a previous tick, and that shortfall must get a
+        // chance to be retried below regardless of today's demand.
+        let (mut deposit_amt, mut body_amt, mut waste_amt) = (0u64, 0u64, 0u64);
+        if n > 0 && conv.ratio_in > 0 {
+            let batches = n / conv.ratio_in as u64;
+            if batches > 0 {
+                let requested = batches * conv.ratio_out as u64;
+                // Net habitat drawdown -- see the doc comment above for why
+                // this is `requested`, not `n` or `batches * ratio_in`.
+                // `produced` is whatever `apportion` actually managed to
+                // remove -- capped by the real stock at this race's
+                // occupied cells, never the requested amount unconditionally
+                // (see the doc comment's note on why this matters for
+                // conservation).
+                let produced =
+                    apportion(terrain, r.element.habitat(), requested, &occ.weight[r], seed, terrain_tick, false, r);
+                if produced > 0 {
+                    deposit_amt = produced * conv.deposit_share as u64 / 1000;
+                    body_amt = produced * conv.body_share as u64 / 1000;
+                    // Remainder, not a third independent multiply --
+                    // guarantees the three shares sum to exactly `produced`
+                    // regardless of permille rounding, same discipline
+                    // `ChannelMix::set_rebalanced` uses.
+                    waste_amt = produced - deposit_amt - body_amt;
+                }
+            }
         }
-
-        let deposit_amt = produced * conv.deposit_share as u64 / 1000;
-        let body_amt = produced * conv.body_share as u64 / 1000;
-        // Remainder, not a third independent multiply -- guarantees the
-        // three shares sum to exactly `produced` regardless of permille
-        // rounding, same discipline `ChannelMix::set_rebalanced` uses.
-        let waste_amt = produced - deposit_amt - body_amt;
 
         let alive: u32 = occ.weight[r].values().sum();
-        if alive == 0 {
+        let terrain_bound = if alive == 0 {
             // No living body of this race exists right now to grow -- fold
             // its share into the terrain deposit rather than lose it.
-            apportion(terrain, r.element, deposit_amt + waste_amt + body_amt, &occ.weight[r], seed, terrain_tick, true, r);
+            deposit_amt + waste_amt + body_amt
         } else {
-            apportion(terrain, r.element, deposit_amt + waste_amt, &occ.weight[r], seed, terrain_tick, true, r);
             *body_share.get_mut(r) = body_amt;
+            deposit_amt + waste_amt
+        };
+
+        // Bug 2 fix: fold in whatever this race's deposit/waste side failed
+        // to land on a previous tick (banked in `terrain.overflow`) before
+        // asking `apportion` for this tick's amount, and capture what
+        // `apportion` actually managed to apply this time -- it saturates
+        // per cell (Invariant II) and can silently write less than
+        // requested when a race's occupied cells are already near
+        // `u16::MAX`. Whatever is still short after this attempt is
+        // re-banked for next tick rather than discarded.
+        let requested_terrain = terrain_bound + terrain.overflow[r];
+        if requested_terrain > 0 {
+            let applied = apportion(terrain, r.element, requested_terrain, &occ.weight[r], seed, terrain_tick, true, r);
+            *terrain.overflow.get_mut(r) = requested_terrain - applied;
         }
     }
     body_share
@@ -519,14 +573,30 @@ pub fn deposit_at(terrain: &mut Terrain, e: Element, amount: u64, pos: V2) {
 /// independently claim up to the cell's *entire* stock, and the total sent
 /// out would exceed what the cell ever held — `saturating_sub` floors the
 /// source's own loss at zero while every destination still received its
-/// full, uncapped share, fabricating mass. So this runs in two passes: pass
-/// 1 totals each cell's raw outbound demand across all four of its edges;
-/// pass 2 recomputes the identical per-edge flows and, wherever a cell's
-/// total demand would exceed its actual stock, scales *all* of that cell's
-/// outflows down together, proportionally, before applying them. Total mass
-/// moved by this operator across the whole grid is exactly zero by
-/// construction, for every reachable grid size and tuning value, since
-/// every unit subtracted from one cell is added to exactly one neighbour.
+/// full, uncapped share, fabricating mass. So the source side runs in two
+/// passes: pass 1 totals each cell's raw outbound demand across all four of
+/// its edges; a later pass recomputes the identical per-edge flows and,
+/// wherever a cell's total demand would exceed its actual stock, scales
+/// *all* of that cell's outflows down together, proportionally, before
+/// applying them.
+///
+/// **A cell can equally be the destination of up to four edges in the same
+/// tick** — several already-source-scaled neighbours can each independently
+/// compute a valid outgoing amount toward this one cell, and their sum can
+/// exceed this cell's remaining headroom to `u16::MAX` even though no single
+/// edge does. Unlike the source side, `saturating_add` clipping here does
+/// not just redistribute the shortfall — the matching `saturating_sub` on
+/// each contributing source side already happened in full, so a clipped add
+/// is a genuine mass loss, not a mass move. This mirrors the source-side fix
+/// one level later: an extra pass tallies each destination's total incoming
+/// (already source-scaled) demand across all four of its edges, and the
+/// final apply pass scales that down again, proportionally, wherever it
+/// would exceed the destination's actual headroom — the same floor-division,
+/// leave-a-few-units-behind discipline the source side already uses. Total
+/// mass moved by this operator across the whole grid is exactly zero by
+/// construction, for every reachable grid size and tuning value, since the
+/// amount subtracted from a source and the amount added to its destination
+/// are now always computed as the identical, already-doubly-scaled number.
 ///
 /// Whole-grid snapshot rule: this reads and writes neighbours, so unlike
 /// ring/star it needs a full double-buffer, not just a per-cell one — an
@@ -576,6 +646,40 @@ pub fn apply_diffusion(terrain: &mut Terrain, tuning: &TerrainTuning) {
         }
     }
 
+    // The source-side-scaled amount one edge would move, before any
+    // destination-side cap (bug 3, below) — shared by the destination-tally
+    // pass and the final apply pass so the two can never disagree about the
+    // same edge's number. Takes `cells`/`out_total` as explicit parameters
+    // rather than capturing `terrain`/`out_total` directly, the same reason
+    // `flow` above does: it is called from inside a loop that also needs to
+    // mutate `terrain.scratch`, and each borrow here must end with the call
+    // rather than live across that mutation.
+    let source_scaled = |cells: &[PerElement<u16>],
+                          out_total: &[PerElement<i64>],
+                          here_idx: usize,
+                          there_idx: usize,
+                          e: Element|
+     -> (usize, usize, i64) {
+        let f = flow(cells, here_idx, there_idx, e);
+        if f == 0 {
+            return (here_idx, there_idx, 0);
+        }
+        let (source_idx, dest_idx, magnitude) =
+            if f > 0 { (here_idx, there_idx, f) } else { (there_idx, here_idx, -f) };
+        let stock = cells[source_idx][e] as i64;
+        let demand = out_total[source_idx][e];
+        // Floor division: strictly conservative relative to the per-edge
+        // cap (a few units of "should have moved" are simply left behind,
+        // rather than risk moving one more than the source actually holds
+        // via rounding up).
+        let scaled = if demand > stock { magnitude * stock / demand } else { magnitude };
+        (source_idx, dest_idx, scaled)
+    };
+
+    // Bug 3 fix: tally each destination cell's total incoming (already
+    // source-scaled) demand across all four of its edges — the mirror of
+    // `out_total` above, one level later in the pipeline.
+    let mut in_total: Vec<PerElement<i64>> = vec![PerElement::filled(0i64); n];
     for y in 0..side {
         for x in 0..side {
             let here_idx = y * side + x;
@@ -585,23 +689,42 @@ pub fn apply_diffusion(terrain: &mut Terrain, tuning: &TerrainTuning) {
                 }
                 let there_idx = ny * side + nx;
                 for e in Element::ALL {
-                    let f = flow(&terrain.cells, here_idx, there_idx, e);
-                    if f == 0 {
-                        continue;
+                    let (_, dest_idx, scaled) = source_scaled(&terrain.cells, &out_total, here_idx, there_idx, e);
+                    if scaled > 0 {
+                        in_total[dest_idx][e] += scaled;
                     }
-                    let (source_idx, dest_idx, magnitude) =
-                        if f > 0 { (here_idx, there_idx, f) } else { (there_idx, here_idx, -f) };
-                    let stock = terrain.cells[source_idx][e] as i64;
-                    let demand = out_total[source_idx][e];
-                    // Floor division: strictly conservative relative to the
-                    // per-edge cap (a few units of "should have moved" are
-                    // simply left behind, rather than risk moving one more
-                    // than the source actually holds via rounding up).
-                    let scaled = if demand > stock { magnitude * stock / demand } else { magnitude };
+                }
+            }
+        }
+    }
+
+    for y in 0..side {
+        for x in 0..side {
+            let here_idx = y * side + x;
+            for (nx, ny, dup) in edges(side, x, y) {
+                if dup {
+                    continue;
+                }
+                let there_idx = ny * side + nx;
+                for e in Element::ALL {
+                    let (source_idx, dest_idx, scaled) =
+                        source_scaled(&terrain.cells, &out_total, here_idx, there_idx, e);
                     if scaled <= 0 {
                         continue;
                     }
-                    let amt = scaled as u16; // safe: scaled <= stock <= u16::MAX
+                    // Bug 3 fix: cap this edge's contribution so the
+                    // destination's total incoming across all its edges
+                    // never exceeds its actual headroom to `u16::MAX` — the
+                    // same proportional, floor-division discipline as the
+                    // source-side cap above, one level later.
+                    let dest_stock = terrain.cells[dest_idx][e] as i64;
+                    let headroom = u16::MAX as i64 - dest_stock;
+                    let demand = in_total[dest_idx][e];
+                    let amt2 = if demand > headroom { scaled * headroom / demand } else { scaled };
+                    if amt2 <= 0 {
+                        continue;
+                    }
+                    let amt = amt2 as u16; // safe: amt2 <= headroom <= u16::MAX
                     terrain.scratch[source_idx][e] = terrain.scratch[source_idx][e].saturating_sub(amt);
                     terrain.scratch[dest_idx][e] = terrain.scratch[dest_idx][e].saturating_add(amt);
                 }
@@ -889,6 +1012,55 @@ mod tests {
     }
 
     #[test]
+    fn apply_conversion_banks_a_saturated_deposit_shortfall_instead_of_losing_it() {
+        // Bug 2 regression: the deposit/waste (add) side of `apply_conversion`
+        // used to discard `apportion`'s actual-applied return value, so a
+        // near-saturated target cell would silently clip the deposit with no
+        // accounting for the shortfall. Set the one occupied cell's Wood
+        // stock to within 5 of `u16::MAX`, so a much larger deposit+waste
+        // request (70, at this row's 650/300/50 split of a 100 produced) can
+        // only actually land 5 of it.
+        let race = Race { element: Element::Wood, kind: Kind::Plant };
+        let mut t = Terrain::new(4);
+        t.cell_mut(1, 1)[Element::Wood] = u16::MAX - 5;
+        t.cell_mut(1, 1)[Element::Water] = 10_000; // ample habitat stock to draw down
+        let entities = vec![Entity::spawn(
+            1,
+            Element::Wood,
+            V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
+            0,
+            0,
+            crate::race::attrs(race),
+        )];
+        let occ = Occupancy::build(&entities, &t);
+        let mut granted = PerRace::filled(grant(0));
+        granted[race] = grant(100); // produces 100 at this row's lossless 1:1 ratio
+
+        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
+
+        assert_eq!(t.cell(1, 1)[Element::Wood], u16::MAX, "the cell fills to exactly its ceiling, no more");
+        assert_eq!(*body_share.get(race), 30, "body_share is unaffected by the terrain-side saturation");
+        // The 65 (deposit) + 5 (waste) = 70 requested, only 5 of which could
+        // actually land (the cell's headroom) -- the missing 65 must be
+        // banked, not silently gone.
+        assert_eq!(t.overflow(race), 65, "the shortfall the saturated cell couldn't accept must be banked, not destroyed");
+
+        // A second terrain tick, with no *new* production (`granted` back to
+        // zero) and headroom reopened (diffusion or consumption elsewhere
+        // would ordinarily do this; simulated here directly) must still
+        // retry and land the banked shortfall -- proving it is genuinely
+        // "delayed", not merely recorded and forgotten.
+        t.cell_mut(1, 1)[Element::Wood] = 0;
+        let granted_zero = PerRace::filled(grant(0));
+        let occ2 = Occupancy::build(&entities, &t);
+        let body_share2 = apply_conversion(&mut t, &occ2, &crate::race::RACES, &granted_zero, 1, 2);
+
+        assert_eq!(t.cell(1, 1)[Element::Wood], 65, "the previously-banked shortfall lands once headroom exists");
+        assert_eq!(t.overflow(race), 0, "fully retried, nothing left banked");
+        assert_eq!(*body_share2.get(race), 0, "no new production this tick, so no new body_share");
+    }
+
+    #[test]
     fn diffusion_conserves_total_mass_across_the_grid() {
         let mut t = Terrain::new(6);
         t.cell_mut(2, 2)[Element::Metal] = 60_000;
@@ -1001,6 +1173,47 @@ mod tests {
         assert!(t.cell(1, 0)[Element::Metal] <= 40, "east neighbour exceeded the cap: {}", t.cell(1, 0)[Element::Metal]);
         assert!(t.cell(0, 1)[Element::Metal] <= 40, "south neighbour exceeded the cap: {}", t.cell(0, 1)[Element::Metal]);
         assert_eq!(t.total(Element::Metal), before, "diffusion must not create mass on a side-2 torus either");
+    }
+
+    #[test]
+    fn diffusion_never_fabricates_mass_when_several_sources_overpack_one_destination() {
+        // Bug 3 regression: `out_total`/source-side scaling protects a
+        // SOURCE cell's total outgoing flow from exceeding its own stock,
+        // but had no equivalent protection on the DESTINATION side -- four
+        // independent source cells, each individually well within its own
+        // per-edge cap and its own source-side scaling, can still together
+        // aim more at one shared destination than that destination has
+        // headroom for. The destination is deliberately set close to
+        // `u16::MAX` (headroom 10) while all four of its neighbours sit at
+        // the true ceiling, so the natural per-edge gradient (10, well
+        // under the flat cap) from each of the four still sums to 40 into a
+        // cell with only 10 headroom -- exactly the adversarial "several
+        // near-saturated sources, one already-full destination" setup.
+        let mut t = Terrain::new(5); // large enough that the centre's 4 neighbours are distinct cells
+        t.cell_mut(2, 2)[Element::Fire] = u16::MAX - 10; // the shared destination, 10 units of headroom
+        t.cell_mut(1, 2)[Element::Fire] = u16::MAX;
+        t.cell_mut(3, 2)[Element::Fire] = u16::MAX;
+        t.cell_mut(2, 1)[Element::Fire] = u16::MAX;
+        t.cell_mut(2, 3)[Element::Fire] = u16::MAX;
+        let before = t.total(Element::Fire);
+        let tuning = TerrainTuning { diffuse_rate: PerElement::filled(1000), diffuse_cap: PerElement::filled(1000) };
+
+        apply_diffusion(&mut t, &tuning);
+
+        // Floor-division rounding (the same conservative discipline the
+        // source side already uses) can leave a handful of units short of
+        // the destination's exact headroom, but must never exceed
+        // `u16::MAX` and must land *something* close to the full 10 units
+        // of headroom -- not silently clip away nearly all of it the way
+        // the pre-fix `saturating_add` did.
+        let gained = t.cell(2, 2)[Element::Fire] - (u16::MAX - 10);
+        assert!(gained >= 8, "destination should absorb nearly all of its 10 units of headroom, got {gained}");
+        assert!(t.cell(2, 2)[Element::Fire] <= u16::MAX);
+        assert_eq!(
+            t.total(Element::Fire),
+            before,
+            "diffusion must not create or destroy mass even when several sources overpack one destination"
+        );
     }
 
     #[test]

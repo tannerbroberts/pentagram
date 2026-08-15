@@ -434,6 +434,108 @@ impl Conversion {
             && self.ratio_out <= self.ratio_in
             && (self.deposit_share as u32 + self.body_share as u32 + self.waste_share as u32) == 1000
     }
+
+    /// Set one share and rebalance the other two proportionally so all
+    /// three still sum to exactly 1000 — the same discipline
+    /// `ChannelMix::set_rebalanced` already uses for a race's five-channel
+    /// deposit mix, applied here to `Conversion`'s three-way split. Bug 4
+    /// (Invariant VIII audit): before this existed, `tuning.rs`'s three
+    /// share knobs each wrote their own field directly and independently,
+    /// with nothing to stop two adjacent live-tuning edits from pushing the
+    /// sum past 1000 — `terrain::apply_conversion`'s `waste_amt` computation
+    /// (`produced - deposit_amt - body_amt`) then underflows and panics
+    /// under this crate's `overflow-checks = true`. Editing a conversion is
+    /// otherwise a two-step operation with an invalid state in the middle;
+    /// this keeps the invariant holding after every single keystroke
+    /// instead. See `World::retune`'s own `Conversion::clamp_shares` call
+    /// for the second, independent enforcement point (defense against a
+    /// `Conversion` reaching a running world some other way than through
+    /// this method).
+    pub fn set_share_rebalanced(&mut self, which: Share, v: u16) {
+        let i = which.index();
+        let v = v.min(1000);
+        let mut vals = [self.deposit_share, self.body_share, self.waste_share];
+        let rest_target = 1000u32 - v as u32;
+        let rest_now: u32 = (0..3).filter(|k| *k != i).map(|k| vals[k] as u32).sum();
+        vals[i] = v;
+
+        #[allow(clippy::manual_checked_ops)]
+        if rest_now == 0 {
+            let each = rest_target / 2;
+            for k in 0..3 {
+                if k != i {
+                    vals[k] = each as u16;
+                }
+            }
+        } else {
+            for k in 0..3 {
+                if k != i {
+                    vals[k] = (vals[k] as u32 * rest_target / rest_now) as u16;
+                }
+            }
+        }
+
+        // Integer division loses a few per-mille. Give them to the largest
+        // of the shares we did not touch, so the sum lands on 1000 exactly
+        // — same drift-correction discipline `ChannelMix::set_rebalanced`
+        // uses.
+        let total: u32 = vals.iter().map(|v| *v as u32).sum();
+        let drift = 1000i32 - total as i32;
+        if drift != 0 {
+            let k = (0..3).filter(|k| *k != i).max_by_key(|k| vals[*k]).unwrap_or(0);
+            vals[k] = (vals[k] as i32 + drift).clamp(0, 1000) as u16;
+        }
+
+        self.deposit_share = vals[0];
+        self.body_share = vals[1];
+        self.waste_share = vals[2];
+    }
+
+    /// Force `deposit_share + body_share + waste_share == 1000` in place,
+    /// preserving `deposit_share`/`body_share` as closely as possible and
+    /// letting `waste_share` absorb the remainder — the second of bug 4's
+    /// two enforcement points, called from `World::retune` so a
+    /// `Conversion` that reaches a running world through some path other
+    /// than `set_share_rebalanced` (a bare field replacement, a future
+    /// call site, a test fixture) still cannot leave the shares able to
+    /// underflow `terrain::apply_conversion`'s `waste_amt` computation. If
+    /// `deposit_share + body_share` alone already exceeds 1000, both are
+    /// scaled down proportionally so they fit and `waste_share` becomes 0;
+    /// otherwise `waste_share` is simply recomputed as the remainder — a
+    /// no-op whenever the input was already valid.
+    pub fn clamp_shares(&mut self) {
+        let d = self.deposit_share as u32;
+        let b = self.body_share as u32;
+        let sum_db = d + b;
+        if sum_db > 1000 {
+            self.deposit_share = (d * 1000 / sum_db) as u16;
+            self.body_share = (1000 - self.deposit_share as u32) as u16;
+            self.waste_share = 0;
+        } else {
+            self.waste_share = (1000 - sum_db) as u16;
+        }
+    }
+}
+
+/// Which of `Conversion`'s three permille shares an edit targets —
+/// `Conversion::set_share_rebalanced`'s selector, the same role `Channel`
+/// plays for `ChannelMix::set_rebalanced`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Share {
+    Deposit,
+    Body,
+    Waste,
+}
+
+impl Share {
+    #[inline]
+    const fn index(self) -> usize {
+        match self {
+            Share::Deposit => 0,
+            Share::Body => 1,
+            Share::Waste => 2,
+        }
+    }
 }
 
 impl Hashable for Conversion {
@@ -1183,6 +1285,85 @@ mod tests {
         m.set_rebalanced(Channel::OnDeath, 1000);
         assert_eq!(m.total(), 1000);
         assert_eq!(m.permille(Channel::OnDeath), 1000);
+    }
+
+    // Bug 4 regression: before `Conversion::set_share_rebalanced` existed,
+    // `tuning.rs`'s three share knobs each wrote their own field
+    // independently, so two adjacent keystrokes (e.g. push `dep share` to
+    // 900, then `body share` to 900) could leave the sum at 1800 — which
+    // `terrain::apply_conversion`'s `waste_amt = produced - deposit_amt -
+    // body_amt` then underflows and panics on (`overflow-checks = true`).
+    #[test]
+    fn a_rebalanced_conversion_share_always_sums_to_one_thousand() {
+        for race in Race::ALL {
+            for which in [Share::Deposit, Share::Body, Share::Waste] {
+                for v in [0u16, 1, 37, 250, 499, 500, 999, 1000, 5000] {
+                    let mut c = attrs(race).conversion;
+                    c.set_share_rebalanced(which, v);
+                    assert_eq!(
+                        c.deposit_share as u32 + c.body_share as u32 + c.waste_share as u32,
+                        1000,
+                        "{}-{} share {:?} → {}: {:?}",
+                        race.element.name(),
+                        race.kind.name(),
+                        which,
+                        v,
+                        c
+                    );
+                    let got = match which {
+                        Share::Deposit => c.deposit_share,
+                        Share::Body => c.body_share,
+                        Share::Waste => c.waste_share,
+                    };
+                    assert_eq!(got, v.min(1000));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_adjacent_share_edits_that_would_have_broken_the_sum_stay_valid() {
+        // The exact scenario the bug report names: "two adjacent tuning-UI
+        // keystrokes". Push deposit to 900, then body to 900 — the naive
+        // independent-field-write version leaves 900+900+50=1850; the
+        // rebalanced version keeps every edit's sum at exactly 1000.
+        let mut c = Conversion::new(1, 1, 650, 300, 50);
+        c.set_share_rebalanced(Share::Deposit, 900);
+        assert_eq!(c.deposit_share as u32 + c.body_share as u32 + c.waste_share as u32, 1000);
+        c.set_share_rebalanced(Share::Body, 900);
+        assert_eq!(c.deposit_share as u32 + c.body_share as u32 + c.waste_share as u32, 1000);
+        assert_eq!(c.body_share, 900);
+        assert!(c.is_valid(), "{:?}", c);
+    }
+
+    #[test]
+    fn conversion_share_rebalancing_survives_being_driven_into_a_corner() {
+        let mut c = Conversion::new(1, 1, 1000, 0, 0);
+        c.set_share_rebalanced(Share::Deposit, 0);
+        assert_eq!(c.deposit_share as u32 + c.body_share as u32 + c.waste_share as u32, 1000);
+        c.set_share_rebalanced(Share::Waste, 1000);
+        assert_eq!(c.deposit_share as u32 + c.body_share as u32 + c.waste_share as u32, 1000);
+        assert_eq!(c.waste_share, 1000);
+    }
+
+    #[test]
+    fn clamp_shares_fixes_a_conversion_whose_sum_already_broke_one_thousand() {
+        // The second enforcement point (`World::retune`): a `Conversion`
+        // constructed some other way than through `set_share_rebalanced`
+        // (a bare struct literal, exactly what `World::retune`'s old
+        // straight field-replacement accepted unchecked) can arrive with an
+        // invalid sum. `clamp_shares` must repair it rather than leave it
+        // able to underflow `terrain::apply_conversion`'s `waste_amt`.
+        let mut c = Conversion::new(1, 1, 900, 900, 50); // sums to 1850
+        assert!(!c.is_valid());
+        c.clamp_shares();
+        assert!(c.is_valid(), "{:?}", c);
+        assert_eq!(c.deposit_share as u32 + c.body_share as u32 + c.waste_share as u32, 1000);
+
+        // Already-valid input is left untouched (idempotent).
+        let mut valid = Conversion::new(1, 1, 650, 300, 50);
+        valid.clamp_shares();
+        assert_eq!(valid, Conversion::new(1, 1, 650, 300, 50));
     }
 
     #[test]

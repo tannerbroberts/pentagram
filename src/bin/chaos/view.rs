@@ -411,10 +411,11 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
         let _ = writeln!(out, "{line}{CLEAR_EOL}");
     }
 
-    // §3.1, computed rather than hoped for. `deposit_unit / lifespan` is what
-    // keeps a race that lives eight minutes from reshaping the map faster than
-    // one that lives a fortnight, and it is the first thing a lifespan or
-    // deposit-unit edit breaks.
+    // §3.1, computed rather than hoped for. `RaceAttrs::terraform_pressure`
+    // (produced-per-life, via the race's own `Conversion` ratio, divided by
+    // lifespan) is what keeps a race that lives eight minutes from reshaping
+    // the map faster than one that lives a fortnight, and it is the first
+    // thing a lifespan or conversion-ratio edit breaks.
     let p: Vec<u64> = Element::ALL
         .iter()
         .map(|e| t.races[Race { element: *e, kind: v.kind }].terraform_pressure())

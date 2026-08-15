@@ -102,8 +102,8 @@ impl Element {
     /// What a race draws down from terrain to sustain itself -- one
     /// ring-step removed from what it deposits (mathematically identical to
     /// eats_animal, kept as its own name because this is terrain
-    /// consumption, not predation). Read by apply_consume (every race) and
-    /// phase_flora's rooting gate (Plants only).
+    /// consumption, not predation). Read by apply_conversion (every race)
+    /// and phase_flora's rooting gate (Plants only).
     #[inline]
     pub const fn habitat(self) -> Element {
         self.eats()
