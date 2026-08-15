@@ -402,8 +402,9 @@ impl World {
         let next = element.generates();
         self.entities[i].carried[element] -= consumed;
         self.entities[i].carried[next] = self.entities[i].carried[next].saturating_add(produced);
+        let race = self.entities[i].race();
         let pos = self.entities[i].pos;
-        crate::terrain::deposit_at(&mut self.terrain, element, tailings, pos);
+        crate::terrain::deposit_at(&mut self.terrain, race, element, tailings, pos);
     }
 
     /// Items/inventory: bundle `quantity` units of this body's own carried
@@ -441,8 +442,9 @@ impl World {
             return;
         }
         let item = self.entities[i].items.remove(idx);
+        let race = self.entities[i].race();
         let pos = self.entities[i].pos;
-        crate::terrain::deposit_at(&mut self.terrain, item.element, item.quantity, pos);
+        crate::terrain::deposit_at(&mut self.terrain, race, item.element, item.quantity, pos);
     }
 
     /// 2 — age every body, drain `hp` for anyone past their starvation grace
@@ -552,12 +554,12 @@ impl World {
         let a = self.races[race];
         self.stats.deaths += 1;
         *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnDeath);
-        crate::terrain::deposit_at(&mut self.terrain, race.element, material, pos);
+        crate::terrain::deposit_at(&mut self.terrain, race, race.element, material, pos);
         for (e, &amt) in carried.iter() {
-            crate::terrain::deposit_at(&mut self.terrain, e, amt, pos);
+            crate::terrain::deposit_at(&mut self.terrain, race, e, amt, pos);
         }
         for item in items {
-            crate::terrain::deposit_at(&mut self.terrain, item.element, item.quantity, pos);
+            crate::terrain::deposit_at(&mut self.terrain, race, item.element, item.quantity, pos);
         }
     }
 
@@ -2173,6 +2175,421 @@ mod tests {
         assert_eq!(w.terrain.cell(x, y)[Element::Water], 7, "carried Water reaches terrain");
         assert_eq!(w.terrain.cell(x, y)[Element::Metal], 12, "bundled item (Metal) reaches terrain");
         assert_eq!(w.terrain.cell(x, y)[Element::Earth], 3, "bundled item (Earth) reaches terrain");
+    }
+
+    #[test]
+    fn charge_death_banks_a_saturated_deposits_shortfall_instead_of_losing_it() {
+        // Round-2 regression: `deposit_at` -- reached here through
+        // `charge_death` for a dying body's `material`, every element of its
+        // `carried` stock, and every `Item`'s quantity -- used to clip
+        // silently to the target cell's remaining `u16` headroom and report
+        // nothing, so any shortfall simply vanished. This is the exact
+        // scenario the bug report itself gives: a body accumulates a large
+        // lump sum of one carried element over its lifetime (nothing caps
+        // `Entity.carried` in `mine()`), then dies onto a cell that is
+        // already near saturated on that element.
+        let mut w = World::new(11, 16);
+        // Climate's ambient influx is a genuine, independent source term
+        // (see `tests/conservation.rs`'s own doc comment on why it is out
+        // of Invariant VIII's scope) -- zeroed here so the retry's landed
+        // total is exactly the banked shortfall, not that plus several
+        // terrain ticks of unrelated background influx.
+        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(6), Fx::from_int(6));
+        let (x, y) = w.terrain.cell_of(pos);
+        w.terrain.cell_mut(x, y)[Element::Water] = u16::MAX - 100; // only 100 headroom
+        let mut carried = PerElement::filled(0u64);
+        carried[Element::Water] = 68_000; // a whole lifetime's mined lump sum, per the bug report
+
+        w.charge_death(race, pos, 0, &carried, &[]);
+
+        assert_eq!(w.terrain.cell(x, y)[Element::Water], u16::MAX, "the cell fills to exactly its ceiling, no more");
+        assert_eq!(
+            w.terrain.overflow_of(race, Element::Water),
+            68_000 - 100,
+            "the shortfall a saturated cell couldn't absorb on death must be banked, not destroyed"
+        );
+
+        // Run the world for real (not a direct second `charge_death` call)
+        // so the banked shortfall's retry goes through the ordinary
+        // `phase_terrain` -> `apply_conversion` path exactly like any other
+        // player would see it, with headroom reopened by draining the cell.
+        w.terrain.cell_mut(x, y)[Element::Water] = 0;
+        let before_total: u64 = (0..w.terrain.side)
+            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
+            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Water] as u64)
+            .sum::<u64>()
+            + w.terrain.overflow_of(race, Element::Water);
+        assert_eq!(before_total, 68_000 - 100, "nothing lost or gained before the retry runs");
+
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        assert_eq!(w.terrain.overflow_of(race, Element::Water), 0, "fully retried once headroom reopens, nothing left banked");
+        let after_total: u64 = (0..w.terrain.side)
+            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
+            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Water] as u64)
+            .sum();
+        assert_eq!(after_total, 68_000 - 100, "the banked shortfall actually lands on terrain -- nothing created or destroyed");
+    }
+
+    #[test]
+    fn smelt_banks_a_saturated_tailings_shortfall_and_it_lands_on_retry() {
+        // Round-3 independent re-verification, targeting `smelt` specifically
+        // (the fix stage's own end-to-end test only exercised `charge_death`;
+        // `deposit_at`'s own unit tests call it directly, bypassing this call
+        // site entirely). Same shape: saturate the tailings cell first.
+        let mut w = World::new(21, 16);
+        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(6), Fx::from_int(6));
+        let id = w.spawn(race, pos);
+        {
+            let i = w.find(id).unwrap();
+            w.entities[i].carried[Element::Wood] = 2000 * SMELT_RATIO_IN; // 2000 whole batches
+        }
+        let (x, y) = w.terrain.cell_of(pos);
+        w.terrain.cell_mut(x, y)[Element::Wood] = u16::MAX - 100; // only 100 headroom for tailings
+
+        w.smelt(id, Element::Wood);
+
+        let tailings = 2000 * (SMELT_RATIO_IN - SMELT_RATIO_OUT);
+        assert_eq!(w.terrain.cell(x, y)[Element::Wood], u16::MAX, "cell fills to exactly its ceiling");
+        assert_eq!(
+            w.terrain.overflow_of(race, Element::Wood),
+            tailings - 100,
+            "smelt's tailings shortfall on a saturated cell must be banked, not destroyed"
+        );
+
+        w.terrain.cell_mut(x, y)[Element::Wood] = 0;
+        let log = InputLog::new();
+        for _ in 0..(2000 * TERRAIN_PERIOD) {
+            w.step(&log);
+        }
+
+        assert_eq!(w.terrain.overflow_of(race, Element::Wood), 0, "fully retried once headroom reopens");
+        let after_total: u64 = (0..w.terrain.side)
+            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
+            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Wood] as u64)
+            .sum();
+        assert_eq!(after_total, tailings - 100, "the banked tailings shortfall actually lands, nothing created or destroyed");
+    }
+
+    #[test]
+    fn reviewer8_probe_extreme_carried_and_item_quantities_do_not_panic_or_lose_material() {
+        // Round-3 reviewer 8's own angle: is there any downstream consumer
+        // of `Entity.carried`/`Item.quantity` that breaks (panics, wraps,
+        // silently truncates) at a magnitude far beyond anything reachable
+        // through ordinary mining, independent of `deposit_at`'s own fix?
+        // Push both pools to values orders of magnitude past the 68,000
+        // "whole lifetime" example the bug report itself used, and drive
+        // them through every consumer (`smelt`, `charge_death` via
+        // `carried` and via `items`) with debug assertions enabled (this is
+        // a debug test build, so integer overflow panics rather than
+        // silently wraps -- the exact failure mode this probe is checking
+        // for).
+        let mut w = World::new(31, 16);
+        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(4), Fx::from_int(4));
+        let id = w.spawn(race, pos);
+
+        // Absurdly large carried stock -- u64::MAX / 4, far past anything a
+        // real lifetime of mining could accumulate but still a legal value
+        // of the field's actual type.
+        let huge: u64 = u64::MAX / 4;
+        {
+            let i = w.find(id).unwrap();
+            w.entities[i].carried[Element::Wood] = huge;
+        }
+
+        // smelt() batches/consumed/produced/tailings arithmetic on a huge
+        // `have` -- must not panic (overflow) and must conserve exactly.
+        w.smelt(id, Element::Wood);
+        let batches = huge / SMELT_RATIO_IN;
+        let consumed = batches * SMELT_RATIO_IN;
+        let produced = batches * SMELT_RATIO_OUT;
+        let tailings = consumed - produced;
+        {
+            let i = w.find(id).unwrap();
+            assert_eq!(w.entities[i].carried[Element::Wood], huge - consumed, "leftover under one batch stays untouched even at this scale");
+            assert_eq!(w.entities[i].carried[Element::Fire], produced, "Wood.generates() == Fire, exact batch conversion");
+        }
+        // Tailings deposit_at's own headroom/overflow arithmetic on a huge
+        // amount -- must bank the full shortfall, not wrap or clip silently
+        // past what it reports.
+        let (x, y) = w.terrain.cell_of(pos);
+        let landed = w.terrain.cell(x, y)[Element::Wood] as u64;
+        let banked = w.terrain.overflow_of(race, Element::Wood);
+        assert_eq!(landed + banked, tailings, "every tailings unit is either on terrain or banked -- none vanished");
+
+        // charge_death with a second huge carried element plus a huge item
+        // quantity, on top of the world already carrying the smelt banked
+        // overflow above -- must not panic and must conserve.
+        let mut carried = PerElement::filled(0u64);
+        carried[Element::Water] = huge;
+        let items = vec![Item { element: Element::Earth, quantity: huge }];
+        w.charge_death(race, pos, 0, &carried, &items);
+        // Prevent the still-alive test body from starving/dying again mid
+        // retry-loop and dumping a second, unaccounted-for lump at the same
+        // position -- this probe is about the arithmetic, not about
+        // exercising a second death.
+        {
+            let i = w.find(id).unwrap();
+            w.entities[i].alive = false;
+        }
+        // Reviewer-1 round-3 fix: `charge_death` above also added an
+        // `OnDeath` consume-demand charge for `race` (Metal), independent of
+        // `deposit_at`. Once granted by the governor, `apply_conversion`'s
+        // own (pre-existing, unrelated-to-this-fix) production line spends
+        // that demand by drawing down `race.element.habitat()` -- Metal's
+        // habitat is Earth (`Element::habitat` is one ring-step back from
+        // `generates`) -- and depositing the converted result as Metal. That
+        // is a real, correct, and *already-accounted-for* Earth-to-Metal
+        // transfer (this same test's Earth cell has real stock sitting in
+        // it after the deposit above, so the draw has something to actually
+        // consume), but it is not what this probe is about: this probe
+        // tracks each element's grand total in isolation
+        // (`terrain(e) + overflow_of(race, e)`), which is only a valid
+        // invariant for a channel nothing else is concurrently draining.
+        // Zeroing the banked demand here removes that unrelated confound so
+        // the assertions below isolate exactly what they claim to check --
+        // `deposit_at`'s own shortfall-banking/retry arithmetic -- without
+        // also asserting a stronger, unrelated claim (that ordinary
+        // Conversion habitat consumption never touches a channel this probe
+        // happens to be watching), which was never bug 6's scope and is
+        // proven separately by `tests/conservation.rs`'s whole-system
+        // invariant instead.
+        w.consume_demand = PerRace::filled(0);
+        w.last_consume = PerRace::default();
+
+        let water_landed = w.terrain.cell(x, y)[Element::Water] as u64;
+        let water_banked = w.terrain.overflow_of(race, Element::Water);
+        assert_eq!(water_landed + water_banked, huge, "carried Water: every unit is either on terrain or banked");
+
+        let earth_landed = w.terrain.cell(x, y)[Element::Earth] as u64;
+        let earth_banked = w.terrain.overflow_of(race, Element::Earth);
+        assert_eq!(earth_landed + earth_banked, huge, "item Earth quantity: every unit is either on terrain or banked");
+
+        // Run the retry loop for real and check exact conservation, not
+        // full drain: at this magnitude (~4.6e18) the shortfall vastly
+        // exceeds this world's entire grid capacity (16*16 cells *
+        // u16::MAX each ~= 1.7e7), so `apply_conversion`'s per-tick retry
+        // can only ever land a sliver per tick and the rest is correctly
+        // re-banked (`terrain.rs`'s "other channels" retry loop:
+        // `*terrain.overflow.get_mut(r).get_mut(e) = banked - applied`) --
+        // this is expected, not a bug: nothing here promises delivery
+        // within any bounded number of ticks, only that nothing is ever
+        // destroyed. `deposit_at`'s doc comment's "until it fully lands" is
+        // a liveness property for realistic magnitudes (grid capacity is
+        // ~250x a whole lifetime's worth of mining at this world's own
+        // tuning), not a safety one -- conservation itself must hold at any
+        // magnitude, which is what this asserts.
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+        let grand_total = |e: Element| -> u64 {
+            let on_terrain: u64 = (0..w.terrain.side)
+                .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
+                .map(|(xx, yy)| w.terrain.cell(xx, yy)[e] as u64)
+                .sum();
+            on_terrain + w.terrain.overflow_of(race, e)
+        };
+        assert_eq!(grand_total(Element::Wood), tailings, "Wood: still exactly conserved after many retry ticks, whether landed or still banked");
+        assert_eq!(grand_total(Element::Water), huge, "Water: still exactly conserved after many retry ticks, whether landed or still banked");
+        assert_eq!(grand_total(Element::Earth), huge, "Earth: still exactly conserved after many retry ticks, whether landed or still banked");
+
+        // A second, realistic-but-still-well-beyond-a-lifetime magnitude
+        // (200,000 -- about 3x the bug report's own 68,000 example) *does*
+        // fully drain within one grid's worth of retry ticks, since it's
+        // well under total grid capacity -- proving the "eventually lands"
+        // liveness property actually holds at every magnitude gameplay
+        // could plausibly reach.
+        let big: u64 = 200_000;
+        let mut carried2 = PerElement::filled(0u64);
+        carried2[Element::Fire] = big;
+        w.terrain.cell_mut(x, y)[Element::Fire] = u16::MAX - 50;
+        w.charge_death(race, pos, 0, &carried2, &[]);
+        assert_eq!(w.terrain.overflow_of(race, Element::Fire), big - 50, "shortfall banked as expected");
+        w.terrain.cell_mut(x, y)[Element::Fire] = 0;
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+        assert_eq!(w.terrain.overflow_of(race, Element::Fire), 0, "a realistic-magnitude banked shortfall does fully drain within one grid's retry ticks");
+    }
+
+    #[test]
+    fn reviewer1_break_item_banks_a_saturated_shortfall_and_it_lands_on_retry() {
+        // Round-3 independent re-verification, targeting `break_item`
+        // specifically (third of the three call sites the bug report names;
+        // neither the fix stage's own test nor `deposit_at`'s own unit tests
+        // exercise this call site directly).
+        let mut w = World::new(22, 16);
+        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
+        let race = Race { element: Element::Earth, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(9), Fx::from_int(9));
+        let id = w.spawn(race, pos);
+        {
+            let i = w.find(id).unwrap();
+            w.entities[i].items.push(Item { element: Element::Metal, quantity: 68_000 });
+        }
+        let (x, y) = w.terrain.cell_of(pos);
+        w.terrain.cell_mut(x, y)[Element::Metal] = u16::MAX - 100; // only 100 headroom
+
+        w.break_item(id, 0);
+
+        assert_eq!(w.terrain.cell(x, y)[Element::Metal], u16::MAX, "cell fills to exactly its ceiling");
+        assert_eq!(
+            w.terrain.overflow_of(race, Element::Metal),
+            68_000 - 100,
+            "break_item's returned-quantity shortfall on a saturated cell must be banked, not destroyed"
+        );
+
+        w.terrain.cell_mut(x, y)[Element::Metal] = 0;
+        let log = InputLog::new();
+        // Two terrain periods, not one: `apportion` caps what it can move
+        // into a single cell in a single call at `u16::MAX` (`terrain.rs`'s
+        // `let v = amt.min(u16::MAX as u64) as u16`), regardless of how much
+        // headroom the cell actually has open. The banked shortfall here
+        // (67,900) exceeds that per-tick cap (65,535), so the first terrain
+        // tick can only land 65,535 and correctly re-banks the remaining
+        // 2,365 for the next one -- this is the same "eventually lands, not
+        // necessarily this very tick" liveness property
+        // `reviewer8_probe_extreme_carried_and_item_quantities_do_not_panic_or_lose_material`
+        // documents at a much larger scale. One extra period is enough here
+        // since the remainder is small.
+        for _ in 0..(TERRAIN_PERIOD * 2) {
+            w.step(&log);
+        }
+
+        assert_eq!(w.terrain.overflow_of(race, Element::Metal), 0, "fully retried once headroom reopens across enough terrain ticks");
+        let after_total: u64 = (0..w.terrain.side)
+            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
+            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Metal] as u64)
+            .sum();
+        assert_eq!(after_total, 68_000 - 100, "the banked shortfall actually lands, nothing created or destroyed");
+    }
+
+    #[test]
+    fn reviewer2_concurrent_saturating_deposits_at_one_cell_in_one_tick_neither_double_count_nor_lose_material() {
+        // Round-3 reviewer 2's own angle: `charge_death` fires *multiple*
+        // `deposit_at` calls in immediate succession, at the very same
+        // position, in the very same tick -- material, then every carried
+        // element, then every item -- and several of them can target the
+        // very same (race, element) channel (two items of the same
+        // element; an item sharing its element with the dying body's own
+        // `material`; carried sharing an element with an item). Each
+        // individual `deposit_at` call is proven correct by other tests,
+        // but nothing yet proves the *sequence* of calls sharing one
+        // already-saturated cell in one tick doesn't double-bank a
+        // shortfall (crediting the same lost units to `overflow` twice) or
+        // lose one (a later call's headroom read stale, pre-mutation state
+        // and thinks there's room that a sibling call already claimed).
+        //
+        // Two elements are pre-saturated to different remaining headrooms
+        // (Fire: 50 units, Water: 30 units) and one (Earth) is left with
+        // full headroom as a control. `material` and one `Item` both target
+        // Fire (the race's own element); `carried` and two separate `Item`s
+        // both target Water; `carried` alone targets Earth. This exercises
+        // every combination the bug report's three call sites can produce
+        // within one `charge_death`: same-channel-via-material-and-item,
+        // same-channel-via-two-items, and a channel with room to spare
+        // sitting right alongside two that don't.
+        let mut w = World::new(23, 16);
+        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let other_race = Race { element: Element::Metal, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(11), Fx::from_int(11));
+        let (x, y) = w.terrain.cell_of(pos);
+        let fire_baseline = u64::from(u16::MAX - 50); // 50 headroom
+        let water_baseline = u64::from(u16::MAX - 30); // 30 headroom
+        w.terrain.cell_mut(x, y)[Element::Fire] = u16::MAX - 50;
+        w.terrain.cell_mut(x, y)[Element::Water] = u16::MAX - 30;
+        w.terrain.cell_mut(x, y)[Element::Earth] = 0; // full headroom -- the control
+
+        let material = 400u64; // Fire, race's own element
+        let mut carried = PerElement::filled(0u64);
+        carried[Element::Water] = 5_000;
+        carried[Element::Earth] = 3_000;
+        let items = vec![
+            Item { element: Element::Water, quantity: 1_200 },
+            Item { element: Element::Water, quantity: 800 },
+            Item { element: Element::Fire, quantity: 600 },
+        ];
+
+        let fire_total = material + 600;
+        let water_total = 5_000 + 1_200 + 800;
+        let earth_total = 3_000;
+
+        w.charge_death(race, pos, material, &carried, &items);
+
+        // Every cell caps at exactly its ceiling, never past it, regardless
+        // of how many separate calls contributed to filling it.
+        assert_eq!(w.terrain.cell(x, y)[Element::Fire], u16::MAX);
+        assert_eq!(w.terrain.cell(x, y)[Element::Water], u16::MAX);
+        assert!(w.terrain.cell(x, y)[Element::Earth] as u64 <= earth_total, "control channel never over-filled");
+
+        // Conservation per channel: landed-on-terrain plus banked-overflow
+        // equals exactly what was requested -- not more (double-count) and
+        // not less (lost) -- even though several independent calls shared
+        // this one cell in this one tick.
+        let fire_landed = w.terrain.cell(x, y)[Element::Fire] as u64;
+        let fire_banked = w.terrain.overflow_of(race, Element::Fire);
+        assert_eq!(fire_landed + fire_banked, fire_baseline + fire_total, "Fire: material + item, same channel, must sum exactly (including the cell's pre-existing baseline)");
+
+        let water_landed = w.terrain.cell(x, y)[Element::Water] as u64;
+        let water_banked = w.terrain.overflow_of(race, Element::Water);
+        assert_eq!(water_landed + water_banked, water_baseline + water_total, "Water: carried + two items, same channel, must sum exactly (including the cell's pre-existing baseline)");
+
+        let earth_landed = w.terrain.cell(x, y)[Element::Earth] as u64;
+        let earth_banked = w.terrain.overflow_of(race, Element::Earth);
+        assert_eq!(earth_landed, earth_total, "Earth had full headroom: nothing should have been banked at all");
+        assert_eq!(earth_banked, 0);
+
+        // No cross-contamination: an unrelated race's overflow buckets on
+        // these same three channels stay untouched.
+        assert_eq!(w.terrain.overflow_of(other_race, Element::Fire), 0);
+        assert_eq!(w.terrain.overflow_of(other_race, Element::Water), 0);
+        assert_eq!(w.terrain.overflow_of(other_race, Element::Earth), 0);
+        // And the dying race's own *other* channels (Wood, Metal) stay at
+        // zero too -- nothing leaked sideways into a channel nobody wrote.
+        assert_eq!(w.terrain.overflow_of(race, Element::Wood), 0);
+        assert_eq!(w.terrain.overflow_of(race, Element::Metal), 0);
+
+        // Now actually run the retry through the real `phase_terrain` path
+        // and confirm both banked channels land their exact remainder, with
+        // nothing double-applied in the process (which would show up as a
+        // grand total exceeding what was actually still banked). The cells
+        // are reset to 0 to reopen headroom, deliberately discarding both
+        // the pre-existing baseline and whatever this call already landed
+        // on top of it -- same discipline the existing
+        // `charge_death_banks_a_saturated_deposits_shortfall_instead_of_losing_it`
+        // test above uses -- so only the still-banked remainder is tracked
+        // from here on.
+        let fire_still_banked = fire_banked;
+        let water_still_banked = water_banked;
+        w.terrain.cell_mut(x, y)[Element::Fire] = 0;
+        w.terrain.cell_mut(x, y)[Element::Water] = 0;
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        assert_eq!(w.terrain.overflow_of(race, Element::Fire), 0, "Fire shortfall fully retried");
+        assert_eq!(w.terrain.overflow_of(race, Element::Water), 0, "Water shortfall fully retried");
+
+        let grand_total = |e: Element| -> u64 {
+            (0..w.terrain.side)
+                .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
+                .map(|(xx, yy)| w.terrain.cell(xx, yy)[e] as u64)
+                .sum()
+        };
+        assert_eq!(grand_total(Element::Fire), fire_still_banked, "Fire: exactly the still-banked remainder lands, nothing double-applied");
+        assert_eq!(grand_total(Element::Water), water_still_banked, "Water: exactly the still-banked remainder lands, nothing double-applied");
     }
 
     #[test]

@@ -131,19 +131,34 @@ pub struct Terrain {
     /// 6). Allocated once at construction and never resized, so a terrain
     /// tick after the first does zero allocation for diffusion.
     scratch: Vec<PerElement<u16>>,
-    /// Invariant VIII (bug 2 fix): `apply_conversion`'s deposit/waste side
-    /// writes to a race's occupied cells via `apportion`, which saturates a
-    /// cell rather than exceed `u16::MAX` (Invariant II) — a cell already
-    /// near the ceiling can silently accept less than requested. Rather
-    /// than let that shortfall simply vanish, `apply_conversion` banks it
-    /// here, per race, and retries it (added on top of that race's own next
+    /// Invariant VIII (bug 2 fix, later widened for the `deposit_at` gap):
+    /// `apply_conversion`'s deposit/waste side writes to a race's occupied
+    /// cells via `apportion`, which saturates a cell rather than exceed
+    /// `u16::MAX` (Invariant II) — a cell already near the ceiling can
+    /// silently accept less than requested. Rather than let that shortfall
+    /// simply vanish, `apply_conversion` banks it here, per race and per
+    /// element, and retries it (added on top of that race's own next
     /// deposit) every subsequent terrain tick until it fully lands.
     /// Diffusion (operator 6, same tick, right after conversion) keeps
     /// draining saturated cells toward their neighbours in the meantime, so
-    /// a banked shortfall is delayed, never stuck forever. Hashed like
-    /// every other piece of terrain state (Invariant VI) — two worlds that
-    /// diverge only in banked overflow are not actually in the same state.
-    overflow: PerRace<u64>,
+    /// a banked shortfall is delayed, never stuck forever.
+    ///
+    /// Per-element, not just per-race, because `apply_conversion` is not
+    /// this ledger's only writer: `deposit_at` (a single-cell material
+    /// return — corpse decomposition, smelting tailings, a broken item's
+    /// quantity) can saturate too, and unlike `apply_conversion` — which
+    /// only ever deposits a race into its own element's layer — a
+    /// `deposit_at` shortfall can be for *any* element a body happened to
+    /// be carrying or holding as an item, attributed to that body's own
+    /// race so it retries the same way, spread across that race's currently
+    /// occupied cells (or the extinct-race uniform fallback if none are
+    /// left alive), right alongside `apply_conversion`'s own retry. Indexed
+    /// `[race][element]`; the race's own element channel is what
+    /// `apply_conversion` reads/writes, every other channel is
+    /// `deposit_at`-only. Hashed like every other piece of terrain state
+    /// (Invariant VI) — two worlds that diverge only in banked overflow are
+    /// not actually in the same state.
+    overflow: PerRace<PerElement<u64>>,
 }
 
 impl Terrain {
@@ -154,7 +169,7 @@ impl Terrain {
             side,
             cells: vec![PerElement::filled(0u16); n],
             scratch: vec![PerElement::filled(0u16); n],
-            overflow: PerRace::filled(0),
+            overflow: PerRace::filled(PerElement::filled(0)),
         }
     }
 
@@ -208,11 +223,21 @@ impl Terrain {
         h.finish()
     }
 
-    /// A race's currently-banked deposit/waste shortfall (bug 2 fix) --
-    /// see `overflow`'s own doc comment. Exposed read-only, mainly for
-    /// tests; `apply_conversion` is the only writer.
+    /// A race's currently-banked shortfall on its own element's channel
+    /// (bug 2 fix) -- see `overflow`'s own doc comment. Exposed read-only,
+    /// mainly for tests; `apply_conversion` is this channel's writer.
     pub fn overflow(&self, r: Race) -> u64 {
-        self.overflow[r]
+        self.overflow[r][r.element]
+    }
+
+    /// A race's currently-banked shortfall on an arbitrary element channel
+    /// -- `overflow` above is a convenience shorthand for this restricted
+    /// to the race's own element. This general form is what covers
+    /// `deposit_at`'s banked shortfalls (corpse decomposition, smelting
+    /// tailings, broken items) on elements other than the race's own.
+    /// Exposed read-only, mainly for tests.
+    pub fn overflow_of(&self, r: Race, e: Element) -> u64 {
+        self.overflow[r][e]
     }
 }
 
@@ -224,8 +249,10 @@ impl Hashable for Terrain {
                 h.u16(*v);
             }
         }
-        for (_, v) in self.overflow.iter() {
-            h.u64(*v);
+        for (_, per_element) in self.overflow.iter() {
+            for (_, v) in per_element.iter() {
+                h.u64(*v);
+            }
         }
     }
 }
@@ -519,10 +546,33 @@ pub fn apply_conversion(
         // requested when a race's occupied cells are already near
         // `u16::MAX`. Whatever is still short after this attempt is
         // re-banked for next tick rather than discarded.
-        let requested_terrain = terrain_bound + terrain.overflow[r];
+        let requested_terrain = terrain_bound + terrain.overflow[r][r.element];
         if requested_terrain > 0 {
             let applied = apportion(terrain, r.element, requested_terrain, &occ.weight[r], seed, terrain_tick, true, r);
-            *terrain.overflow.get_mut(r) = requested_terrain - applied;
+            *terrain.overflow.get_mut(r).get_mut(r.element) = requested_terrain - applied;
+        }
+
+        // `deposit_at` gap fix: this race may also be sitting on banked
+        // shortfalls from single-cell deposits (`World::charge_death`'s
+        // carried/items return, `World::smelt`'s tailings, `World::
+        // break_item`'s returned quantity) on element channels other than
+        // its own -- `apportion`'s own doc comment/this struct's `overflow`
+        // doc comment. Retry every such channel here too, spread across
+        // this race's currently occupied cells exactly like its own-element
+        // retry just above (or the extinct-race uniform fallback if none of
+        // its bodies are alive right now), rather than only ever retrying
+        // through `deposit_at` itself -- which would need occupancy it
+        // doesn't have access to.
+        for e in Element::ALL {
+            if e == r.element {
+                continue; // handled above, together with this tick's own production
+            }
+            let banked = terrain.overflow[r][e];
+            if banked == 0 {
+                continue;
+            }
+            let applied = apportion(terrain, e, banked, &occ.weight[r], seed, terrain_tick, true, r);
+            *terrain.overflow.get_mut(r).get_mut(e) = banked - applied;
         }
     }
     body_share
@@ -531,20 +581,41 @@ pub fn apply_conversion(
 /// A direct, single-cell material return — unlike [`apportion`], which
 /// spreads a race's aggregate grant across every cell its living bodies
 /// occupy, this writes to exactly the one cell a specific body's material
-/// actually returns to. Used by `World::charge_death`: a corpse decomposes
-/// where it fell, not smeared across a race's entire territory. Saturates
-/// like every other terrain write (Invariant II).
-pub fn deposit_at(terrain: &mut Terrain, e: Element, amount: u64, pos: V2) {
+/// actually returns to. Used by `World::charge_death` (a corpse decomposes
+/// where it fell, not smeared across a race's entire territory),
+/// `World::smelt` (tailings) and `World::break_item` (a broken item's
+/// quantity).
+///
+/// `race` is the body whose action produced this deposit -- the dying
+/// entity in `charge_death`, the smelter in `smelt`, the item's owner in
+/// `break_item` -- and need not match `e`: a body's `carried`/items can
+/// hold elements quite different from its own race's. It exists purely for
+/// attribution, not to gate or scale the deposit.
+///
+/// Saturates like every other terrain write (Invariant II): `amount` can
+/// exceed both `u16::MAX` outright and this cell's actual remaining
+/// headroom below it. Either way the shortfall is not silently discarded --
+/// it is banked in `Terrain::overflow[race][e]` (see that field's own doc
+/// comment) and retried by `apply_conversion` every subsequent terrain
+/// tick, spread across `race`'s currently occupied cells, until it fully
+/// lands. This is the same discipline `apportion` already uses for
+/// `apply_conversion`'s own deposit/waste side (the bug 2 fix) — a
+/// near-saturated single target cell is exactly the shape that discipline
+/// exists for.
+pub fn deposit_at(terrain: &mut Terrain, race: Race, e: Element, amount: u64, pos: V2) {
     if amount == 0 {
         return;
     }
     let (x, y) = terrain.cell_of(pos);
-    let v = amount.min(u16::MAX as u64) as u16;
-    if v == 0 {
-        return;
-    }
     let c = terrain.cell_mut(x, y);
-    c[e] = c[e].saturating_add(v);
+    let headroom = u64::from(u16::MAX - c[e]);
+    let applied = amount.min(headroom);
+    c[e] += applied as u16;
+    let shortfall = amount - applied;
+    if shortfall > 0 {
+        let bucket = terrain.overflow.get_mut(race).get_mut(e);
+        *bucket = bucket.saturating_add(shortfall);
+    }
 }
 
 /// Operator 6 — bounded diffusion, Invariant I's literal home. Gradient
@@ -1058,6 +1129,132 @@ mod tests {
         assert_eq!(t.cell(1, 1)[Element::Wood], 65, "the previously-banked shortfall lands once headroom exists");
         assert_eq!(t.overflow(race), 0, "fully retried, nothing left banked");
         assert_eq!(*body_share2.get(race), 0, "no new production this tick, so no new body_share");
+    }
+
+    #[test]
+    fn deposit_at_banks_a_saturated_cells_shortfall_instead_of_losing_it() {
+        // Round-2 regression: `deposit_at` (the single-cell material return
+        // `World::charge_death`/`smelt`/`break_item` all call) used to clip
+        // its incoming amount to the cell's remaining `u16` headroom via a
+        // bare `saturating_add` and return nothing -- any shortfall above
+        // what the cell could absorb simply vanished, with no accounting at
+        // all. Same shape as the `apply_conversion` bug 2 fix above, proved
+        // the same way: set a cell within 5 of `u16::MAX`, deposit far more
+        // than that headroom, and show the shortfall is banked rather than
+        // destroyed.
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let mut t = Terrain::new(4);
+        t.cell_mut(2, 2)[Element::Water] = u16::MAX - 5; // only 5 headroom
+        let pos = V2::new(crate::fx::Fx::from_int(2), crate::fx::Fx::from_int(2));
+
+        // A corpse's carried Water (unrelated to its own Fire element) is
+        // exactly the newly-reachable shape bug 1's `charge_death` fix
+        // created: large lump sums with nothing capping them beforehand.
+        deposit_at(&mut t, race, Element::Water, 68_000, pos);
+
+        assert_eq!(t.cell(2, 2)[Element::Water], u16::MAX, "the cell fills to exactly its ceiling, no more");
+        assert_eq!(
+            t.overflow_of(race, Element::Water),
+            68_000 - 5,
+            "everything the cell couldn't absorb must be banked under (race, element), not destroyed"
+        );
+
+        // Retried and landed exactly like `apply_conversion`'s own banked
+        // shortfall: a subsequent terrain tick, with headroom reopened and
+        // zero new production, must fully apply the banked amount.
+        t.cell_mut(2, 2)[Element::Water] = 0;
+        let occ = Occupancy::build(&[], &t); // no living bodies of `race` -- exercises the extinct-race uniform fallback
+        let granted_zero = PerRace::filled(grant(0));
+        apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, 9, 1);
+
+        assert_eq!(t.total(Element::Water), 68_000 - 5, "the previously-banked shortfall lands once headroom exists");
+        assert_eq!(t.overflow_of(race, Element::Water), 0, "fully retried, nothing left banked");
+    }
+
+    #[test]
+    fn deposit_at_shortfall_retries_spread_across_the_races_living_bodies_not_just_the_original_cell() {
+        // Same banking mechanism, but with a living body of `race` present
+        // elsewhere on the grid at retry time -- proving the retry actually
+        // goes through `apportion`'s occupancy-weighted spread (the same
+        // path `apply_conversion`'s own retry uses), not merely a hardcoded
+        // replay at the original deposit position.
+        let race = Race { element: Element::Metal, kind: Kind::Plant };
+        let mut t = Terrain::new(4);
+        t.cell_mut(0, 0)[Element::Earth] = u16::MAX; // fully saturated, zero headroom
+        let pos = V2::new(crate::fx::Fx::from_int(0), crate::fx::Fx::from_int(0));
+
+        deposit_at(&mut t, race, Element::Earth, 500, pos);
+        assert_eq!(t.overflow_of(race, Element::Earth), 500, "zero headroom banks the whole amount");
+
+        // A living body of `race`, at a different, empty cell.
+        let entities = vec![Entity::spawn(
+            1,
+            Element::Metal,
+            V2::new(crate::fx::Fx::from_int(3), crate::fx::Fx::from_int(3)),
+            0,
+            0,
+            crate::race::attrs(race),
+        )];
+        let occ = Occupancy::build(&entities, &t);
+        let granted_zero = PerRace::filled(grant(0));
+        apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, 3, 1);
+
+        assert_eq!(t.overflow_of(race, Element::Earth), 0, "fully retried once a living body gives it somewhere to land");
+        assert_eq!(t.cell(3, 3)[Element::Earth], 500, "lands at the living body's own cell, not the original saturated one");
+        assert_eq!(t.cell(0, 0)[Element::Earth], u16::MAX, "the original cell is untouched by the retry");
+    }
+
+    #[test]
+    fn reviewer3_overflow_survives_many_saturated_retries_then_fully_drains_once_reopened() {
+        // Round-3 reviewer 3's own angle: read the retry path end to end
+        // and confirm it actually *drains* banked overflow over subsequent
+        // ticks rather than only ever recording it once. Unlike the other
+        // overflow tests above (which retry exactly once), this keeps the
+        // one occupied cell pinned at saturation across MANY separate
+        // `apply_conversion` calls -- each one an independent "terrain
+        // tick" attempting the retry and failing again -- accumulating more
+        // banked shortfall on top each time, before finally opening the
+        // cell up and confirming the *entire* accumulated bank, across all
+        // those failed attempts, lands exactly once headroom exists.
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let mut t = Terrain::new(4);
+        let pos = V2::new(crate::fx::Fx::from_int(2), crate::fx::Fx::from_int(2));
+        let entities = vec![Entity::spawn(1, Element::Metal, pos, 0, 0, crate::race::attrs(race))];
+        let occ = Occupancy::build(&entities, &t);
+        let granted_zero = PerRace::filled(grant(0));
+
+        let mut total_banked_expected = 0u64;
+        const RETRY_ATTEMPTS: u64 = 40;
+        for tick in 1..=RETRY_ATTEMPTS {
+            // Re-pin the cell to fully saturated before every attempt, as
+            // if some unrelated sustained producer kept refilling it the
+            // whole time -- and deposit a fresh shortfall on top of
+            // whatever is already banked, exactly like a steady trickle of
+            // deaths onto the same busy cell would.
+            t.cell_mut(2, 2)[Element::Earth] = u16::MAX;
+            deposit_at(&mut t, race, Element::Earth, 300, pos);
+            total_banked_expected += 300;
+
+            // A retry attempt against a cell that is still fully saturated
+            // must change nothing: not shrink the bank (material must not
+            // vanish) and not grow it beyond what was actually deposited
+            // (material must not be double-banked).
+            apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, tick, tick);
+            assert_eq!(
+                t.overflow_of(race, Element::Earth),
+                total_banked_expected,
+                "a retry against a still-saturated cell must neither lose nor double-bank the shortfall (attempt {tick})"
+            );
+            assert_eq!(t.cell(2, 2)[Element::Earth], u16::MAX, "the saturated cell itself is untouched by a failed retry");
+        }
+
+        // Now actually open the cell up and let the retry mechanism land
+        // the whole accumulated bank for real.
+        t.cell_mut(2, 2)[Element::Earth] = 0;
+        apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, RETRY_ATTEMPTS + 1, RETRY_ATTEMPTS + 1);
+
+        assert_eq!(t.overflow_of(race, Element::Earth), 0, "the entire bank accumulated over many failed retries fully drains the instant headroom reopens");
+        assert_eq!(t.cell(2, 2)[Element::Earth], total_banked_expected as u16, "every unit banked across all those attempts actually lands, exactly, none created or destroyed");
     }
 
     #[test]

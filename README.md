@@ -650,6 +650,22 @@ there is really only one.
 > standalone `tests/rev9_deaths_probe.rs`), which is exactly why bug 1, the
 > most severe of the five, was invisible to it.
 
+> **Invariant VIII, sixth gap.** A round-2 adversarial pass over the five
+> fixes above found a sixth: `terrain::deposit_at` — the single-cell write
+> `World::charge_death`, `smelt`, and `break_item` all call — still clipped
+> its incoming amount to a cell's remaining `u16` headroom via a bare
+> `saturating_add` and reported nothing, the same failure class as gap 2
+> above in a helper that fix never touched. Bug 1's own `carried`/`items`
+> deposits made this newly severe, since nothing caps `Entity.carried` and a
+> lifetime's mined stock can land as one large lump sum on death.
+> `Terrain::overflow` widened to `PerRace<PerElement<u64>>` so a shortfall
+> banks under whichever `(race, element)` pair actually produced it —
+> `deposit_at` now takes a `Race` — and `apply_conversion`'s existing retry
+> loop picks up every element's banked overflow for a race, not just its
+> own, spreading it the same way its bug-2 fix already does. See
+> `terrain::tests::deposit_at_banks_a_saturated_cells_shortfall_instead_of_losing_it`
+> and `world::tests::charge_death_banks_a_saturated_deposits_shortfall_instead_of_losing_it`.
+
 ## Next
 
 Nothing past S3 has a design yet. The "Known and deliberate" section above
