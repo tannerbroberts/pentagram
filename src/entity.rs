@@ -6,7 +6,7 @@
 //! (`World::phase_feeding`, `ecology.rs`). Combat has no home yet; that
 //! arrives at S5.
 
-use crate::element::Element;
+use crate::element::{Element, PerElement};
 use crate::fx::{Fx, V2};
 use crate::hash::{Hashable, Hasher};
 use crate::rand::{rand_range, rand_signed, Channel};
@@ -21,11 +21,33 @@ pub const ACTION_THRESHOLD: Fx = Fx::ratio(1, 100);
 
 /// The top of `hp`'s range — a fixed 0..=100 scale regardless of race, the
 /// same way every race's channel mix lives on a 0..1000 per-mille scale
-/// regardless of its `deposit_unit`. S2's feeding and starvation both read
+/// regardless of its `consume_unit`. S2's feeding and starvation both read
 /// and write within this range.
 pub const MAX_HP: i32 = 100;
 
+/// Items and inventory: a lightweight, single-element material bundle a body
+/// carries in `Entity.items` (below), distinct from `Entity.carried` (loose,
+/// unbundled stock of other elements) and `Entity.material` (the body's own
+/// element, its own mass). Created by `World`'s `MakeItem` command from
+/// carried stock, destroyed by `BreakItem`, which returns `quantity` units of
+/// `element` to terrain at the breaking body's position — Invariant VIII: a
+/// pure transfer, nothing created or destroyed, in either direction. No
+/// composites/alloys and no durability this pass (deferred, see
+/// `docs/S3_ECOLOGY_LAYERS_DESIGN.md`'s successor design notes) — an `Item`
+/// is a quantity of exactly one element, nothing more.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Item {
+    pub element: Element,
+    pub quantity: u64,
+}
+
+impl Hashable for Item {
+    fn hash_into(&self, h: &mut Hasher) {
+        h.u8(self.element as u8).u64(self.quantity);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Entity {
     pub id: u32,
     pub element: Element,
@@ -52,6 +74,40 @@ pub struct Entity {
     /// scale deposit/consume demand -- a deliberate choice, see
     /// docs/S3_ECOLOGY_LAYERS_DESIGN.md section 7.
     pub size: u16,
+    /// Invariant VIII (material conservation): how many units of its own
+    /// element (`self.element`) this specific body currently holds/embodies
+    /// -- distinct from `size` (a structural/collision-radius fraction) and
+    /// from `hp`/`hunger` (the separate vitality system, untouched by this
+    /// field). Grown by `World::credit_body_material` (this body's own
+    /// share of its race's conversion, `race::Conversion.body_share`) and,
+    /// for Animals, by predation -- killing prey transfers the prey's
+    /// entire `material` to the predator's, in full (`World::phase_feeding`;
+    /// "you are what you eat"). Lost entirely on death: `World::charge_death`
+    /// returns it to terrain as `self.element`, at `self.pos`, in place of
+    /// the old abstract `OnDeath` deposit-demand charge.
+    pub material: u64,
+    /// Items/inventory (post-Invariant-VIII): loose, unbundled material of
+    /// *other* elements this body is physically carrying — distinct from
+    /// `material` above, which is only ever this body's own element (what it
+    /// is made of). Gained 1:1 from `World`'s `Mine` command (terrain →
+    /// carried, gated by `RaceAttrs::mining_rate`, `Kind::Animal` only —
+    /// Plants are rooted and never mine) and reshaped by `Smelt` (carried
+    /// element X → carried `X.generates()`, at a fixed lossy ratio, tailings
+    /// returned to terrain). Spent by `MakeItem`, which bundles a quantity of
+    /// one element out of here into a portable `Item` (below). Always zero
+    /// for a `Kind::Plant` body — nothing ever credits it, since mining is
+    /// the only source and Plants cannot mine — so `MakeItem`/`Smelt` are
+    /// naturally no-ops for a Plant without needing their own separate
+    /// `Kind` gate.
+    pub carried: PerElement<u64>,
+    /// Items/inventory: portable, single-element material bundles this body
+    /// holds, each created by `MakeItem` out of `carried` and destroyed by
+    /// `BreakItem` (removed from here, its full `quantity` returned to
+    /// terrain at this body's position, as its own `element` — Invariant
+    /// VIII, a pure transfer). Ground-dropped items lying on terrain
+    /// independent of any entity are a reasonable stretch goal, not built
+    /// this pass — see this crate's own inventory design notes.
+    pub items: Vec<Item>,
 }
 
 impl Entity {
@@ -79,6 +135,23 @@ impl Entity {
             acted: false,
             hunger: 0,
             size: 1000,
+            // Invariant VIII: a newborn starts holding none of its own
+            // element -- the simplest conservative choice, and the one that
+            // needs no parent-material bookkeeping at every one of the
+            // several call sites that spawn a body with no particular
+            // parent in hand (`seed_population`, command spawns). A body
+            // grows its own material entirely through its own subsequent
+            // consumption-conversion (`World::credit_body_material`), never
+            // by inheriting a slice of a parent's. A richer birth-endowment
+            // model (transferring some of a parent's material at birth) is
+            // a plausible future refinement, not built here.
+            material: 0,
+            // Items/inventory: a newborn starts with nothing carried and no
+            // items, for the same reason `material` starts at zero — mining,
+            // smelting and item-making are this body's own subsequent
+            // actions, never inherited from a parent.
+            carried: PerElement::filled(0),
+            items: Vec::new(),
         }
     }
 
@@ -112,7 +185,20 @@ impl Hashable for Entity {
             .bool(self.alive)
             .bool(self.acted)
             .u32(self.hunger)
-            .u16(self.size);
+            .u16(self.size)
+            .u64(self.material);
+        // Items/inventory: `carried` in fixed ring order (PerElement::iter's
+        // contract), then `items` length-prefixed (so two inventories that
+        // differ only in count still diverge) and each item in insertion
+        // order — deterministic because `items` is only ever mutated by
+        // canonically-ordered commands (Invariant V/VI).
+        for (_, v) in self.carried.iter() {
+            h.u64(*v);
+        }
+        h.u32(self.items.len() as u32);
+        for item in &self.items {
+            item.hash_into(h);
+        }
     }
 }
 
@@ -319,34 +405,45 @@ mod tests {
         };
         let base_hash = hash_of(&base);
 
-        let mut id = base;
+        // S3.9 note: `Entity` is no longer `Copy` (the new `items: Vec<Item>`
+        // field can't be) — every variant below now explicitly `.clone()`s
+        // `base` rather than relying on an implicit copy, the same discipline
+        // `world.rs`'s own `state_hash_notices_*` tests already use for
+        // `World` (which was never `Copy` to begin with).
+        let mut id = base.clone();
         id.id += 1;
-        let mut element = base;
+        let mut element = base.clone();
         element.element = Element::Water;
-        let mut kind = base;
+        let mut kind = base.clone();
         kind.kind = Kind::Plant;
-        let mut pos_x = base;
+        let mut pos_x = base.clone();
         pos_x.pos.x = pos_x.pos.x + Fx::ONE;
-        let mut pos_y = base;
+        let mut pos_y = base.clone();
         pos_y.pos.y = pos_y.pos.y + Fx::ONE;
-        let mut heading_x = base;
+        let mut heading_x = base.clone();
         heading_x.heading.x = heading_x.heading.x + Fx::ONE;
-        let mut heading_y = base;
+        let mut heading_y = base.clone();
         heading_y.heading.y = heading_y.heading.y + Fx::ONE;
-        let mut age = base;
+        let mut age = base.clone();
         age.age += 1;
-        let mut lifespan = base;
+        let mut lifespan = base.clone();
         lifespan.lifespan += 1;
-        let mut hp = base;
+        let mut hp = base.clone();
         hp.hp += 1;
-        let mut alive = base;
+        let mut alive = base.clone();
         alive.alive = !alive.alive;
-        let mut acted = base;
+        let mut acted = base.clone();
         acted.acted = !acted.acted;
-        let mut hunger = base;
+        let mut hunger = base.clone();
         hunger.hunger += 1;
-        let mut size = base;
+        let mut size = base.clone();
         size.size += 1;
+        let mut material = base.clone();
+        material.material += 1;
+        let mut carried = base.clone();
+        carried.carried[Element::Wood] += 1;
+        let mut items = base.clone();
+        items.items.push(Item { element: Element::Wood, quantity: 1 });
 
         for (name, variant) in [
             ("id", id),
@@ -363,9 +460,34 @@ mod tests {
             ("acted", acted),
             ("hunger", hunger),
             ("size", size),
+            ("material", material),
+            ("carried", carried),
+            ("items", items),
         ] {
             assert_ne!(hash_of(&variant), base_hash, "{name} does not affect the hash");
         }
+    }
+
+    // S3.9: `items`'s length must affect the hash even when every item it
+    // does hold is identical between the two sides — a naive "hash whatever
+    // `items` contains" implementation that folded items together without a
+    // length prefix could let a 2-item and a 3-item inventory of the same
+    // repeated item collide. Regression-shaped, not just coverage.
+    #[test]
+    fn item_count_affects_the_hash_even_with_identical_items() {
+        let f = attrs(animal(Element::Fire));
+        let mut two = Entity::spawn(1, Element::Fire, V2::ZERO, 5, 0, f);
+        two.items.push(Item { element: Element::Wood, quantity: 7 });
+        two.items.push(Item { element: Element::Wood, quantity: 7 });
+        let mut three = two.clone();
+        three.items.push(Item { element: Element::Wood, quantity: 7 });
+
+        let hash_of = |e: &Entity| {
+            let mut h = Hasher::new();
+            e.hash_into(&mut h);
+            h.finish()
+        };
+        assert_ne!(hash_of(&two), hash_of(&three));
     }
 
     // S3.5: `grown_size` is the pure function `Entity.size` is recomputed

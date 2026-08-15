@@ -14,6 +14,7 @@
 //! | V   | Inputs replicate; state does not | [`input`] |
 //! | VI  | Every tick is reproducible | [`replay`] |
 //! | VII | Bounded churn — rates are floored and capped | [`governor`] |
+//! | VIII | Material is conserved — every unit of terrain/body/item material traces to an explicit transfer or ring-ordered conversion, never created or destroyed | [`terrain::apply_conversion`], `world`'s mining/smelting/item commands |
 //!
 //! # Reading order
 //!
@@ -33,6 +34,19 @@
 //! terrain)` rather than stored on `Entity` — read by `world`'s
 //! `phase_movement`. [`world`] is the tick loop, and its phase order is a
 //! wire format, not an implementation detail.
+//!
+//! **Invariant VIII (material conservation).** [`entity::Entity`]'s
+//! `material`/`carried`/`items` fields, [`race::Conversion`], and
+//! `terrain::apply_conversion` are the core of it — a race's habitat draw
+//! becomes its own element via a fixed ratio, split across background
+//! deposit / the body's own held material / explicit waste, never conjuring
+//! or discarding a unit. The items/inventory layer built on top —
+//! mining (terrain → `Entity.carried`), smelting (`Entity.carried` X →
+//! `Entity.carried` X.generates(), tailings to terrain), and
+//! [`entity::Item`] (a portable single-element bundle, made from and broken
+//! back into `carried`/terrain) — is `world`'s `CmdKind::Mine`/`Smelt`/
+//! `MakeItem`/`BreakItem`, gated the same command-log-driven, replay-safe
+//! way every other explicit action in this crate is (`input`).
 
 pub mod behavior;
 pub mod climate;

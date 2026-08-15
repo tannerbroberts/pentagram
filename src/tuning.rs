@@ -197,7 +197,7 @@ macro_rules! burst_knob {
     };
 }
 
-static BODY: [Knob; 15] = [
+static BODY: [Knob; 16] = [
     knob!("lifespan", Fmt::Ticks, Step::Scale, 100, TICKS_PER_DAY as i64 * 90,
           "how long one body persists before it expires of old age",
           |t, e| t.races[e].lifespan as i64,
@@ -219,25 +219,48 @@ static BODY: [Knob; 15] = [
           |t, e| t.restock[e] as i64,
           |t, e, v| t.restock[e] = v as u32),
 
-    knob!("deposit unit", Fmt::Int, Step::Scale, 1, 100_000_000,
-          "total a body writes to the terrain over its ENTIRE life, split across the channels",
-          |t, e| t.races[e].deposit_unit as i64,
-          |t, e, v| t.races[e].deposit_unit = v as u64),
-    edge_knob!("dep floor", deposit, floor, Edge::Floor,
-               "granted every terrain tick even at zero demand — the world's own churn"),
-    edge_knob!("dep nominal", deposit, nominal, Edge::Nominal,
-               "long-run average under sustained demand; the burst bucket refills at this rate"),
-    edge_knob!("dep ceiling", deposit, ceiling, Edge::Ceiling,
-               "never exceeded in one terrain tick, under any behaviour whatsoever"),
-    burst_knob!("dep burst", deposit,
-                "terrain ticks of nominal that can be banked, then spent all at once"),
+    // Invariant VIII: deposition is no longer an independent rate axis —
+    // `deposit_unit`/`deposit`/`deposit_mix` are retired (see
+    // `race::Conversion`'s doc comment). These five knobs replace them with
+    // the coupled conversion: a fixed ratio from the habitat draw below into
+    // the race's own element, and where the produced amount goes.
+    knob!("ratio in", Fmt::Int, Step::Add(1), 1, 100_000,
+          "habitat-element units consumed per conversion batch",
+          |t, e| t.races[e].conversion.ratio_in as i64,
+          |t, e, v| t.races[e].conversion.ratio_in = v as u32),
+    knob!("ratio out", Fmt::Int, Step::Add(1), 1, 100_000,
+          "own-element units produced per batch — never exceeds ratio in; a conversion cannot manufacture mass",
+          |t, e| t.races[e].conversion.ratio_out as i64,
+          |t, e, v| t.races[e].conversion.ratio_out = (v as u32).min(t.races[e].conversion.ratio_in)),
+    knob!("dep share", Fmt::Permille, Step::Add(25), 0, 1000,
+          "permille of produced material written to terrain as background deposit",
+          |t, e| t.races[e].conversion.deposit_share as i64,
+          |t, e, v| t.races[e].conversion.deposit_share = v as u16),
+    knob!("body share", Fmt::Permille, Step::Add(25), 0, 1000,
+          "permille of produced material added to the body's own held material",
+          |t, e| t.races[e].conversion.body_share as i64,
+          |t, e, v| t.races[e].conversion.body_share = v as u16),
+    knob!("waste share", Fmt::Permille, Step::Add(25), 0, 1000,
+          "permille of produced material returned to terrain as an explicit waste byproduct",
+          |t, e| t.races[e].conversion.waste_share as i64,
+          |t, e, v| t.races[e].conversion.waste_share = v as u16),
+
+    // Items/inventory (Invariant VIII extension): the one new per-race rate
+    // knob mining adds — see `race::RaceAttrs::mining_rate`'s own doc
+    // comment. Smelting's ratio is a fixed global constant
+    // (`World::SMELT_RATIO_IN`/`SMELT_RATIO_OUT`), not a per-race tunable, so
+    // it has no row here.
+    knob!("mining rate", Fmt::Int, Step::Add(5), 0, 60_000,
+          "terrain units of a chosen element drawn into carried stock per Mine command (Animal only)",
+          |t, e| t.races[e].mining_rate as i64,
+          |t, e, v| t.races[e].mining_rate = v as u32),
 
     knob!("consume unit", Fmt::Int, Step::Scale, 1, 100_000_000,
-          "total a body takes from the terrain over its entire life",
+          "total a body draws from its habitat element over its entire life",
           |t, e| t.races[e].consume_unit as i64,
           |t, e, v| t.races[e].consume_unit = v as u64),
     edge_knob!("con floor", consume, floor, Edge::Floor,
-               "taken every terrain tick even at zero demand"),
+               "reserve: the bucket is never spent below this in one tick (Invariant VIII — no longer a free minimum)"),
     edge_knob!("con nominal", consume, nominal, Edge::Nominal,
                "long-run average consumption under sustained demand"),
     edge_knob!("con ceiling", consume, ceiling, Edge::Ceiling,
@@ -246,8 +269,14 @@ static BODY: [Knob; 15] = [
                 "terrain ticks of nominal consumption that can be banked"),
 ];
 
-/// One row per channel, twice. The mix is what makes two races with identical
-/// rates feel nothing alike, so it gets its own page rather than being buried.
+/// One row per channel. The mix is what makes two races with identical
+/// rates feel nothing alike, so it gets its own page rather than being
+/// buried. Invariant VIII: `deposit_mix` is retired (deposition is a fixed,
+/// same-tick consequence of the draw below, not a separately timed channel
+/// of its own — see `race::Conversion`'s doc comment and the "body share"
+/// row on the body & rates page, which is what now carries a race's old
+/// "terraforms mostly at death" flavour). Only the habitat-draw timing
+/// (`consume_mix`) remains a channel mix.
 macro_rules! mix_knobs {
     ($prefix:literal, $field:ident, $chan:expr, $help:literal) => {
         knob!($prefix, Fmt::Permille, Step::Add(25), 0, 1000, $help,
@@ -256,17 +285,7 @@ macro_rules! mix_knobs {
     };
 }
 
-static MIX: [Knob; 10] = [
-    mix_knobs!("dep birth", deposit_mix, Channel::OnBirth,
-               "written at the moment of incarnation — fires once per life"),
-    mix_knobs!("dep death", deposit_mix, Channel::OnDeath,
-               "written by the corpse — fires once per life; dominant for short-lived races"),
-    mix_knobs!("dep action", deposit_mix, Channel::OnAction,
-               "written by moving — fires every tick a body actually travels"),
-    mix_knobs!("dep consume", deposit_mix, Channel::OnConsume,
-               "written at the moment of refining what was eaten — one meal per 200 ticks"),
-    mix_knobs!("dep existence", deposit_mix, Channel::OnExistence,
-               "written by merely being here — once per body per terrain tick"),
+static MIX: [Knob; 5] = [
     mix_knobs!("con birth", consume_mix, Channel::OnBirth, "taken at incarnation"),
     mix_knobs!("con death", consume_mix, Channel::OnDeath, "taken by the corpse"),
     mix_knobs!("con action", consume_mix, Channel::OnAction, "taken by moving"),
@@ -497,12 +516,11 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
              lifespan_variance: {},\n        \
              speed: Fx::ratio({}, 100),\n        \
              radius: Fx::ratio({}, 100),\n        \
-             deposit_unit: {},\n        \
-             deposit: RateBand::new({}, {}, {}, {}),\n        \
-             deposit_mix: ChannelMix::new({}, {}, {}, {}, {}),\n        \
              consume_unit: {},\n        \
              consume: RateBand::new({}, {}, {}, {}),\n        \
              consume_mix: ChannelMix::new({}, {}, {}, {}, {}),\n        \
+             conversion: Conversion::new({}, {}, {}, {}, {}),\n        \
+             mining_rate: {},\n        \
              fantasy: {:?},\n    }},\n",
             race.element.name(),
             race.kind.name(),
@@ -510,18 +528,18 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
             a.lifespan_variance,
             (a.speed.raw() as i64 * 100 + 32_768) / 65_536,
             (a.radius.raw() as i64 * 100 + 32_768) / 65_536,
-            a.deposit_unit,
-            a.deposit.floor,
-            a.deposit.nominal,
-            a.deposit.ceiling,
-            a.deposit.burst_ticks,
-            mix(&a, false, 0), mix(&a, false, 1), mix(&a, false, 2), mix(&a, false, 3), mix(&a, false, 4),
             a.consume_unit,
             a.consume.floor,
             a.consume.nominal,
             a.consume.ceiling,
             a.consume.burst_ticks,
-            mix(&a, true, 0), mix(&a, true, 1), mix(&a, true, 2), mix(&a, true, 3), mix(&a, true, 4),
+            mix(&a, 0), mix(&a, 1), mix(&a, 2), mix(&a, 3), mix(&a, 4),
+            a.conversion.ratio_in,
+            a.conversion.ratio_out,
+            a.conversion.deposit_share,
+            a.conversion.body_share,
+            a.conversion.waste_share,
+            a.mining_rate,
             a.fantasy,
         );
     }
@@ -654,11 +672,7 @@ fn cells(v: Fx) -> i64 {
     (v.raw() as i64 * 100 + 32_768) / 65_536
 }
 
-fn mix(a: &RaceAttrs, consume: bool, i: usize) -> u16 {
+fn mix(a: &RaceAttrs, i: usize) -> u16 {
     let c = Channel::ALL[i];
-    if consume {
-        a.consume_mix.permille(c)
-    } else {
-        a.deposit_mix.permille(c)
-    }
+    a.consume_mix.permille(c)
 }

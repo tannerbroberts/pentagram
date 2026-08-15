@@ -288,7 +288,7 @@ fn map(out: &mut impl Write, w: &World, h: usize, cols: usize) {
 fn races(out: &mut impl Write, v: &View, w: &World, t: &Tuning, _cols: usize) {
     let _ = writeln!(
         out,
-        "{DIM}race    alive  population        deposit: floor╵ nominal┊ granted▓ ceiling→ \
+        "{DIM}race    alive  population        conversion draw: floor╵ nominal┊ granted▓ ceiling→ \
          │      granted state{RESET}{CLEAR_EOL}"
     );
 
@@ -305,15 +305,19 @@ fn races(out: &mut impl Write, v: &View, w: &World, t: &Tuning, _cols: usize) {
         // 5 rows at a time — not both kinds merged and not stacked to ten
         // rows. Press `x` to flip it.
         let race = Race { element: e, kind: v.kind };
-        let g = w.last_deposit[race];
-        let band = t.races[race].deposit;
+        // Invariant VIII: deposit's own governor/band is retired (see
+        // `race::Conversion`'s doc comment) — this panel now reads the one
+        // remaining governor, which gates the habitat draw the conversion
+        // runs on; `floor` is a spend reserve now, not a free minimum, so
+        // an extinct race's grant genuinely goes to zero rather than
+        // "still churning at its floor."
+        let g = w.last_consume[race];
+        let band = t.races[race].consume;
         let c = col(RGB[e]);
         let state = if pop[e] == 0 {
-            format!("{DIM}extinct — still churning at its floor{RESET}")
+            format!("{DIM}extinct — no longer drawing or depositing{RESET}")
         } else if g.clipped > 0 {
             format!("{c}rate-limited{RESET}{DIM} — {} refused{RESET}", abbrev(g.clipped as i64))
-        } else if g.forced > 0 {
-            format!("{DIM}idle — floor is doing the work{RESET}")
         } else {
             format!("{DIM}inside its band{RESET}")
         };

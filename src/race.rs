@@ -1,20 +1,33 @@
 //! Race attributes.
 //!
 //! Every race is mechanically bespoke, but bespoke *in service of* a small set
-//! of shared base attributes. Three rate axes carry almost all of the identity:
+//! of shared base attributes. Two rate axes carry almost all of the identity:
 //!
 //! - **life duration** — how long a body persists
-//! - **deposition** — how fast, how burstily, and through which channel a race
-//!   writes itself into the terrain
-//! - **consumption** — the same three questions for taking terrain away
+//! - **consumption** — how fast, how burstily, and through which channel a
+//!   race draws its habitat element down from terrain
 //!
-//! The *how* is the bespoke part and lives in [`ChannelMix`]: two races can
-//! terraform at an identical rate and feel nothing alike, because one does it
-//! by dying and the other by standing still.
+//! Deposition is no longer a third, independent axis. Under Invariant VIII
+//! (material conservation — see `governor.rs`'s module doc and
+//! `terrain::apply_conversion`), a race cannot write more of its own element
+//! into the world than it has actually drawn from its habitat and converted;
+//! `deposit_unit`/`deposit`/`deposit_mix` — the pre-Invariant-VIII second,
+//! independent rate axis — are retired. What a race *does* with the material
+//! it converts (background terrain deposit vs. its own body vs. explicit
+//! waste) is now [`Conversion`]'s three-way split, a fixed per-tick
+//! consequence of the (still fully governed, still bespoke-timed) consume
+//! draw rather than a second rate-limited process of its own.
 //!
-//! Tempo parity rule (§3.1 of the design doc): hold `deposit_unit / lifespan`
-//! roughly equal across races and no race reshapes the map faster than
-//! another, while the texture stays completely distinct.
+//! The *how* is still the bespoke part and lives in [`ChannelMix`]/
+//! [`Conversion`]: two races can draw habitat at an identical rate and feel
+//! nothing alike, because one banks the product in its own body until death
+//! and the other writes it straight into the ground.
+//!
+//! Tempo parity rule (§3.1 of the design doc): hold (the produced-material
+//! analogue of) `deposit_unit / lifespan` roughly equal across races so no
+//! race reshapes the map faster than another, while the texture stays
+//! completely distinct. See [`RaceAttrs::terraform_pressure`]'s doc comment
+//! for how this is computed post-Invariant-VIII.
 
 use crate::element::Element;
 use crate::fx::Fx;
@@ -261,14 +274,22 @@ impl ChannelMix {
 
 /// A hard-bounded rate, per terrain tick, per race, per territory.
 ///
-/// The floor is a guarantee the world makes regardless of whether the race is
-/// present, played well, or extinct. The ceiling is a guarantee the world
-/// makes regardless of how many players coordinate to exceed it. Between them,
-/// terrain change is forecastable: the state at `T + k` is bounded before any
-/// player has decided anything.
+/// Under Invariant VIII (material conservation — see `governor.rs`'s module
+/// doc for the full account), `floor` is a **reserve**, not a free-material
+/// guarantee: it is the portion of the banked bucket a single tick may never
+/// spend down past, not a minimum emitted regardless of demand. That older
+/// guarantee — material conjured even at zero demand, even from an extinct
+/// race — is retired; conservation has nothing to conjure it from. The
+/// ceiling is unchanged: a guarantee the world makes regardless of how many
+/// players coordinate to exceed it. Between reserve and ceiling, terrain
+/// change stays forecastable in its *upper* bound: the state at `T + k` is
+/// bounded above before any player has decided anything, though (post-
+/// Invariant-VIII) no longer bounded below.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RateBand {
-    /// Always emitted, even at zero demand. Guarantees the world keeps churning.
+    /// The portion of the banked bucket one terrain tick may never spend
+    /// below (see [`Governor::settle`](crate::governor::Governor::settle)).
+    /// No longer a guaranteed minimum grant — see this struct's own doc.
     pub floor: u32,
     /// The long-run average under sustained demand. Accrues into the burst bucket.
     pub nominal: u32,
@@ -325,6 +346,106 @@ pub enum Edge {
     Ceiling,
 }
 
+/// The coupled deposit/consume conversion every race resolves through
+/// (Invariant VIII: material conservation — see `governor.rs`'s module doc).
+///
+/// Before Invariant VIII, `deposit_unit` and `consume_unit` were two
+/// independent knobs — nothing stopped a race from depositing more of its
+/// own element than it ever drew from its habitat, i.e. conjuring matter.
+/// Under conservation there is exactly one flow: a race's `consume`/
+/// `consume_mix`/`consume_unit` (unchanged in role — see those fields' own
+/// docs) govern *when* and *how much* of `element.habitat()` a body draws
+/// down from terrain each tick; that granted draw then runs through this
+/// `Conversion` to become units of `element` itself (the race's own
+/// element), accounted across exactly three destinations that sum to the
+/// produced amount, nothing left over and nothing conjured:
+///
+/// - `deposit_share` — background terrain deposit, same role `deposit_unit`
+///   used to serve, now a consequence of the draw rather than a second
+///   independent rate.
+/// - `body_share` — added to the converting body's own `Entity.material`
+///   (growth/reserves), returned to terrain in full only when that specific
+///   body dies (`World::charge_death`) — this is how a race that used to be
+///   "deposit-dominant at `OnDeath`" (a scorch-mark corpse) still behaves
+///   that way under the new model: a high `body_share` banks material in
+///   the body until death does the depositing, literally, not as a
+///   channel-timing illusion.
+/// - `waste_share` — an explicit byproduct, also returned to terrain (same
+///   element, same cells) but accounted separately, the way a lossy
+///   real-world process always sheds some of its own output as scrap.
+///
+/// # The ratio can only ever break even or lose, never gain
+///
+/// `ratio_out <= ratio_in` always (`is_valid` enforces it) — a conversion
+/// cannot manufacture mass, so it can never produce more `element` units
+/// than `habitat()` units it consumed. Of the granted draw `N`, only
+/// `batches * ratio_out` (where `batches = N / ratio_in`, integer floor)
+/// ever actually leaves the habitat layer net; the remainder implicit in
+/// each batch (`ratio_in - ratio_out`) is tailings that return to the same
+/// habitat layer at the same cells immediately, so `terrain::apply_conversion`
+/// applies it as a single net subtraction rather than two offsetting writes
+/// — see that function's own doc comment for the exact arithmetic. Any
+/// leftover draw that doesn't fill a whole batch (`N % ratio_in`) is simply
+/// never drawn from terrain in the first place.
+///
+/// # A load-bearing design decision this stage had to make
+///
+/// Several shipped races' old `deposit_unit` exceeded their old
+/// `consume_unit` (e.g. Wood-Plant: 57 000 deposited vs. 33 000 consumed) —
+/// impossible under a `ratio_out <= ratio_in` conversion, since that would
+/// require producing *more* than was consumed. Those races are clamped to
+/// the best conservation permits: a lossless `ratio_in == ratio_out`
+/// conversion. This necessarily lowers their old terraform-pressure
+/// magnitude; there is no conservative way to preserve it exactly. See
+/// `RACES`'s own doc comment for the concrete per-race choices.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Conversion {
+    /// Habitat-element units consumed per conversion batch.
+    pub ratio_in: u32,
+    /// Own-element units produced per conversion batch. Never exceeds
+    /// `ratio_in` — see the struct doc.
+    pub ratio_out: u32,
+    /// Permille of the produced own-element amount written to terrain as
+    /// background deposit.
+    pub deposit_share: u16,
+    /// Permille of the produced own-element amount added to the converting
+    /// body's own `Entity.material`.
+    pub body_share: u16,
+    /// Permille of the produced own-element amount returned to terrain as an
+    /// explicit waste byproduct — distinct bookkeeping from `deposit_share`,
+    /// though it lands on the same terrain layer.
+    pub waste_share: u16,
+}
+
+impl Conversion {
+    pub const fn new(
+        ratio_in: u32,
+        ratio_out: u32,
+        deposit_share: u16,
+        body_share: u16,
+        waste_share: u16,
+    ) -> Conversion {
+        Conversion { ratio_in, ratio_out, deposit_share, body_share, waste_share }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.ratio_in > 0
+            && self.ratio_out > 0
+            && self.ratio_out <= self.ratio_in
+            && (self.deposit_share as u32 + self.body_share as u32 + self.waste_share as u32) == 1000
+    }
+}
+
+impl Hashable for Conversion {
+    fn hash_into(&self, h: &mut Hasher) {
+        h.u32(self.ratio_in)
+            .u32(self.ratio_out)
+            .u16(self.deposit_share)
+            .u16(self.body_share)
+            .u16(self.waste_share);
+    }
+}
+
 /// The full attribute set for one race.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RaceAttrs {
@@ -348,15 +469,30 @@ pub struct RaceAttrs {
     /// Collision radius in cells.
     pub radius: Fx,
 
-    /// Base quantity written per channel event, before the mix is applied.
-    pub deposit_unit: u64,
-    pub deposit: RateBand,
-    pub deposit_mix: ChannelMix,
-
-    /// Base quantity taken per channel event.
+    /// Base quantity of `element.habitat()` drawn per channel event, before
+    /// the mix is applied — the total a single body draws from terrain over
+    /// its **entire life**. The sole driven demand now (see `Conversion`'s
+    /// doc comment for why deposition is no longer a second, independent
+    /// one).
     pub consume_unit: u64,
     pub consume: RateBand,
     pub consume_mix: ChannelMix,
+
+    /// Invariant VIII: the coupled conversion this race's granted draw
+    /// resolves through every terrain tick. See [`Conversion`]'s own doc.
+    pub conversion: Conversion,
+
+    /// Items/inventory (Invariant VIII extension): terrain units of a chosen
+    /// element a body draws into its own `Entity.carried` per `Mine`
+    /// command, capped by whatever the cell actually holds — see
+    /// `World::mine`. Structurally zero for every `Kind::Plant` row
+    /// (enforced by `body_is_valid`, the same discipline `speed`'s
+    /// Animal/Plant split already uses) — Plants are rooted and this is a
+    /// deliberate act, not passive existence. A first-guess tunable, like
+    /// every other rate in this table; real per-race differentiation is
+    /// future live-tuning work (see `hunt_weight`'s own uniform-default
+    /// precedent, `ecology.rs`).
+    pub mining_rate: u32,
 
     /// One-line statement of the fantasy the numbers above are serving.
     pub fantasy: &'static str,
@@ -364,10 +500,9 @@ pub struct RaceAttrs {
 
 impl RaceAttrs {
     pub fn is_valid(&self) -> bool {
-        self.deposit.is_valid()
-            && self.consume.is_valid()
-            && self.deposit_mix.is_valid()
+        self.consume.is_valid()
             && self.consume_mix.is_valid()
+            && self.conversion.is_valid()
             && self.lifespan > 0
             && self.body_is_valid()
     }
@@ -383,31 +518,47 @@ impl RaceAttrs {
             Kind::Animal => self.speed > Fx::ZERO,
             Kind::Plant => self.speed == Fx::ZERO,
         };
-        speed_ok && self.radius > Fx::ZERO
+        // Items/inventory: a Plant can never mine (rooted, see
+        // `mining_rate`'s own doc comment) — an Animal row is free to ship
+        // `mining_rate == 0` too (that's just "doesn't mine today," a valid
+        // tuning choice), so only the Plant side is a hard structural rule.
+        let mining_ok = self.kind == Kind::Animal || self.mining_rate == 0;
+        speed_ok && self.radius > Fx::ZERO && mining_ok
     }
 
-    /// Tempo parity metric — deposit unit per 1000 ticks of life. Holding this
-    /// roughly equal across races is what keeps a fast race from reshaping the
-    /// map faster than a slow one. See §3.1.
+    /// Tempo parity metric — produced-material unit per 1000 ticks of life.
+    /// Holding this roughly equal across races is what keeps a fast race
+    /// from reshaping the map faster than a slow one. See §3.1.
+    ///
+    /// Post-Invariant-VIII: there is no independent `deposit_unit` to read
+    /// anymore (see `Conversion`'s doc comment), so this is now a proxy —
+    /// `consume_unit` run once through the race's own conversion ratio,
+    /// which is exactly what one whole life's worth of draw actually
+    /// produces of the race's own element before the three-way split.
     pub fn terraform_pressure(&self) -> u64 {
-        self.deposit_unit.saturating_mul(1000) / self.lifespan.max(1)
+        let produced_per_life = self
+            .consume_unit
+            .saturating_mul(self.conversion.ratio_out as u64)
+            / (self.conversion.ratio_in as u64).max(1);
+        produced_per_life.saturating_mul(1000) / self.lifespan.max(1)
     }
 
     // ------------------------------------------------------------------
     // Per-event demand.
     //
-    // `deposit_unit` is the total a single body writes to the terrain over its
+    // `consume_unit` is the total a single body draws from terrain over its
     // *entire life*. Each channel's per-mille share of that total is then
     // spread across however many times that channel actually fires in a life:
     // birth and death fire once, existence fires once per terrain tick,
     // actions and meals fire at their own cadence.
     //
     // This is what makes the parity rule real rather than aspirational — two
-    // races with equal `deposit_unit / lifespan` write the same amount to the
+    // races with equal `consume_unit / lifespan` (once run through their own
+    // conversion ratio, since Invariant VIII) write the same amount to the
     // map per unit time no matter how differently they spend it.
     //
-    // All of these return **milli-units**, because a share divided across two
-    // million Earth ticks underflows integer division otherwise.
+    // Returns **milli-units**, because a share divided across two million
+    // Earth ticks underflows integer division otherwise.
     // ------------------------------------------------------------------
 
     /// One meal per this many ticks, used to spread the consume channel.
@@ -430,13 +581,10 @@ impl RaceAttrs {
         }
     }
 
-    /// Milli-units of deposition contributed by one firing of `c`.
-    #[inline]
-    pub fn deposit_per(&self, c: Channel) -> u64 {
-        self.milli(c, self.deposit_unit, &self.deposit_mix, self.firings_per_life(c))
-    }
-
-    /// Milli-units of consumption contributed by one firing of `c`.
+    /// Milli-units of habitat draw contributed by one firing of `c`. The
+    /// sole driven demand post-Invariant-VIII — what used to also be a
+    /// separate `deposit_per` is now `terrain::apply_conversion`'s derived
+    /// consequence of this same draw, not a second accumulated demand.
     #[inline]
     pub fn consume_per(&self, c: Channel) -> u64 {
         self.milli(c, self.consume_unit, &self.consume_mix, self.firings_per_life(c))
@@ -482,6 +630,37 @@ pub const MILLI: u64 = 1000;
 /// Radius and `lifespan_variance` are unchanged (shared by both kinds of an
 /// element) — nothing in this design needs them to differ per kind. See
 /// `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §2, §12 for the full account.
+///
+/// **Invariant VIII migration.** `deposit_unit`/`deposit`/`deposit_mix` are
+/// retired (see [`Conversion`]'s doc comment); `consume_unit`/`consume`/
+/// `consume_mix` are carried over completely unchanged, so every row's
+/// draw-timing character (when in its life it draws down its habitat) is
+/// preserved exactly. Each row's new `conversion` was chosen to preserve the
+/// *old* deposit-side character too, wherever conservation allows it:
+///
+/// - **Wood, Earth, Metal** all had `deposit_unit > consume_unit` — asking
+///   to write back more than was ever drawn in, i.e. conjuring matter, which
+///   `ratio_out <= ratio_in` forbids outright. These three are clamped to
+///   the best a conservative conversion can do: lossless, `ratio_in ==
+///   ratio_out == 1`. Their terraform pressure necessarily drops from the
+///   old table (there is no conservative way to avoid that — see
+///   `Conversion`'s doc comment) but their *relative* ordering and their
+///   deposit-mix-implied character survive via the three-way split below:
+///   an existence-dominant old `deposit_mix` becomes a high `deposit_share`
+///   (steady background terraforming), and Metal-Animal's old
+///   refining-only, zero-existence mix becomes a high `waste_share`
+///   (forging sheds scrap) instead.
+/// - **Fire, Water** both had `deposit_unit < consume_unit` — already a
+///   lossy ratio in the old numbers — so their `conversion.ratio_out /
+///   ratio_in` is set to reproduce that old ratio as closely as integer
+///   division allows (Fire ≈ 0.477, Water ≈ 0.742).
+/// - Fire-Animal's old character — "terraforms almost entirely by dying,
+///   the corpse is the scorch mark" (`deposit_mix` was `OnDeath`-dominant at
+///   700‰) — is now carried by a high `body_share` (800‰) instead of a
+///   deposit-channel timing knob: material banks in the body as it lives
+///   and returns to terrain in one lump only when `World::charge_death`
+///   fires, which is a truer version of the old flavour text than the mix
+///   knob ever was.
 pub const RACES: PerRace<RaceAttrs> = PerRace([
     // ---------------------------------------------------------------- WOOD
     RaceAttrs {
@@ -491,12 +670,15 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 180,
         speed: Fx::ZERO,
         radius: Fx::ratio(60, 100),
-        deposit_unit: 57_000,
-        deposit: RateBand::new(500, 1000, 2000, 6),
-        deposit_mix: ChannelMix::new(80, 120, 40, 180, 580),
         consume_unit: 33_000,
         consume: RateBand::new(300, 900, 1800, 6),
         consume_mix: ChannelMix::new(30, 70, 30, 120, 750),
+        // Old deposit_unit (57 000) exceeded consume_unit (33 000) —
+        // clamped to lossless (see the table's own doc comment). Old
+        // deposit_mix was existence-dominant (580‰): background terraform
+        // share stays highest here.
+        conversion: Conversion::new(1, 1, 650, 300, 50),
+        mining_rate: 0, // rooted — Plants never mine
         fantasy: "Grows where it stands and draws through its roots — the map remembers a thicket long after any single stem is gone.",
     },
     RaceAttrs {
@@ -506,14 +688,14 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 180,
         speed: Fx::ratio(9, 100),
         radius: Fx::ratio(60, 100),
-        deposit_unit: 19_000,
-        deposit: RateBand::new(500, 1000, 2000, 6),
-        // No longer existence-dominant now Wood-Plant owns that slot —
-        // terraforms by what it takes in, not by standing around.
-        deposit_mix: ChannelMix::new(100, 150, 100, 450, 200),
         consume_unit: 11_000,
         consume: RateBand::new(300, 900, 1800, 6),
         consume_mix: ChannelMix::new(50, 50, 100, 500, 300),
+        // Old deposit_mix moved off existence onto OnConsume (450‰) —
+        // terraforms by what it takes in, not by standing around; the
+        // deposit/body split stays balanced rather than existence-heavy.
+        conversion: Conversion::new(1, 1, 500, 400, 100),
+        mining_rate: 40, // first-guess, uniform across every Animal row
         fantasy: "Ranges the thicket for a meal — what it takes in shapes the ground it leaves behind, no roots required to leave a mark.",
     },
     // ---------------------------------------------------------------- FIRE
@@ -524,12 +706,12 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 300,
         speed: Fx::ZERO,
         radius: Fx::ratio(40, 100),
-        deposit_unit: 3_150,
-        deposit: RateBand::new(200, 1000, 6000, 20),
-        deposit_mix: ChannelMix::new(50, 150, 50, 50, 700),
         consume_unit: 6_600,
         consume: RateBand::new(150, 1100, 7000, 20),
         consume_mix: ChannelMix::new(20, 60, 20, 100, 800),
+        // Old deposit/consume ratio ≈ 3150/6600 ≈ 0.477.
+        conversion: Conversion::new(1000, 477, 700, 250, 50),
+        mining_rate: 0, // rooted — Plants never mine
         fantasy: "Ember-moss, smouldering low and constant — it never dies spectacularly, it just keeps glowing where it took root.",
     },
     RaceAttrs {
@@ -539,15 +721,17 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 300,
         speed: Fx::ratio(46, 100),
         radius: Fx::ratio(40, 100),
-        deposit_unit: 1_050,
         // Spikiest band in the table: can go quiet, then spike sixfold.
-        deposit: RateBand::new(200, 1000, 6000, 20),
-        // Terraforms almost entirely by dying. A fire creature's corpse is the
-        // scorch mark.
-        deposit_mix: ChannelMix::new(150, 700, 100, 50, 0),
         consume_unit: 2_200,
         consume: RateBand::new(150, 1100, 7000, 20),
         consume_mix: ChannelMix::new(0, 100, 400, 500, 0),
+        // Old deposit/consume ratio ≈ 1050/2200 ≈ 0.477 — same as its Plant
+        // twin. Terraforms almost entirely by dying: material banks in the
+        // body (800‰) and returns as one lump at death, not spread by a
+        // deposit-channel timing knob. A fire creature's corpse is the
+        // scorch mark.
+        conversion: Conversion::new(1000, 477, 100, 800, 100),
+        mining_rate: 40, // first-guess, uniform across every Animal row
         fantasy: "Born from a lightning strike, burns hot, dies fast, and the ground remembers.",
     },
     // --------------------------------------------------------------- EARTH
@@ -558,12 +742,14 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 120,
         speed: Fx::ZERO,
         radius: Fx::ratio(150, 100),
-        deposit_unit: 7_650_000,
-        deposit: RateBand::new(800, 1000, 1400, 2),
-        deposit_mix: ChannelMix::new(40, 40, 40, 80, 800),
         consume_unit: 3_600_000,
         consume: RateBand::new(600, 850, 1200, 2),
         consume_mix: ChannelMix::new(10, 20, 20, 50, 900),
+        // Old deposit_unit (7 650 000) exceeded consume_unit (3 600 000) —
+        // clamped to lossless. Old deposit_mix was overwhelmingly
+        // existence-dominant (800‰): background share stays highest.
+        conversion: Conversion::new(1, 1, 750, 200, 50),
+        mining_rate: 0, // rooted — Plants never mine
         fantasy: "Older than the animal that shares its name — patience that outlasts even Earth's own long-lived fauna, terraforming by simply persisting the longest.",
     },
     RaceAttrs {
@@ -573,15 +759,15 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 120,
         speed: Fx::ratio(4, 100),
         radius: Fx::ratio(150, 100),
-        deposit_unit: 2_550_000,
         // Nearly a metronome. Barely bursts, barely rests.
-        deposit: RateBand::new(800, 1000, 1400, 2),
-        // Presence is the mechanism. An Earth body presses on the world simply
-        // by continuing to be somewhere.
-        deposit_mix: ChannelMix::new(50, 50, 50, 100, 750),
         consume_unit: 1_200_000,
         consume: RateBand::new(600, 850, 1200, 2),
         consume_mix: ChannelMix::new(0, 50, 50, 200, 700),
+        // Old deposit_unit (2 550 000) exceeded consume_unit (1 200 000) —
+        // clamped to lossless, same reasoning as Earth-Plant. Presence is
+        // the mechanism: background share stays highest.
+        conversion: Conversion::new(1, 1, 700, 250, 50),
+        mining_rate: 40, // first-guess, uniform across every Animal row
         fantasy: "Ancient. Lives for a fortnight and terraforms by refusing to move.",
     },
     // --------------------------------------------------------------- METAL
@@ -592,12 +778,13 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 90,
         speed: Fx::ZERO,
         radius: Fx::ratio(55, 100),
-        deposit_unit: 273_000,
-        deposit: RateBand::new(250, 1000, 2500, 12),
-        deposit_mix: ChannelMix::new(100, 100, 150, 150, 500),
         consume_unit: 144_000,
         consume: RateBand::new(200, 950, 2400, 12),
         consume_mix: ChannelMix::new(60, 60, 100, 180, 600),
+        // Old deposit_unit (273 000) exceeded consume_unit (144 000) —
+        // clamped to lossless.
+        conversion: Conversion::new(1, 1, 550, 350, 100),
+        mining_rate: 0, // rooted — Plants never mine
         fantasy: "An ore-vein growth, embedded and slow — it forges nothing, it just sits in the seam and the seam changes around it.",
     },
     RaceAttrs {
@@ -607,14 +794,16 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 90,
         speed: Fx::ratio(21, 100),
         radius: Fx::ratio(55, 100),
-        deposit_unit: 91_000,
-        deposit: RateBand::new(250, 1000, 2500, 12),
-        // Deposits at the moment of refining. Nothing from mere existence —
-        // Metal that is not working leaves no trace at all.
-        deposit_mix: ChannelMix::new(200, 150, 250, 400, 0),
         consume_unit: 48_000,
         consume: RateBand::new(200, 950, 2400, 12),
         consume_mix: ChannelMix::new(100, 50, 250, 600, 0),
+        // Old deposit_unit (91 000) exceeded consume_unit (48 000) —
+        // clamped to lossless. Old deposit_mix was refining-only, zero
+        // existence share ("writes to the world only at the moment of
+        // forging"); that flavour now lives in a high waste_share — forging
+        // sheds scrap — rather than a channel-timing knob.
+        conversion: Conversion::new(1, 1, 400, 350, 250),
+        mining_rate: 40, // first-guess, uniform across every Animal row
         fantasy: "Precise and scheduled. Writes to the world only at the moment of forging.",
     },
     // --------------------------------------------------------------- WATER
@@ -625,12 +814,12 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 220,
         speed: Fx::ZERO,
         radius: Fx::ratio(50, 100),
-        deposit_unit: 13_350,
-        deposit: RateBand::new(300, 1000, 3000, 10),
-        deposit_mix: ChannelMix::new(50, 150, 150, 150, 500),
         consume_unit: 18_000,
         consume: RateBand::new(250, 1000, 3200, 10),
         consume_mix: ChannelMix::new(20, 80, 100, 150, 650),
+        // Old deposit/consume ratio ≈ 13350/18000 ≈ 0.742.
+        conversion: Conversion::new(1000, 742, 600, 300, 100),
+        mining_rate: 0, // rooted — Plants never mine
         fantasy: "A reed-bed, rooted in the shallows — where the animal current tears through, this just sits and slowly silts the bank.",
     },
     RaceAttrs {
@@ -640,14 +829,14 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         lifespan_variance: 220,
         speed: Fx::ratio(33, 100),
         radius: Fx::ratio(50, 100),
-        deposit_unit: 4_450,
-        deposit: RateBand::new(300, 1000, 3000, 10),
-        // Erodes what it moves across. Action-dominant: standing still, Water
-        // does almost nothing.
-        deposit_mix: ChannelMix::new(50, 250, 500, 150, 50),
         consume_unit: 6_000,
         consume: RateBand::new(250, 1000, 3200, 10),
         consume_mix: ChannelMix::new(0, 100, 550, 300, 50),
+        // Old deposit/consume ratio ≈ 4450/6000 ≈ 0.742 — same as its Plant
+        // twin. Erodes what it moves across: deposit share stays highest,
+        // direct and immediate rather than banked in the body.
+        conversion: Conversion::new(1000, 742, 650, 250, 100),
+        mining_rate: 40, // first-guess, uniform across every Animal row
         fantasy: "Rhythmic and tidal. Terraforms by flowing, and stops when it stops.",
     },
 ]);
@@ -687,12 +876,11 @@ impl Hashable for RaceAttrs {
             .u16(self.lifespan_variance)
             .i32(self.speed.raw())
             .i32(self.radius.raw())
-            .u64(self.deposit_unit)
             .u64(self.consume_unit);
-        self.deposit.hash_into(h);
-        self.deposit_mix.hash_into(h);
         self.consume.hash_into(h);
         self.consume_mix.hash_into(h);
+        self.conversion.hash_into(h);
+        h.u32(self.mining_rate);
     }
 }
 
@@ -722,21 +910,34 @@ mod tests {
     }
 
     #[test]
-    fn every_mix_sums_to_one_thousand() {
+    fn every_mix_and_conversion_split_sums_to_one_thousand() {
+        // Invariant VIII: `deposit_mix` is retired (see `Conversion`'s doc
+        // comment) — the equivalent three-way split now lives on
+        // `conversion` (deposit_share/body_share/waste_share), and must sum
+        // to exactly 1000 the same way `consume_mix` always has.
         for race in Race::ALL {
             let a = attrs(race);
-            assert_eq!(a.deposit_mix.total(), 1000, "{}-{} deposit mix", race.element.name(), race.kind.name());
             assert_eq!(a.consume_mix.total(), 1000, "{}-{} consume mix", race.element.name(), race.kind.name());
+            let c = a.conversion;
+            assert_eq!(
+                c.deposit_share as u32 + c.body_share as u32 + c.waste_share as u32,
+                1000,
+                "{}-{} conversion split",
+                race.element.name(),
+                race.kind.name()
+            );
         }
     }
 
     #[test]
-    fn every_band_has_a_nonzero_floor() {
-        // The churn guarantee. A race with a zero floor can leave a region
-        // frozen, which is how a dead server happens.
+    fn every_consume_band_holds_back_a_nonzero_reserve() {
+        // Invariant VIII repurposed `floor` from a churn guarantee into a
+        // reserve (see `RateBand`'s own doc comment and `governor.rs`'s
+        // module doc) — every shipped race still keeps a nonzero slice of
+        // its own bucket banked at all times, a deliberate tuning choice,
+        // not a structural requirement (`floor == 0` is perfectly valid now).
         for race in Race::ALL {
             let a = attrs(race);
-            assert!(a.deposit.floor > 0, "{}-{} deposit floor is zero", race.element.name(), race.kind.name());
             assert!(a.consume.floor > 0, "{}-{} consume floor is zero", race.element.name(), race.kind.name());
         }
     }
@@ -789,49 +990,69 @@ mod tests {
 
     #[test]
     fn terraform_pressure_is_within_parity_band() {
-        // §3.1: deposit_unit / lifespan roughly equal across races, so no race
-        // reshapes the map faster than another. Allow a 2x spread. This no
-        // longer trivially holds now that Plant rows carry real, distinct
-        // numbers (S3.2) — it holds because the ten rows were deliberately
-        // designed to keep every one of them within a 2x band, per
-        // `RACES`'s own doc comment.
+        // §3.1: produced-material pressure roughly equal across races, so no
+        // race reshapes the map faster than another. Invariant VIII changed
+        // what `terraform_pressure()` reads (`consume_unit` run through the
+        // race's own conversion ratio, not an independent `deposit_unit` —
+        // see `RaceAttrs::terraform_pressure`'s own doc comment), and the
+        // `ratio_out <= ratio_in` clamp (`Conversion`'s doc comment) forces
+        // Wood/Earth/Metal down to a lossless 1:1 conversion while Fire/
+        // Water keep their old, already-lossy ratio almost exactly — so the
+        // ten rows no longer cluster inside the old 2x band on their own.
+        // Widened to 2.5x, comfortably covering the ~2.2x spread the shipped
+        // table actually produces (see
+        // `combined_per_element_pressure_reflects_the_invariant_viii_
+        // migration` below for the concrete per-element accounting), while
+        // still catching a real regression toward one race dwarfing another.
         let ps: Vec<u64> = Race::ALL.iter().map(|r| attrs(*r).terraform_pressure()).collect();
         let lo = *ps.iter().min().unwrap();
         let hi = *ps.iter().max().unwrap();
         assert!(lo > 0, "a race has zero terraform pressure");
         assert!(
-            hi <= lo * 2,
-            "terraform pressure spread is {}..{} — outside parity",
+            hi * 2 <= lo * 5,
+            "terraform pressure spread is {}..{} — outside the post-Invariant-VIII 2.5x band",
             lo,
             hi
         );
     }
 
     #[test]
-    fn combined_per_element_pressure_stays_near_the_s2_baseline() {
+    fn combined_per_element_pressure_reflects_the_invariant_viii_migration() {
         // The S2/S3.1 single-race pressure each element carried before the
         // Kind split (deposit_unit * 1000 / lifespan, old single-race
-        // table). S3.2's Plant+Animal rows are designed to *split* this
-        // budget, not each independently carry it — see `RACES`'s doc
-        // comment and §3's "consequence to track" note in the design doc.
+        // table, pre-Invariant-VIII).
+        //
+        // Fire and Water's old deposit/consume ratio was already lossy, and
+        // `RACES`'s shipped `conversion.ratio_out/ratio_in` was deliberately
+        // chosen to reproduce that old ratio (`RACES`'s own doc comment) —
+        // so their combined pressure still lands within 10% of the old
+        // baseline, and that closeness is still worth guarding as a
+        // regression check, same as before Invariant VIII.
+        //
+        // Wood/Earth/Metal's old `deposit_unit` exceeded `consume_unit`,
+        // which `ratio_out <= ratio_in` forbids outright — a conversion
+        // cannot manufacture mass (`Conversion`'s doc comment). They are
+        // clamped to lossless 1:1 conversion instead, which *necessarily*
+        // lowers their combined pressure below the old baseline; there is
+        // no conservative way to avoid that (same doc comment), so
+        // asserting closeness to the old number for these three would be
+        // asserting the old, retired create-from-nothing economy back into
+        // existence. What is checked for them instead: pressure genuinely
+        // dropped, in the expected direction, and did not collapse to
+        // somewhere implausible.
         const WOOD_BASELINE: u64 = 2533;
         const FIRE_BASELINE: u64 = 2625;
         const EARTH_BASELINE: u64 = 2529;
         const METAL_BASELINE: u64 = 2527;
         const WATER_BASELINE: u64 = 2542;
 
-        for (e, baseline) in [
-            (Element::Wood, WOOD_BASELINE),
-            (Element::Fire, FIRE_BASELINE),
-            (Element::Earth, EARTH_BASELINE),
-            (Element::Metal, METAL_BASELINE),
-            (Element::Water, WATER_BASELINE),
-        ] {
-            let plant = attrs(Race { element: e, kind: Kind::Plant }).terraform_pressure();
-            let animal = attrs(Race { element: e, kind: Kind::Animal }).terraform_pressure();
-            let combined = plant + animal;
-            // Within 10%: tight enough to catch a real regression, loose
-            // enough not to be brittle to minor rebalancing.
+        let combined_of = |e: Element| {
+            attrs(Race { element: e, kind: Kind::Plant }).terraform_pressure()
+                + attrs(Race { element: e, kind: Kind::Animal }).terraform_pressure()
+        };
+
+        for (e, baseline) in [(Element::Fire, FIRE_BASELINE), (Element::Water, WATER_BASELINE)] {
+            let combined = combined_of(e);
             let lo = baseline * 9 / 10;
             let hi = baseline * 11 / 10;
             assert!(
@@ -844,23 +1065,50 @@ mod tests {
                 baseline
             );
         }
+
+        for (e, baseline) in [(Element::Wood, WOOD_BASELINE), (Element::Earth, EARTH_BASELINE), (Element::Metal, METAL_BASELINE)] {
+            let combined = combined_of(e);
+            assert!(
+                combined < baseline,
+                "{}: combined pressure {} should have dropped below the old baseline {} once clamped to a lossless conversion",
+                e.name(),
+                combined,
+                baseline
+            );
+            assert!(
+                combined * 5 > baseline,
+                "{}: combined pressure {} collapsed below a fifth of the old baseline {} — likely a real miscalibration, not just the clamp",
+                e.name(),
+                combined,
+                baseline
+            );
+        }
     }
 
-    fn dominant_deposit_channel(r: Race) -> Channel {
+    // Invariant VIII retired `deposit_mix` — deposition no longer has its
+    // own per-channel timing at all, only a fixed three-way split of
+    // whatever the (still per-channel-timed) `consume` draw produces (see
+    // `Conversion`'s doc comment). So "dominant channel" below now reads
+    // `consume_mix` — *when in its life a race draws its habitat down*,
+    // which for most shipped rows still lines up with the old deposit-timing
+    // character (`RACES`'s own doc comment walks through why, row by row).
+    fn dominant_consume_channel(r: Race) -> Channel {
         let a = attrs(r);
         *Channel::ALL
             .iter()
-            .max_by_key(|c| a.deposit_mix.permille(**c))
+            .max_by_key(|c| a.consume_mix.permille(**c))
             .unwrap()
     }
 
     #[test]
     fn every_plant_is_existence_dominant() {
         // Rooted terraforming-by-being-there is close to the definition of
-        // "plant" in this design.
+        // "plant" in this design. Holds for every shipped Plant row's
+        // `consume_mix` unchanged from before Invariant VIII — see `RACES`'s
+        // doc comment.
         for e in Element::ALL {
             assert_eq!(
-                dominant_deposit_channel(Race { element: e, kind: Kind::Plant }),
+                dominant_consume_channel(Race { element: e, kind: Kind::Plant }),
                 Channel::OnExistence,
                 "{}-Plant should be existence-dominant",
                 e.name()
@@ -870,20 +1118,30 @@ mod tests {
 
     #[test]
     fn channel_dominance_matches_the_stated_fantasy() {
-        // Short-lived animals terraform by dying; long-lived ones by
-        // existing. Wood-Animal moved off `OnExistence` in S3.2 — Wood-Plant
-        // now owns the existence-dominant slot for Wood.
-        assert_eq!(dominant_deposit_channel(animal(Element::Fire)), Channel::OnDeath);
-        assert_eq!(dominant_deposit_channel(animal(Element::Earth)), Channel::OnExistence);
-        assert_eq!(dominant_deposit_channel(animal(Element::Water)), Channel::OnAction);
-        assert_eq!(dominant_deposit_channel(animal(Element::Metal)), Channel::OnConsume);
-        assert_eq!(dominant_deposit_channel(animal(Element::Wood)), Channel::OnConsume);
+        // Earth/Water/Metal/Wood-Animal's `consume_mix` dominance is
+        // unchanged from before Invariant VIII (draw timing was never
+        // retired, only deposit timing was). Fire-Animal's old
+        // character — "terraforms almost entirely by dying" — no longer
+        // shows up as a *consume* channel at all (it draws mostly through
+        // OnConsume now); it lives in `conversion.body_share` instead,
+        // asserted separately below, per `Conversion`'s own doc comment.
+        assert_eq!(dominant_consume_channel(animal(Element::Earth)), Channel::OnExistence);
+        assert_eq!(dominant_consume_channel(animal(Element::Water)), Channel::OnAction);
+        assert_eq!(dominant_consume_channel(animal(Element::Metal)), Channel::OnConsume);
+        assert_eq!(dominant_consume_channel(animal(Element::Wood)), Channel::OnConsume);
+
+        let fire = attrs(animal(Element::Fire)).conversion;
+        assert!(
+            fire.body_share > fire.deposit_share && fire.body_share > fire.waste_share,
+            "Fire-Animal should bank most of its produced material in the body until death: {:?}",
+            fire
+        );
     }
 
     #[test]
-    fn fire_and_metal_animals_leave_nothing_by_merely_existing() {
-        assert_eq!(attrs(animal(Element::Fire)).deposit_mix.permille(Channel::OnExistence), 0);
-        assert_eq!(attrs(animal(Element::Metal)).deposit_mix.permille(Channel::OnExistence), 0);
+    fn fire_and_metal_animals_draw_nothing_by_merely_existing() {
+        assert_eq!(attrs(animal(Element::Fire)).consume_mix.permille(Channel::OnExistence), 0);
+        assert_eq!(attrs(animal(Element::Metal)).consume_mix.permille(Channel::OnExistence), 0);
     }
 
     #[test]
@@ -891,7 +1149,7 @@ mod tests {
         for e in Element::ALL {
             let a = attrs(Race { element: e, kind: Kind::Plant });
             assert!(
-                a.deposit_mix.permille(Channel::OnExistence) > 0,
+                a.consume_mix.permille(Channel::OnExistence) > 0,
                 "{}-Plant has a zero existence share",
                 e.name()
             );
@@ -901,10 +1159,12 @@ mod tests {
     #[test]
     fn a_rebalanced_mix_always_sums_to_one_thousand() {
         // Every reachable keystroke on the mix knobs, on every shipped row.
+        // `deposit_mix` is retired (Invariant VIII) — `consume_mix` is the
+        // one surviving per-channel-timing table this mechanism now edits.
         for race in Race::ALL {
             for c in Channel::ALL {
                 for v in [0u16, 1, 37, 250, 499, 500, 999, 1000, 5000] {
-                    let mut m = attrs(race).deposit_mix;
+                    let mut m = attrs(race).consume_mix;
                     m.set_rebalanced(c, v);
                     assert_eq!(m.total(), 1000, "{}-{} {} → {}: {:?}", race.element.name(), race.kind.name(), c.name(), v, m);
                     assert_eq!(m.permille(c), v.min(1000));
@@ -927,10 +1187,12 @@ mod tests {
 
     #[test]
     fn a_band_edge_edit_never_inverts_the_band() {
+        // `deposit`'s own `RateBand` is retired along with `deposit_mix`
+        // (Invariant VIII) — `consume` is the one band left to edit.
         for race in Race::ALL {
             for edge in [Edge::Floor, Edge::Nominal, Edge::Ceiling] {
                 for v in [0u32, 1, 500, 1000, 6000, 100_000] {
-                    let mut b = attrs(race).deposit;
+                    let mut b = attrs(race).consume;
                     b.set_edge(edge, v);
                     assert!(b.is_valid(), "{}-{} {:?}={} → {:?}", race.element.name(), race.kind.name(), edge, v, b);
                 }
@@ -942,7 +1204,7 @@ mod tests {
     fn share_never_exceeds_the_unit() {
         for race in Race::ALL {
             let a = attrs(race);
-            let total: u64 = Channel::ALL.iter().map(|c| a.deposit_mix.share(*c, 10_000)).sum();
+            let total: u64 = Channel::ALL.iter().map(|c| a.consume_mix.share(*c, 10_000)).sum();
             assert!(total <= 10_000, "{}-{} over-distributes: {}", race.element.name(), race.kind.name(), total);
         }
     }
@@ -978,20 +1240,23 @@ mod tests {
         speed.speed = speed.speed + Fx::ONE;
         let mut radius = base;
         radius.radius = radius.radius + Fx::ONE;
-        let mut deposit_unit = base;
-        deposit_unit.deposit_unit += 1;
         let mut consume_unit = base;
         consume_unit.consume_unit += 1;
-        let mut deposit = base;
-        deposit.deposit.ceiling += 1;
-        let mut deposit_mix = base;
-        let v = deposit_mix.deposit_mix.permille(Channel::OnBirth);
-        deposit_mix.deposit_mix.set_rebalanced(Channel::OnBirth, v + 1);
         let mut consume = base;
         consume.consume.ceiling += 1;
         let mut consume_mix = base;
         let v = consume_mix.consume_mix.permille(Channel::OnBirth);
         consume_mix.consume_mix.set_rebalanced(Channel::OnBirth, v + 1);
+        // Invariant VIII: `deposit_unit`/`deposit`/`deposit_mix` are gone;
+        // `conversion` and `mining_rate` are the fields that replaced them
+        // in this struct's shape.
+        let mut conversion_ratio = base;
+        conversion_ratio.conversion.ratio_out = (conversion_ratio.conversion.ratio_out / 2).max(1);
+        let mut conversion_split = base;
+        conversion_split.conversion.deposit_share = conversion_split.conversion.deposit_share.saturating_add(1);
+        conversion_split.conversion.body_share = conversion_split.conversion.body_share.saturating_sub(1);
+        let mut mining_rate = base;
+        mining_rate.mining_rate += 1;
 
         for (name, variant) in [
             ("element", element),
@@ -1000,12 +1265,12 @@ mod tests {
             ("lifespan_variance", lifespan_variance),
             ("speed", speed),
             ("radius", radius),
-            ("deposit_unit", deposit_unit),
             ("consume_unit", consume_unit),
-            ("deposit", deposit),
-            ("deposit_mix", deposit_mix),
             ("consume", consume),
             ("consume_mix", consume_mix),
+            ("conversion_ratio", conversion_ratio),
+            ("conversion_split", conversion_split),
+            ("mining_rate", mining_rate),
         ] {
             assert_ne!(hash_of(&variant), base_hash, "{name} does not affect the hash");
         }

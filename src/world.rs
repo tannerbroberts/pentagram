@@ -20,10 +20,8 @@
 use crate::behavior::{BehaviorTuning, Drive};
 use crate::climate::{Climate, ClimateTuning};
 use crate::ecology::{EcologyTuning, PropagationTuning};
-#[cfg(test)]
-use crate::element::Element;
-use crate::element::PerElement;
-use crate::entity::{Entity, ACTION_THRESHOLD, MAX_HP};
+use crate::element::{Element, PerElement};
+use crate::entity::{Entity, Item, ACTION_THRESHOLD, MAX_HP};
 use crate::fx::{Fx, V2};
 use crate::governor::{Governor, Grant};
 use crate::hash::{Hashable, Hasher};
@@ -39,18 +37,30 @@ pub const JITTER: Fx = Fx::ratio(1, 400);
 /// cohort born from the same parent does not stack exactly on top of it.
 pub const BIRTH_SCATTER: Fx = Fx::ratio(150, 100);
 
+/// Items/inventory (Invariant VIII extension): `Smelt`'s fixed conversion
+/// ratio, `X` → `X.generates()` — the project owner's own worked example,
+/// shipped as-is rather than derived: 50 carried units of `X` in, 1 unit of
+/// `X.generates()` out, the remaining 49 returned to terrain at the smelting
+/// body's position as tailings (`World::smelt`). Unlike `race::Conversion`
+/// (one ratio per race, live-tunable), this is one ratio for every race and
+/// every element — smelting is the same physical process no matter who's
+/// doing it — so it is a plain constant, not a `RaceAttrs` field or a
+/// `tuning.rs` knob.
+pub const SMELT_RATIO_IN: u64 = 50;
+pub const SMELT_RATIO_OUT: u64 = 1;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
     pub births: u64,
     pub deaths: u64,
     pub collisions: u64,
     pub actions: u64,
-    /// Total demand refused by the deposit governors. A rising value means
-    /// somebody is pushing on a rate limit.
+    /// Total demand refused by the (sole, post-Invariant-VIII) conversion
+    /// governor. A rising value means somebody is pushing on a rate limit.
+    /// Named `deposit_clipped` for historical continuity with the
+    /// pre-Invariant-VIII two-governor model; it now tracks the one
+    /// governor that gates the coupled conversion's habitat draw.
     pub deposit_clipped: u64,
-    /// Total emitted purely to honour a floor. A rising value means a race is
-    /// absent or idle and the world is turning over without it.
-    pub deposit_forced: u64,
     /// S2: successful predation events, counted at the predator.
     pub feedings: u64,
     /// S2: deaths where hunger had already crossed `starve_after` — a subset
@@ -100,7 +110,7 @@ pub struct World {
     /// compares equal to an untuned one.
     pub races: PerRace<RaceAttrs>,
 
-    /// S1: the terrain field and the tuning tables its six operators read.
+    /// S1: the terrain field and the tuning tables its operators read.
     /// Covered by [`World::state_hash`] the same way `races` is — a
     /// retuned world must not hash the same as an untuned one.
     pub terrain: Terrain,
@@ -120,13 +130,18 @@ pub struct World {
     /// Covered by [`World::state_hash`] the same way `ecology`/`behavior` are.
     pub propagation: PropagationTuning,
 
-    deposit_gov: PerRace<Governor>,
+    /// Invariant VIII: the sole governor left. Pre-Invariant-VIII this
+    /// gated one of two independent flows (deposit); it now gates the one
+    /// coupled conversion's habitat draw — see `race::Conversion` and
+    /// `terrain::apply_conversion`. Deposit's own governor/RateBand/demand
+    /// are retired entirely: deposition is now a fully derived,
+    /// same-tick consequence of this draw, not a second rate-limited
+    /// process (its bound is inherited transitively, since the produced
+    /// amount can never exceed the draw by construction).
     consume_gov: PerRace<Governor>,
     /// Accumulated in milli-units between terrain ticks.
-    deposit_demand: PerRace<u64>,
     consume_demand: PerRace<u64>,
 
-    pub last_deposit: PerRace<Grant>,
     pub last_consume: PerRace<Grant>,
     pub stats: Stats,
 }
@@ -156,11 +171,8 @@ impl World {
             ecology: EcologyTuning::default(),
             behavior: BehaviorTuning::default(),
             propagation: PropagationTuning::default(),
-            deposit_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).deposit))),
             consume_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).consume))),
-            deposit_demand: PerRace::filled(0),
             consume_demand: PerRace::filled(0),
-            last_deposit: PerRace::default(),
             last_consume: PerRace::default(),
             stats: Stats::default(),
         }
@@ -176,7 +188,6 @@ impl World {
     pub fn retune(&mut self, races: PerRace<RaceAttrs>) {
         self.races = races;
         for r in Race::ALL {
-            self.deposit_gov.get_mut(r).set_band(races[r].deposit);
             self.consume_gov.get_mut(r).set_band(races[r].consume);
         }
     }
@@ -257,7 +268,6 @@ impl World {
         // Ids are handed out ascending, so pushing preserves the sort.
         self.entities.push(e);
         self.stats.births += 1;
-        *self.deposit_demand.get_mut(race) += a.deposit_per(DepChannel::OnBirth);
         *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnBirth);
         id
     }
@@ -312,7 +322,113 @@ impl World {
                     self.entities[i].hp = 0;
                 }
             }
+            CmdKind::Mine { element } => self.mine(c.entity, element),
+            CmdKind::Smelt { element } => self.smelt(c.entity, element),
+            CmdKind::MakeItem { element, quantity } => self.make_item(c.entity, element, quantity),
+            CmdKind::BreakItem { index } => self.break_item(c.entity, index),
         }
+    }
+
+    /// Items/inventory (Invariant VIII extension): mine up to
+    /// `RaceAttrs::mining_rate[race]` units of `element` out of the terrain
+    /// cell this body currently occupies, into its own `Entity.carried` —
+    /// a pure 1:1 transfer, never more than the cell actually holds. A
+    /// no-op for a dead entity, an unknown id, a `Kind::Plant` (rooted —
+    /// mining is a deliberate act, never passive existence), a zero-rate
+    /// race, or an already-empty cell.
+    fn mine(&mut self, id: u32, element: Element) {
+        let Some(i) = self.find(id) else { return };
+        if !self.entities[i].alive || self.entities[i].kind != Kind::Animal {
+            return;
+        }
+        let race = self.entities[i].race();
+        let rate = self.races[race].mining_rate as u64;
+        if rate == 0 {
+            return;
+        }
+        let pos = self.entities[i].pos;
+        let (x, y) = self.terrain.cell_of(pos);
+        let stock = self.terrain.cell(x, y)[element] as u64;
+        let amount = rate.min(stock);
+        if amount == 0 {
+            return;
+        }
+        let amt16 = amount as u16; // amount <= stock <= u16::MAX
+        let c = self.terrain.cell_mut(x, y);
+        c[element] = c[element].saturating_sub(amt16);
+        self.entities[i].carried[element] = self.entities[i].carried[element].saturating_add(amount);
+    }
+
+    /// Items/inventory (Invariant VIII extension): convert as many whole
+    /// `SMELT_RATIO_IN`-unit batches of this body's own carried `element` as
+    /// it currently holds into `SMELT_RATIO_OUT` units apiece of carried
+    /// `element.generates()` — the fixed, race-independent ratio
+    /// `SMELT_RATIO_IN`/`SMELT_RATIO_OUT` document. The per-batch difference
+    /// (tailings) is not discarded: it returns to terrain at this body's
+    /// current position, as `element`, in one net deposit for the whole
+    /// command (same "single net write, not per-batch" discipline
+    /// `terrain::apply_conversion`'s own doc comment explains for its
+    /// tailings). A no-op for a dead entity, an unknown id, a `Kind::Plant`
+    /// (structurally never carries anything to smelt — see
+    /// `Entity.carried`'s own doc comment), or fewer than `SMELT_RATIO_IN`
+    /// units on hand.
+    fn smelt(&mut self, id: u32, element: Element) {
+        let Some(i) = self.find(id) else { return };
+        if !self.entities[i].alive || self.entities[i].kind != Kind::Animal {
+            return;
+        }
+        let have = self.entities[i].carried[element];
+        let batches = have / SMELT_RATIO_IN;
+        if batches == 0 {
+            return;
+        }
+        let consumed = batches * SMELT_RATIO_IN;
+        let produced = batches * SMELT_RATIO_OUT;
+        let tailings = consumed - produced;
+        let next = element.generates();
+        self.entities[i].carried[element] -= consumed;
+        self.entities[i].carried[next] = self.entities[i].carried[next].saturating_add(produced);
+        let pos = self.entities[i].pos;
+        crate::terrain::deposit_at(&mut self.terrain, element, tailings, pos);
+    }
+
+    /// Items/inventory: bundle `quantity` units of this body's own carried
+    /// `element` into a new `Item` pushed onto `Entity.items` — a no-op
+    /// (nothing created, nothing spent) if the entity is dead, unknown,
+    /// `quantity` is zero, or fewer than `quantity` units are actually
+    /// carried. No `Kind` gate here (unlike `mine`/`smelt`): a `Kind::Plant`
+    /// body's `carried` is structurally always zero (nothing ever credits
+    /// it — mining is the only source and Plants cannot mine), so this is
+    /// already a no-op for one without needing its own redundant check.
+    fn make_item(&mut self, id: u32, element: Element, quantity: u64) {
+        let Some(i) = self.find(id) else { return };
+        if !self.entities[i].alive || quantity == 0 {
+            return;
+        }
+        if self.entities[i].carried[element] < quantity {
+            return;
+        }
+        self.entities[i].carried[element] -= quantity;
+        self.entities[i].items.push(Item { element, quantity });
+    }
+
+    /// Items/inventory: destroy the item at `index` in this body's
+    /// `Entity.items`, returning its full quantity to terrain at this
+    /// body's current position, as the item's own element — Invariant VIII,
+    /// a pure transfer. A no-op for a dead entity, an unknown id, or an
+    /// out-of-range index.
+    fn break_item(&mut self, id: u32, index: u32) {
+        let Some(i) = self.find(id) else { return };
+        if !self.entities[i].alive {
+            return;
+        }
+        let idx = index as usize;
+        if idx >= self.entities[i].items.len() {
+            return;
+        }
+        let item = self.entities[i].items.remove(idx);
+        let pos = self.entities[i].pos;
+        crate::terrain::deposit_at(&mut self.terrain, item.element, item.quantity, pos);
     }
 
     /// 2 — age every body, drain `hp` for anyone past their starvation grace
@@ -358,30 +474,44 @@ impl World {
                     e.size = crate::entity::grown_size(birth_size, e.age, e.lifespan, ceiling);
                     if e.is_expired() || e.hp <= 0 {
                         e.alive = false;
-                        Some((e.race(), starving))
+                        Some((e.race(), starving, e.pos, e.material))
                     } else {
                         None
                     }
                 }
             };
-            if let Some((race, starving)) = dead {
+            if let Some((race, starving, pos, material)) = dead {
                 if starving {
                     self.stats.starved += 1;
                 }
-                self.charge_death(race);
+                self.charge_death(race, pos, material);
             }
         }
     }
 
-    /// Charge the `OnDeath` demand for one body's race and count the
-    /// death. Shared by natural/starvation death (`phase_aging`) and
-    /// predation (`phase_feeding`) — a corpse terraforms the same way
-    /// regardless of what ended the body.
-    fn charge_death(&mut self, race: Race) {
+    /// Charge the `OnDeath` habitat-draw demand for one body's race, count
+    /// the death, and return the body's own held material to terrain.
+    /// Shared by natural/starvation death (`phase_aging`) and predation
+    /// (`phase_feeding`) — a corpse terraforms the same way regardless of
+    /// what ended the body.
+    ///
+    /// Invariant VIII: `material` is the dying body's own `Entity.material`
+    /// at the moment of death, deposited back to terrain as `race.element`
+    /// at `pos` — this literally *is* the death deposit now, replacing the
+    /// old abstract `OnDeath` deposit-demand charge (there is no
+    /// `deposit_per`/`deposit_demand` anymore — see `race::Conversion`'s
+    /// doc comment). Unlike background deposit (spread across a race's
+    /// occupied territory via `apportion`), this lands at exactly one cell:
+    /// a corpse decomposes where it fell, not smeared across the map.
+    /// `phase_feeding` transfers a killed body's material to its predator
+    /// *before* calling this, so `material` is already `0` for prey eaten
+    /// this tick — the material moved to the predator, it did not also fall
+    /// to the ground, so there is no double count.
+    fn charge_death(&mut self, race: Race, pos: V2, material: u64) {
         let a = self.races[race];
         self.stats.deaths += 1;
-        *self.deposit_demand.get_mut(race) += a.deposit_per(DepChannel::OnDeath);
         *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnDeath);
+        crate::terrain::deposit_at(&mut self.terrain, race.element, material, pos);
     }
 
     /// 3 — move, jitter, and reflect off the bounds.
@@ -471,7 +601,6 @@ impl World {
         for (race, n) in acted.iter() {
             if *n > 0 {
                 self.stats.actions += *n;
-                *self.deposit_demand.get_mut(race) += races[race].deposit_per(DepChannel::OnAction) * *n;
                 *self.consume_demand.get_mut(race) += races[race].consume_per(DepChannel::OnAction) * *n;
             }
         }
@@ -572,6 +701,13 @@ impl World {
         // depends on the order mutations happened to land in.
         let mut eaten = vec![false; n];
         let mut fed = vec![false; n];
+        // Invariant VIII: which prey index (if any) each predator index
+        // ate this tick, so the material transfer below knows the pairing
+        // — `eaten`/`fed` alone only record booleans, not who-ate-whom.
+        // Each predator eats at most one prey per tick (`fed[pred]` blocks
+        // further matches within the same scan), so this is a genuine 1:1
+        // mapping.
+        let mut ate: Vec<Option<usize>> = vec![None; n];
 
         for i in 0..n {
             if !self.entities[i].alive || eaten[i] {
@@ -651,6 +787,7 @@ impl World {
                 }
                 eaten[prey] = true;
                 fed[pred] = true;
+                ate[pred] = Some(prey);
             }
         }
 
@@ -666,8 +803,20 @@ impl World {
             self.entities[i].hp = after;
             self.entities[i].hunger = 0;
             self.stats.feedings += 1;
-            *self.deposit_demand.get_mut(race) += races[race].deposit_per(DepChannel::OnConsume);
             *self.consume_demand.get_mut(race) += races[race].consume_per(DepChannel::OnConsume);
+
+            // Invariant VIII, Animal predation only ("you are what you
+            // eat"): the prey's entire current material transfers to the
+            // predator, in full, before the prey is marked dead below — so
+            // `charge_death`'s terrain-return sees `material == 0` for it
+            // and does not also deposit the same units to the ground.
+            // Grazing (Plant prey) is included here too, same mechanism,
+            // same rule.
+            if let Some(prey_idx) = ate[i] {
+                let gained = self.entities[prey_idx].material;
+                self.entities[i].material = self.entities[i].material.saturating_add(gained);
+                self.entities[prey_idx].material = 0;
+            }
 
             if before < ecology.repro_threshold[el] && after >= ecology.repro_threshold[el] {
                 births.push((race, self.entities[i].pos, self.entities[i].id));
@@ -677,9 +826,11 @@ impl World {
         for (i, &was_eaten) in eaten.iter().enumerate() {
             if was_eaten {
                 let race = self.entities[i].race();
+                let pos = self.entities[i].pos;
+                let material = self.entities[i].material;
                 self.entities[i].alive = false;
                 self.entities[i].hp = 0;
-                self.charge_death(race);
+                self.charge_death(race, pos, material);
             }
         }
 
@@ -701,11 +852,12 @@ impl World {
 
     /// 6 — plant reproduction (S3.5). Gated at the same terrain-tick
     /// boundary `phase_settle`/`phase_terrain` share. A new phase rather
-    /// than folding into `phase_terrain`'s existing six-slot sequence,
+    /// than folding into `phase_terrain`'s own operator sequence,
     /// because `phase_terrain` runs *after* `phase_settle` — a newborn's
     /// `OnBirth` demand would be deferred to the next terrain tick — and
     /// folding in would renumber `docs/S1_TERRAIN_DESIGN.md`'s documented
-    /// six-slot wire format. Snapshot-then-apply, the same shape
+    /// slot wire format (five slots as of Invariant VIII — see
+    /// `terrain.rs`'s own module doc). Snapshot-then-apply, the same shape
     /// `phase_feeding`'s own `births` vec already uses: every candidate is
     /// decided against a fixed snapshot of who's alive and where (including
     /// `Occupancy`, built once up front), and every successful offspring is
@@ -766,8 +918,10 @@ impl World {
         }
     }
 
-    /// 7 — at a terrain-tick boundary, charge existence and settle every
-    /// governor. This is the only place demand becomes terrain change.
+    /// 7 — at a terrain-tick boundary, charge existence and settle the
+    /// (sole, post-Invariant-VIII) conversion governor. This is the only
+    /// place demand becomes a granted, governed habitat draw; turning that
+    /// draw into terrain change is `phase_terrain`'s job.
     fn phase_settle(&mut self) {
         if !(self.tick + 1).is_multiple_of(TERRAIN_PERIOD) {
             return;
@@ -782,50 +936,85 @@ impl World {
         let races = self.races;
         for (race, n) in alive.iter() {
             if *n > 0 {
-                *self.deposit_demand.get_mut(race) +=
-                    races[race].deposit_per(DepChannel::OnExistence) * *n;
                 *self.consume_demand.get_mut(race) +=
                     races[race].consume_per(DepChannel::OnExistence) * *n;
             }
         }
 
         for race in Race::ALL {
-            let d = self.deposit_demand[race] / MILLI;
-            let grant = self.deposit_gov.get_mut(race).settle(d);
-            self.stats.deposit_clipped += grant.clipped;
-            self.stats.deposit_forced += grant.forced;
-            self.last_deposit[race] = grant;
-            self.deposit_demand[race] = 0;
-
             let c = self.consume_demand[race] / MILLI;
-            self.last_consume[race] = self.consume_gov.get_mut(race).settle(c);
+            let grant = self.consume_gov.get_mut(race).settle(c);
+            self.stats.deposit_clipped += grant.clipped;
+            self.last_consume[race] = grant;
             self.consume_demand[race] = 0;
         }
     }
 
-    /// 8 — the six fixed-order operator slots gated at the same terrain-tick
-    /// boundary `phase_settle` uses so every operator sees this tick's
-    /// freshly computed `last_deposit`/`last_consume` grants. See
-    /// `docs/S1_TERRAIN_DESIGN.md` and `terrain.rs`'s own doc comment for why
-    /// this exact order — deposit, consume, attrition, suppression, climate,
-    /// diffusion — is a wire format, not a stylistic choice. Slots 3 and 4
-    /// used to be terrain's own `ring`/`star` operators, converting and
-    /// nullifying stock with no entity involved at all; terrain isn't its
-    /// own actor, so those slots are now `ecology::apply_attrition`/
-    /// `apply_suppression` — the same ring/star *relations*, now read from
-    /// terrain and applied to the bodies standing in it.
+    /// 8 — the five fixed-order operator slots gated at the same terrain-tick
+    /// boundary `phase_settle` uses so `apply_conversion` sees this tick's
+    /// freshly computed `last_consume` grant. See `docs/S1_TERRAIN_DESIGN.md`
+    /// and `terrain.rs`'s own doc comment for why this exact order —
+    /// conversion, attrition, suppression, climate, diffusion — is a wire
+    /// format, not a stylistic choice.
+    ///
+    /// **Invariant VIII.** The old, independent deposit and consume operators
+    /// (slots 1 and 2) are now one coupled `apply_conversion` (slot 1) — see
+    /// that function's doc comment for the exact accounting. It cannot
+    /// credit a living body's own `Entity.material` itself (`terrain.rs`
+    /// doesn't own `Entity` state), so it returns each race's produced
+    /// body-material share for `credit_body_material` to apply immediately
+    /// after, still within this same phase/terrain-tick boundary. Slots
+    /// that used to be terrain's own `ring`/`star` operators, converting and
+    /// nullifying stock with no entity involved at all, are gone too
+    /// (predates Invariant VIII); terrain isn't its own actor, so those
+    /// slots are `ecology::apply_attrition`/`apply_suppression` — the same
+    /// ring/star *relations*, now read from terrain and applied to the
+    /// bodies standing in it.
     fn phase_terrain(&mut self) {
         if !(self.tick + 1).is_multiple_of(TERRAIN_PERIOD) {
             return;
         }
         let terrain_tick = (self.tick + 1) / TERRAIN_PERIOD;
         let occ = Occupancy::build(&self.entities, &self.terrain);
-        crate::terrain::apply_deposit(&mut self.terrain, &occ, &self.last_deposit, self.seed, terrain_tick);
-        crate::terrain::apply_consume(&mut self.terrain, &occ, &self.last_consume, self.seed, terrain_tick);
+        let body_share =
+            crate::terrain::apply_conversion(&mut self.terrain, &occ, &self.races, &self.last_consume, self.seed, terrain_tick);
+        self.credit_body_material(&body_share);
         crate::ecology::apply_attrition(&mut self.entities, &self.terrain, &self.ecology);
         crate::ecology::apply_suppression(&mut self.entities, &self.terrain, &self.ecology);
         crate::climate::apply_influx(&mut self.terrain, &self.climate, &self.climate_tuning, terrain_tick);
         crate::terrain::apply_diffusion(&mut self.terrain, &self.terrain_tuning);
+    }
+
+    /// Invariant VIII: distribute each race's produced body-material share
+    /// (`apply_conversion`'s return value) evenly across every one of that
+    /// race's currently-living bodies, in ascending id order (Invariant
+    /// IV — `self.entities` is already sorted this way), with the
+    /// indivisible remainder going to the lowest-id bodies first so the
+    /// total credited is always exactly `share`, nothing left over.
+    ///
+    /// `apply_conversion` already guards the zero-living-bodies case (that
+    /// share folds into terrain deposit instead, before this ever runs), so
+    /// a nonzero `share` reaching here is always backed by at least one
+    /// living body of that race.
+    fn credit_body_material(&mut self, body_share: &PerRace<u64>) {
+        for r in Race::ALL {
+            let share = body_share[r];
+            if share == 0 {
+                continue;
+            }
+            let indices: Vec<usize> =
+                (0..self.entities.len()).filter(|&i| self.entities[i].alive && self.entities[i].race() == r).collect();
+            let count = indices.len() as u64;
+            if count == 0 {
+                continue;
+            }
+            let base = share / count;
+            let remainder = share % count;
+            for (k, &i) in indices.iter().enumerate() {
+                let extra = u64::from((k as u64) < remainder);
+                self.entities[i].material = self.entities[i].material.saturating_add(base + extra);
+            }
+        }
     }
 
     /// 9 — remove the dead. `retain` is order-preserving, so the id sort holds.
@@ -876,20 +1065,11 @@ impl World {
         self.ecology.hash_into(&mut h);
         self.behavior.hash_into(&mut h);
         self.propagation.hash_into(&mut h);
-        for (_, g) in self.deposit_gov.iter() {
-            g.hash_into(&mut h);
-        }
         for (_, g) in self.consume_gov.iter() {
             g.hash_into(&mut h);
         }
-        for (_, d) in self.deposit_demand.iter() {
-            h.u64(*d);
-        }
         for (_, d) in self.consume_demand.iter() {
             h.u64(*d);
-        }
-        for (_, g) in self.last_deposit.iter() {
-            g.hash_into(&mut h);
         }
         for (_, g) in self.last_consume.iter() {
             g.hash_into(&mut h);
@@ -899,7 +1079,6 @@ impl World {
             .u64(self.stats.collisions)
             .u64(self.stats.actions)
             .u64(self.stats.deposit_clipped)
-            .u64(self.stats.deposit_forced)
             .u64(self.stats.feedings)
             .u64(self.stats.starved)
             .u64(self.stats.grazed)
@@ -979,24 +1158,24 @@ mod tests {
     }
 
     #[test]
-    fn governors_always_grant_inside_their_band() {
+    fn governors_always_grant_inside_their_ceiling() {
+        // Invariant VIII retires the lower bound (see `governor.rs`'s
+        // module doc) — a grant can be anywhere from 0 up to the ceiling
+        // now, never a guaranteed floor. `>= b.floor` is gone on purpose,
+        // not an oversight.
         let mut w = world();
         let log = InputLog::new();
         for _ in 0..4000 {
             w.step(&log);
             for race in Race::ALL {
-                let b = attrs(race).deposit;
-                let g = w.last_deposit[race];
-                if g.granted == 0 {
-                    continue; // before the first settlement
-                }
+                let b = attrs(race).consume;
+                let g = w.last_consume[race];
                 assert!(
-                    g.granted >= b.floor as u64 && g.granted <= b.ceiling as u64,
-                    "{}-{} granted {} outside [{}, {}]",
+                    g.granted <= b.ceiling as u64,
+                    "{}-{} granted {} above ceiling {}",
                     race.element.name(),
                     race.kind.name(),
                     g.granted,
-                    b.floor,
                     b.ceiling
                 );
             }
@@ -1004,10 +1183,17 @@ mod tests {
     }
 
     #[test]
-    fn an_extinct_race_still_churns_its_terrain() {
-        // Only Earth-Animal exists. Every other race — including Earth-Plant
-        // — must still be granted its floor, which is what stops a lost
-        // biome becoming an absorbing state.
+    fn an_extinct_races_terrain_stops_changing_from_its_own_activity() {
+        // Invariant VIII retires the old create-from-nothing floor
+        // (`governor.rs`'s module doc): only Earth-Animal exists, so every
+        // other race has zero consumption demand all run and must be
+        // granted exactly zero, not a floor -- conservation forbids
+        // emitting material nothing was ever drawn from. This is the
+        // deliberate trade-off the old
+        // `an_extinct_race_still_churns_its_terrain` test used to pin down
+        // the opposite of; there is no conservative equivalent of "still
+        // churns," so this asserts the new behaviour in the same scenario
+        // instead of merely deleting the old assertion.
         let mut w = World::new(3, 32);
         let earth_animal = Race { element: Element::Earth, kind: Kind::Animal };
         for k in 0..4 {
@@ -1022,13 +1208,13 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                w.last_deposit[race].granted,
-                attrs(race).deposit.floor as u64,
-                "{}-{} should be churning at its floor",
+                w.last_consume[race].granted,
+                0,
+                "{}-{} extinct race should draw and be granted nothing",
                 race.element.name(),
                 race.kind.name()
             );
-            assert!(w.last_deposit[race].forced > 0);
+            assert_eq!(w.last_consume[race].forced, 0, "forced is structurally always 0 now");
         }
     }
 
@@ -1631,7 +1817,21 @@ mod tests {
         // it at (at least) `growth_ref` so the ceiling is a full 1000 and
         // this test still proves the age/lifespan growth curve, not the new
         // stock-scaling behavior (`entity.rs` covers that in isolation).
+        //
+        // Pre-existing, S3.8-era test defect fixed here (unrelated to
+        // Invariant VIII, flagged by the Stage 2 report): a one-time terrain
+        // seed at a single cell does not stay put -- `apply_diffusion`
+        // spreads that peak out to its zero-stock neighbours every terrain
+        // tick, so by several hundred ticks in the ceiling had actually
+        // collapsed back below `birth_size`, freezing growth at the
+        // seedling's starting size instead of proving it reaches full
+        // growth. Diffusion is not what this test is about, so it is
+        // disabled here the same way other tests in this file neutralise a
+        // mechanism that isn't the one under test (e.g.
+        // `fire_turns_over_many_times_before_earth_dies_once` zeroing
+        // `forage_radius`).
         let mut w = World::new(34, 32);
+        w.retune_terrain(TerrainTuning { diffuse_rate: PerElement::filled(0), diffuse_cap: PerElement::filled(0) });
         let race = Race { element: Element::Fire, kind: Kind::Plant };
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
         let (cx, cy) = w.terrain.cell_of(center);
@@ -1646,5 +1846,166 @@ mod tests {
         let e = w.entities.iter().find(|e| e.id == id);
         assert!(e.is_some(), "the seedling should not have died of old age or starvation mid-test");
         assert_eq!(e.unwrap().size, 1000, "size should have reached full growth well past maturity");
+    }
+
+    // ------------------------------------------------------------------
+    // Invariant VIII, items/inventory extension: Mine, Smelt, MakeItem,
+    // BreakItem. Hand-built scenarios that pin the exact conservation
+    // arithmetic down, the same way S2's feeding tests pin `phase_feeding`
+    // down rather than asserting on the shipped tuning table's behaviour.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn mine_transfers_terrain_into_carried_exactly() {
+        let mut w = World::new(1, 8);
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(2), Fx::from_int(2));
+        let id = w.spawn(race, pos);
+        let (x, y) = w.terrain.cell_of(pos);
+        w.terrain.cell_mut(x, y)[Element::Wood] = 1000;
+        let before_terrain = w.terrain.total(Element::Wood);
+
+        w.mine(id, Element::Wood);
+
+        let rate = w.races[race].mining_rate as u64;
+        assert!(rate > 0, "test assumes the shipped table gives Fire-Animal a nonzero mining_rate");
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.carried[Element::Wood], rate, "carried should gain exactly the mining rate");
+        assert_eq!(
+            w.terrain.total(Element::Wood),
+            before_terrain - rate,
+            "terrain should lose exactly what carried gained -- a pure transfer"
+        );
+    }
+
+    #[test]
+    fn mine_never_draws_more_than_the_cell_actually_holds() {
+        let mut w = World::new(2, 8);
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(2), Fx::from_int(2));
+        let id = w.spawn(race, pos);
+        let (x, y) = w.terrain.cell_of(pos);
+        w.terrain.cell_mut(x, y)[Element::Wood] = 3; // less than any sane mining_rate
+
+        w.mine(id, Element::Wood);
+
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.carried[Element::Wood], 3, "must not mine more than the cell held");
+        assert_eq!(w.terrain.cell(x, y)[Element::Wood], 0, "cell should be fully, not over-, drained");
+    }
+
+    #[test]
+    fn a_plant_can_never_mine() {
+        let mut w = World::new(3, 8);
+        let race = Race { element: Element::Fire, kind: Kind::Plant };
+        let pos = V2::new(Fx::from_int(2), Fx::from_int(2));
+        let id = w.spawn(race, pos);
+        let (x, y) = w.terrain.cell_of(pos);
+        w.terrain.cell_mut(x, y)[Element::Wood] = 1000;
+
+        w.mine(id, Element::Wood);
+
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.carried[Element::Wood], 0, "a rooted Plant must never mine");
+        assert_eq!(w.terrain.cell(x, y)[Element::Wood], 1000, "terrain must be untouched");
+    }
+
+    #[test]
+    fn smelt_converts_whole_batches_and_returns_tailings_conserving_total() {
+        let mut w = World::new(4, 8);
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(3), Fx::from_int(3));
+        let id = w.spawn(race, pos);
+        {
+            let i = w.find(id).unwrap();
+            let e = &mut w.entities[i];
+            e.carried[Element::Wood] = 125; // 2 whole batches of 50, 25 left over
+        }
+
+        w.smelt(id, Element::Wood);
+
+        let (x, y) = w.terrain.cell_of(pos);
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.carried[Element::Wood], 25, "leftover under one batch stays untouched");
+        assert_eq!(e.carried[Element::Fire], 2, "Wood.generates() == Fire, 2 batches -> 2 units out");
+        assert_eq!(
+            w.terrain.cell(x, y)[Element::Wood],
+            2 * (SMELT_RATIO_IN - SMELT_RATIO_OUT) as u16,
+            "tailings (49 per batch) return to terrain at the smelter's position"
+        );
+        // Conservation: 125 in carried before == 25 remaining + 2*50 accounted
+        // for (2 produced + 98 tailings), nothing created or destroyed.
+        assert_eq!(25 + 2 * SMELT_RATIO_IN as u64, 125);
+    }
+
+    #[test]
+    fn smelt_is_a_noop_below_one_whole_batch() {
+        let mut w = World::new(5, 8);
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(3), Fx::from_int(3));
+        let id = w.spawn(race, pos);
+        {
+            let i = w.find(id).unwrap();
+            let e = &mut w.entities[i];
+            e.carried[Element::Wood] = SMELT_RATIO_IN as u64 - 1;
+        }
+
+        w.smelt(id, Element::Wood);
+
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.carried[Element::Wood], SMELT_RATIO_IN as u64 - 1, "nothing consumed below one batch");
+        assert_eq!(e.carried[Element::Fire], 0);
+    }
+
+    #[test]
+    fn make_item_then_break_item_round_trips_exactly() {
+        let mut w = World::new(6, 8);
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(5), Fx::from_int(5));
+        let id = w.spawn(race, pos);
+        {
+            let i = w.find(id).unwrap();
+            let e = &mut w.entities[i];
+            e.carried[Element::Wood] = 500;
+        }
+
+        w.make_item(id, Element::Wood, 300);
+        {
+            let e = w.entities.iter().find(|e| e.id == id).unwrap();
+            assert_eq!(e.carried[Element::Wood], 200, "spent from carried");
+            assert_eq!(e.items.len(), 1);
+            assert_eq!(e.items[0], crate::entity::Item { element: Element::Wood, quantity: 300 });
+        }
+
+        let (x, y) = w.terrain.cell_of(pos);
+        let before = w.terrain.cell(x, y)[Element::Wood];
+        w.break_item(id, 0);
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert!(e.items.is_empty(), "the item should be gone");
+        assert_eq!(
+            w.terrain.cell(x, y)[Element::Wood],
+            before + 300,
+            "breaking must return the item's full quantity to terrain at the breaker's position"
+        );
+    }
+
+    #[test]
+    fn make_item_is_a_noop_without_enough_carried_material() {
+        let mut w = World::new(7, 8);
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let id = w.spawn(race, V2::new(Fx::from_int(1), Fx::from_int(1)));
+        w.make_item(id, Element::Wood, 50); // nothing carried at all
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert!(e.items.is_empty(), "must not fabricate an item from nothing");
+    }
+
+    #[test]
+    fn break_item_out_of_range_index_is_a_noop() {
+        let mut w = World::new(8, 8);
+        let race = Race { element: Element::Metal, kind: Kind::Animal };
+        let id = w.spawn(race, V2::new(Fx::from_int(1), Fx::from_int(1)));
+        w.break_item(id, 0); // no items at all yet
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert!(e.items.is_empty());
     }
 }

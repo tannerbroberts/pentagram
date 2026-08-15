@@ -48,8 +48,12 @@ fn main() {
     // shared between a race's Plant and Animal row.
     let pop = w.population();
     for race in Race::ALL {
-        let b = attrs(race).deposit;
-        let g = w.last_deposit[race];
+        // Invariant VIII: deposit's own governor/band is retired (see
+        // `race::Conversion`'s doc comment) — this table now reports the
+        // one remaining governor, which gates the habitat draw the
+        // conversion runs on.
+        let b = attrs(race).consume;
+        let g = w.last_consume[race];
         println!(
             "{:<7}-{:<6} {:>5} {:>9} {:>9} {:>9} {:>8} {:>9}",
             race.element.name(),

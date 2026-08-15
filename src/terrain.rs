@@ -1,39 +1,53 @@
 //! S1 — the terrain field.
 //!
 //! Five `u16` saturations per cell. `phase_terrain` in `world.rs` (run right
-//! after `phase_settle`) still runs a fixed six-slot sequence every terrain
-//! tick, but only four of those slots are terrain operators now — this file
+//! after `phase_settle`) now runs a fixed five-slot sequence every terrain
+//! tick, but only three of those slots are terrain operators now — this file
 //! owns:
 //!
 //! ```text
-//!   1 deposit    2 consume    5 climate    6 diffusion
+//!   1 conversion    4 climate    5 diffusion
 //! ```
 //!
-//! Slots 3 and 4 used to be `ring` and `star`: terrain converting a permille
-//! of a cell's own stock into the next ring element, and terrain nullifying
-//! a permille of a cell's stock against its suppressor's — both ran every
-//! terrain tick with no entity involved at all, terrain acting on itself.
-//! That's gone. The ring and star *relations* still matter, but they now
-//! read terrain and act on bodies instead of the other way around —
-//! `ecology.rs`'s `apply_attrition` (ring's relation, `eaten_by()`, redirected
-//! to body hp) and `apply_suppression` (star's relation, `suppressed_by()`,
-//! redirected to body `hunger`) fill the same two slots in `phase_terrain`,
-//! gated at the same terrain-tick cadence. Terrain only changes because of
-//! what bodies do; it does not act on its own.
+//! **Invariant VIII update.** Slots 1 and 2 used to be independent `deposit`
+//! and `consume` operators, each spending its own separately governed
+//! budget — the deposit side able to write more of a race's own element than
+//! it had ever drawn from anywhere, i.e. conjuring matter. Under material
+//! conservation there is one coupled operator instead:
+//! [`apply_conversion`] reads a race's already-settled habitat draw and
+//! converts it, at the race's own fixed ratio, into its own element, split
+//! across background terrain deposit / the drawing bodies' own held
+//! material / explicit waste — see that function's own doc comment for the
+//! exact accounting. The slot count this file owns drops from four to
+//! three; `world.rs`'s `phase_terrain` doc comment carries the equivalent
+//! note for the *other* two (ecology's) slots.
+//!
+//! Slots that used to be `ring` and `star` (terrain converting a permille of
+//! a cell's own stock into the next ring element, and terrain nullifying a
+//! permille of a cell's stock against its suppressor's — both ran every
+//! terrain tick with no entity involved at all, terrain acting on itself)
+//! are gone too, predating this change. The ring and star *relations* still
+//! matter, but they now read terrain and act on bodies instead of the other
+//! way around — `ecology.rs`'s `apply_attrition` (ring's relation,
+//! `eaten_by()`, redirected to body hp) and `apply_suppression` (star's
+//! relation, `suppressed_by()`, redirected to body `hunger`) fill two slots
+//! in `phase_terrain`, gated at the same terrain-tick cadence. Terrain only
+//! changes because of what bodies do; it does not act on its own.
 //!
 //! The slot order is still a wire format exactly the way `World::step`'s
 //! phase order already is — reordering any two of these changes every
 //! recorded replay. See `docs/S1_TERRAIN_DESIGN.md` for the full design and
 //! the reasoning behind the order, the deposit/consume element mapping, and
 //! every other choice this file makes that the README's one-line S1 spec
-//! left open.
+//! left open (predates Invariant VIII; read `apply_conversion`'s doc comment
+//! for what changed since).
 //!
-//! **Deposit writes `race.element` (self); consume removes
+//! **Conversion writes `race.element` (self, the produced side) and removes
 //! `race.element.habitat()`** (same ring-backward math as `eats()`/
 //! `eats_animal()`, read here as terrain consumption rather than predation)
-//! — a Fire body's deposit is a scorch mark on the Fire layer, its
-//! consumption burns down the Wood layer under it. This is this design's
-//! interpretive call, not a README fact (see the design doc §9.2).
+//! — a Fire body's deposit is a scorch mark on the Fire layer, its draw
+//! burns down the Wood layer under it. This is this design's interpretive
+//! call, not a README fact (see the design doc §9.2).
 //!
 //! Diffusion is not per-cell — it reads neighbours — so it snapshots the
 //! *whole grid* into a scratch double-buffer before writing anything back.
@@ -49,7 +63,7 @@ use crate::entity::Entity;
 use crate::fx::V2;
 use crate::governor::Grant;
 use crate::hash::{Hashable, Hasher};
-use crate::race::{PerRace, Race};
+use crate::race::{PerRace, Race, RaceAttrs};
 use crate::rand::{rand_below, Channel};
 
 /// Element colours. The single definition — `tuning::RGB` re-exports this
@@ -205,7 +219,7 @@ impl Hashable for Terrain {
 /// both the deposit and the consume operator. Race-shaped, not
 /// element-shaped: a Wood-Plant and a Wood-Animal both write the Wood
 /// terrain layer, but each accrues its own governor demand and must be
-/// apportioned separately (see `apply_deposit`/`apply_consume` below).
+/// apportioned separately (see `apply_conversion` below).
 ///
 /// `BTreeMap` rather than a hash map — same reason `entity.rs`'s own tests
 /// reach for `BTreeSet`: Invariant IV requires a defined iteration order,
@@ -231,7 +245,7 @@ impl Occupancy {
 
     /// How many bodies of `race` currently occupy the terrain cell at
     /// `cell_index` (`Terrain::index`'s output). `phase_flora`'s `crowd_max`
-    /// gate needs this (S3.5); `apply_deposit`/`apply_consume` don't -- they
+    /// gate needs this (S3.5); `apply_conversion` doesn't -- it
     /// iterate the whole weight map by other means already.
     pub fn count(&self, race: Race, cell_index: u32) -> u32 {
         self.weight.get(race).get(&cell_index).copied().unwrap_or(0)
@@ -244,6 +258,17 @@ impl Occupancy {
 /// nothing is occupied — are broken with a stateless, per-terrain-tick
 /// rotating hash rather than a fixed cell-index order, so no single cell
 /// permanently wins every leftover unit for the life of the world.
+///
+/// Returns the amount actually applied, summed across every touched cell —
+/// **not necessarily `total`**. Every per-cell write below saturates
+/// (`saturating_add`/`saturating_sub`, Invariant II's usual discipline), so
+/// a cell that is already near `u16::MAX` (add) or already low on `target`
+/// (subtract) can silently accept less than its computed share. Invariant
+/// VIII: `apply_conversion`'s habitat drawdown is the caller that actually
+/// depends on this return value being honest — crediting a race's produced
+/// output must track what was *really* removed from its habitat, not what
+/// was merely requested, or a habitat layer running low would let that race
+/// manufacture output from stock it never actually had.
 fn apportion(
     terrain: &mut Terrain,
     target: Element,
@@ -253,9 +278,9 @@ fn apportion(
     terrain_tick: u64,
     add: bool,
     race: Race,
-) {
+) -> u64 {
     if total == 0 {
-        return;
+        return 0;
     }
     let total_weight: u64 = weight.values().map(|w| *w as u64).sum();
     let mut amounts: BTreeMap<u32, u64> = BTreeMap::new();
@@ -284,7 +309,7 @@ fn apportion(
         // cells winning the leftover remainder every single tick forever.
         let cells = (terrain.side as u64) * (terrain.side as u64);
         if cells == 0 {
-            return;
+            return 0;
         }
         let base = total / cells;
         let remainder = total % cells;
@@ -324,6 +349,7 @@ fn apportion(
         }
     }
 
+    let mut applied: u64 = 0;
     for (cell, amt) in amounts {
         let (x, y) = terrain.xy_of(cell);
         let v = amt.min(u16::MAX as u64) as u16;
@@ -331,65 +357,140 @@ fn apportion(
             continue;
         }
         let c = terrain.cell_mut(x, y);
-        if add {
-            c[target] = c[target].saturating_add(v);
-        } else {
-            c[target] = c[target].saturating_sub(v);
-        }
+        let before = c[target];
+        c[target] = if add { before.saturating_add(v) } else { before.saturating_sub(v) };
+        applied += c[target].abs_diff(before) as u64;
     }
+    applied
 }
 
-/// Operator 1. Each race's already-settled `last_deposit[r].granted` becomes
-/// per-cell increments to its own element (`r.element`), at the cells that
-/// race's living bodies currently occupy. Terrain itself stays 5-wide — a
-/// Wood-Plant and a Wood-Animal both write the Wood layer, apportioned
-/// independently (see `apportion`'s race-unique salt).
-pub fn apply_deposit(
+/// Operator 1 (Invariant VIII). Each race's already-settled
+/// `last_consume[r].granted` — the governed draw of `r.element.habitat()` —
+/// resolves through `r`'s [`crate::race::Conversion`] into units of
+/// `r.element` itself, apportioned across the same cells that race's living
+/// bodies currently occupy (same race-unique salt discipline `apportion`
+/// itself documents).
+///
+/// # The arithmetic, exactly
+///
+/// Let `N = last_consume[r].granted` (habitat units), `conv = races[r].conversion`.
+///
+/// - `batches = N / conv.ratio_in` (integer floor) — any remainder
+///   (`N % ratio_in`) does not fill a whole batch and is simply never drawn
+///   from terrain in the first place.
+/// - `produced = batches * conv.ratio_out` — units of `r.element` the
+///   governed demand *asks* the conversion to create.
+/// - Net habitat removed from terrain is `produced`, **not** `N` or
+///   `batches * ratio_in`: of every batch's `ratio_in` habitat units, only
+///   `ratio_out` ever leave net — the remaining `ratio_in - ratio_out` per
+///   batch are tailings that return to the very same habitat layer, at the
+///   very same cells, in the very same tick (Conversion's own doc comment
+///   explains why `ratio_out <= ratio_in` always). Writing that as "subtract
+///   `batches * ratio_in`, then add back `batches * (ratio_in - ratio_out)`"
+///   would apportion across cells identically in total but through two
+///   separate largest-remainder roundings; folding it into the single net
+///   subtraction below is simpler and reaches the same conserved total, so
+///   that is what this function does.
+/// - **What actually leaves the habitat layer can be less than `produced`.**
+///   `apportion` saturates per cell (Invariant II) and returns the amount it
+///   actually managed to remove, which is capped by whatever `r`'s occupied
+///   cells actually hold — a governed grant is a demand ceiling, not a
+///   promise that the physical stock is there to back it (the same
+///   "can't spend what isn't in the bucket" principle `World::mine` already
+///   applies to a single cell, here applied to a race's whole apportioned
+///   territory). This actual amount, not the requested `produced`, is what
+///   the rest of this function calls `produced` and splits three ways below
+///   — crediting the full governed request regardless of physical
+///   availability would manufacture `r.element` out of habitat the race
+///   never actually had, which is exactly the create-from-nothing failure
+///   Invariant VIII exists to close off.
+/// - `produced` (now the actual, stock-backed amount) then splits three ways
+///   per `conv`'s permille shares, remainder-corrected so the three parts
+///   sum to exactly `produced` (same drift-correction discipline
+///   `ChannelMix::set_rebalanced` uses): `deposit_amt`, `body_amt`,
+///   `waste_amt`.
+/// - `deposit_amt + waste_amt` (both `r.element`) apply to terrain via
+///   `apportion` — two different bookkeeping reasons landing on the same
+///   layer, at the same cells.
+/// - `body_amt` cannot be applied here: `terrain.rs` does not own `Entity`
+///   state. It comes back out through this function's `PerRace<u64>`
+///   return value for `World` to credit onto each living body's own
+///   `Entity.material` (see `World::phase_terrain`/`credit_body_material`).
+///   **Exception:** if `r` currently has zero living bodies (occupancy is
+///   empty — e.g. its last body died earlier this same tick, still
+///   charging an `OnDeath` draw), there is nothing to credit; that share is
+///   folded into the terrain deposit instead, via the same
+///   extinct-race uniform-fallback `apportion` already provides, so it is
+///   never simply lost.
+pub fn apply_conversion(
     terrain: &mut Terrain,
     occ: &Occupancy,
-    last_deposit: &PerRace<Grant>,
-    seed: u64,
-    terrain_tick: u64,
-) {
-    for r in Race::ALL {
-        apportion(
-            terrain,
-            r.element,
-            last_deposit[r].granted,
-            &occ.weight[r],
-            seed,
-            terrain_tick,
-            true,
-            r,
-        );
-    }
-}
-
-/// Operator 2. Each race's `last_consume[r].granted` becomes per-cell
-/// decrements to `r.element.habitat()` — the same ring-backward math as
-/// `eats()`/`eats_animal()`, but read here as terrain consumption/habitat
-/// drawdown rather than predation — at the same cells operator 1 used (a
-/// Fire body's consumption burns down the Wood layer under it, not the Fire
-/// layer).
-pub fn apply_consume(
-    terrain: &mut Terrain,
-    occ: &Occupancy,
+    races: &PerRace<RaceAttrs>,
     last_consume: &PerRace<Grant>,
     seed: u64,
     terrain_tick: u64,
-) {
+) -> PerRace<u64> {
+    let mut body_share: PerRace<u64> = PerRace::filled(0);
     for r in Race::ALL {
-        apportion(
-            terrain,
-            r.element.habitat(),
-            last_consume[r].granted,
-            &occ.weight[r],
-            seed,
-            terrain_tick,
-            false,
-            r,
-        );
+        let n = last_consume[r].granted;
+        let conv = races[r].conversion;
+        if n == 0 || conv.ratio_in == 0 {
+            continue;
+        }
+        let batches = n / conv.ratio_in as u64;
+        if batches == 0 {
+            continue;
+        }
+        let requested = batches * conv.ratio_out as u64;
+
+        // Net habitat drawdown -- see the doc comment above for why this is
+        // `requested`, not `n` or `batches * ratio_in`. `produced` is
+        // whatever `apportion` actually managed to remove -- capped by the
+        // real stock at this race's occupied cells, never the requested
+        // amount unconditionally (see the doc comment's note on why this
+        // matters for conservation).
+        let produced = apportion(terrain, r.element.habitat(), requested, &occ.weight[r], seed, terrain_tick, false, r);
+        if produced == 0 {
+            continue;
+        }
+
+        let deposit_amt = produced * conv.deposit_share as u64 / 1000;
+        let body_amt = produced * conv.body_share as u64 / 1000;
+        // Remainder, not a third independent multiply -- guarantees the
+        // three shares sum to exactly `produced` regardless of permille
+        // rounding, same discipline `ChannelMix::set_rebalanced` uses.
+        let waste_amt = produced - deposit_amt - body_amt;
+
+        let alive: u32 = occ.weight[r].values().sum();
+        if alive == 0 {
+            // No living body of this race exists right now to grow -- fold
+            // its share into the terrain deposit rather than lose it.
+            apportion(terrain, r.element, deposit_amt + waste_amt + body_amt, &occ.weight[r], seed, terrain_tick, true, r);
+        } else {
+            apportion(terrain, r.element, deposit_amt + waste_amt, &occ.weight[r], seed, terrain_tick, true, r);
+            *body_share.get_mut(r) = body_amt;
+        }
     }
+    body_share
+}
+
+/// A direct, single-cell material return — unlike [`apportion`], which
+/// spreads a race's aggregate grant across every cell its living bodies
+/// occupy, this writes to exactly the one cell a specific body's material
+/// actually returns to. Used by `World::charge_death`: a corpse decomposes
+/// where it fell, not smeared across a race's entire territory. Saturates
+/// like every other terrain write (Invariant II).
+pub fn deposit_at(terrain: &mut Terrain, e: Element, amount: u64, pos: V2) {
+    if amount == 0 {
+        return;
+    }
+    let (x, y) = terrain.cell_of(pos);
+    let v = amount.min(u16::MAX as u64) as u16;
+    if v == 0 {
+        return;
+    }
+    let c = terrain.cell_mut(x, y);
+    c[e] = c[e].saturating_add(v);
 }
 
 /// Operator 6 — bounded diffusion, Invariant I's literal home. Gradient
@@ -676,46 +777,115 @@ mod tests {
     }
 
     #[test]
-    fn apply_deposit_writes_the_races_own_element_at_occupied_cells() {
+    fn apply_conversion_draws_habitat_and_splits_produced_material_into_deposit_body_and_waste() {
+        // Wood-Plant: ratio_in=1, ratio_out=1 (a lossless conversion — see
+        // `RACES`'s own doc comment for why this row is clamped there), split
+        // 650/300/50 deposit/body/waste. habitat() = Wood.eats() = Water, so
+        // this body draws down Water and deposits/wastes onto Wood.
+        let race = Race { element: Element::Wood, kind: Kind::Plant };
         let mut t = Terrain::new(4);
+        t.cell_mut(1, 1)[Element::Water] = 10_000;
         let entities = vec![Entity::spawn(
             1,
-            Element::Fire,
+            Element::Wood,
             V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
             0,
             0,
-            crate::race::attrs(animal(Element::Fire)),
+            crate::race::attrs(race),
         )];
         let occ = Occupancy::build(&entities, &t);
         let mut granted = PerRace::filled(grant(0));
-        granted[animal(Element::Fire)] = grant(100);
-        apply_deposit(&mut t, &occ, &granted, 1, 1);
-        assert_eq!(t.total(Element::Fire), 100);
+        granted[race] = grant(100);
+
+        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
+
+        assert_eq!(
+            t.cell(1, 1)[Element::Water],
+            10_000 - 100,
+            "habitat drawdown is the produced amount, 100 at this 1:1 ratio"
+        );
+        assert_eq!(t.total(Element::Wood), 65 + 5, "deposit_share (650‰) + waste_share (50‰) of the 100 produced");
+        assert_eq!(*body_share.get(race), 30, "body_share (300‰) of the 100 produced, returned for World to credit");
         for e in Element::ALL {
-            if e != Element::Fire {
+            if e != Element::Water && e != Element::Wood {
                 assert_eq!(t.total(e), 0);
             }
         }
     }
 
     #[test]
-    fn apply_consume_removes_from_the_eaten_element() {
+    fn apply_conversion_folds_an_extinct_races_body_share_into_terrain_deposit() {
+        // No living body of this race exists this tick (occupancy is empty)
+        // -- the whole produced amount, body_share included, must land on
+        // terrain rather than vanish. See `apply_conversion`'s own doc
+        // comment for why.
+        //
+        // Habitat stock is seeded across *every* cell, not just one --
+        // extinct-race apportionment spreads uniformly across the whole
+        // grid (`apportion`'s own fallback), and since Invariant VIII's
+        // production cap (`apply_conversion_caps_production_at_the_actual_
+        // available_habitat_stock`) now honours actual per-cell stock, a
+        // single seeded cell would starve every other cell's share of the
+        // draw and this test would be proving the cap, not the fold.
+        let race = Race { element: Element::Wood, kind: Kind::Plant };
         let mut t = Terrain::new(4);
-        t.cell_mut(1, 1)[Element::Wood] = 1000;
+        for y in 0..4 {
+            for x in 0..4 {
+                t.cell_mut(x, y)[Element::Water] = 1000;
+            }
+        }
+        let occ = Occupancy::build(&[], &t);
+        let mut granted = PerRace::filled(grant(0));
+        granted[race] = grant(100);
+
+        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
+
+        assert_eq!(*body_share.get(race), 0, "nothing alive to credit");
+        assert_eq!(t.total(Element::Wood), 100, "the whole produced amount folds into terrain deposit instead of being lost");
+    }
+
+    #[test]
+    fn apply_conversion_caps_production_at_the_actual_available_habitat_stock() {
+        // Regression: `apportion`'s per-cell subtraction saturates
+        // (Invariant II) and used to silently clip below what a race's
+        // governed grant requested, while the produced side was credited in
+        // full regardless of whether the habitat drawdown actually
+        // succeeded -- manufacturing `r.element` out of habitat the race
+        // never actually had. Granted draw (100) exceeds the occupied
+        // cell's actual Water stock (40); production must be capped to what
+        // was actually removed (40), not the requested 100.
+        let race = Race { element: Element::Wood, kind: Kind::Plant };
+        let mut t = Terrain::new(4);
+        t.cell_mut(1, 1)[Element::Water] = 40; // less than the granted draw below
         let entities = vec![Entity::spawn(
             1,
-            Element::Fire,
+            Element::Wood,
             V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
             0,
             0,
-            crate::race::attrs(animal(Element::Fire)),
+            crate::race::attrs(race),
         )];
         let occ = Occupancy::build(&entities, &t);
         let mut granted = PerRace::filled(grant(0));
-        granted[animal(Element::Fire)] = grant(100);
-        apply_consume(&mut t, &occ, &granted, 1, 1);
-        assert_eq!(t.cell(1, 1)[Element::Wood], 900, "Fire eats Wood");
-        assert_eq!(t.cell(1, 1)[Element::Fire], 0, "consume must not touch Fire's own layer");
+        granted[race] = grant(100);
+
+        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
+
+        assert_eq!(t.cell(1, 1)[Element::Water], 0, "the cell's whole stock, and no more, is drawn down");
+        assert_eq!(
+            t.total(Element::Wood),
+            26 + 2,
+            "deposit_share (650‰) + waste_share (50‰) of the capped 40 actually produced, not the requested 100"
+        );
+        assert_eq!(*body_share.get(race), 12, "body_share (300‰) of the capped 40, not the requested 100");
+        // Conservation, directly: every unit that left the Water layer is
+        // traceable to the Wood layer (deposit + waste) or the returned
+        // body_share -- nothing more, regardless of what was requested.
+        assert_eq!(
+            40 - t.total(Element::Water),
+            t.total(Element::Wood) + *body_share.get(race),
+            "habitat lost must equal element produced across terrain deposit+waste and body_share"
+        );
     }
 
     #[test]

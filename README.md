@@ -15,7 +15,7 @@ chaos watch            same, rebuilding whenever src/ changes
 chaos edit             open the tuning table in $EDITOR
 chaos verify           the determinism exit condition
 chaos soak [ticks]     long headless run + per-race report
-chaos test             full suite (185 tests, 3 gated behind --ignored)
+chaos test             full suite (205 tests, 3 gated behind --ignored)
 ```
 
 `chaos` lives in `~/.local/bin`; set `CHAOS_ROOT` to point it at a different
@@ -61,11 +61,13 @@ Fire      53   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇  │╵▓▓▓
   - *rate-limited* — `clipped > 0`. Demand was refused; the race is pushing a
     rate limit. At soak populations this is the normal state, and the amount
     refused is the interesting number.
-  - *idle — floor is doing the work* — `forced > 0`. Demand fell short of the
-    floor, so the world emitted the floor anyway.
-  - *extinct — still churning at its floor* — nobody of this race is alive here
-    and the terrain still turns over, which is what stops a lost biome becoming
-    an absorbing state.
+  - *extinct or idle* — `granted == 0`. Nobody of this race drew anything this
+    tick — absent, or simply undemanding. Under Invariant VIII (see the
+    material-conservation update note near the end of this document) this
+    means the terrain has genuinely stopped changing from that race's own
+    activity, not that a floor is quietly emitting on its behalf — the old
+    *"idle — floor is doing the work"* state is gone along with the floor
+    guarantee that produced it.
   - *inside its band* — demand was met in full out of banked burst budget.
 
 **The pressure line** under the knob grid is the §3.1 parity metric,
@@ -114,6 +116,7 @@ input commands — the same path a player's input takes.
 | V | Inputs replicate; state does not | `input.rs` |
 | VI | Every tick is reproducible | `replay.rs` |
 | VII | Bounded churn — rates are floored and capped | `governor.rs` |
+| VIII | Material is conserved — every unit of terrain/body/item material traces to an explicit transfer or ring-ordered conversion, never created or destroyed | `race.rs` (`Conversion`), `terrain.rs` (`apply_conversion`), `entity.rs` (`material`/`carried`/`items`), `world.rs` (mining/smelting/item commands) |
 
 Invariant I has no home yet because there is no field to diffuse. It arrives
 with the terrain grid at S1, and the band-width arithmetic that depends on it
@@ -156,26 +159,44 @@ Earth   2016000 ticks  (14d)    2529   existence    — terraforms by staying
 Lifespans span 2520×. Terraforming pressure spans 1.04×. That is the tempo axis
 working: wildly different rhythms, near-identical total effect on the map.
 
+> **Invariant VIII update:** `deposit_unit` is retired (see the
+> material-conservation update note near the end of this document) — the
+> table above is pre-conservation and no longer reflects what ships.
+> `terraform_pressure()` now reads `consume_unit` run through the race's own
+> `Conversion` ratio instead. Wood/Earth/Metal's old `deposit_unit` exceeded
+> `consume_unit`, which is now structurally impossible, so those three are
+> clamped to a lossless conversion and their pressure necessarily dropped
+> (Wood 2533→1466, Earth 2529→1190, Metal 2527→1332); Fire and Water's old
+> ratio was already lossy and the new `Conversion.ratio_out/ratio_in` was
+> chosen to reproduce it almost exactly (Fire 2625→2622, Water 2542→2544).
+> The ten-row spread widened from 2x to about 2.2x as a direct, documented
+> consequence — see `race::tests::terraform_pressure_is_within_parity_band`.
+
 ### The governor
 
-Every race's deposition and consumption passes through a rate band, per terrain
-tick, per territory. It guarantees three things regardless of player behaviour:
+Every race's coupled deposit/consume conversion (see the material-conservation
+update note near the end of this document) passes through one rate band, per
+terrain tick, per territory. It guarantees two things regardless of player
+behaviour:
 
-- **Never below the floor** — emitted even at zero demand, even if the race is
-  extinct here. An emptied server keeps turning over, which is what stops a lost
-  biome from becoming an absorbing state.
 - **Never above the ceiling** — no amount of coordination or exploitation moves
   more terrain in one tick than this.
 - **Long-run average converges to nominal** — bursting spends a bucket that only
   refills at nominal, so maximum effort and minimum effort differ in *timing*,
   not in total.
 
-Together these bound the terrain state at `T + k` before any player has decided
-anything, which is what forecastable terrain actually requires.
+Together these bound the terrain state at `T + k` from *above* before any
+player has decided anything. A third guarantee used to bound it from below too
+— **never below the floor**, emitted even at zero demand, even if the race was
+extinct here, so an emptied server kept turning over rather than freezing into
+an absorbing state — but material conservation has nothing to conjure that
+floor's material from, so it is retired; see the update note for the full
+account of what replaced it.
 
-`Grant` reports `granted`, `forced` (emitted only to honour the floor — the race
-is idle or absent) and `clipped` (demand refused — somebody is pushing a rate
-limit). All three drive the gauge and the state column in the live view.
+`Grant` reports `granted`, `forced` (kept for shape/hash continuity but
+structurally always `0` now that nothing is ever forced into existence to
+honour a floor) and `clipped` (demand refused — somebody is pushing a rate
+limit). All three still drive the gauge and the state column in the live view.
 
 ## Known and deliberate
 
@@ -489,6 +510,107 @@ there is really only one.
 > literally made of more of its own element locally can grow bigger, self-
 > reinforcing since Plants are existence-dominant depositors of that
 > element.
+
+> **Post-S3 update: Invariant VIII, material conservation.** The economy's
+> two independent flows — `deposit_unit`/`deposit`/`deposit_mix` writing a
+> race's own element to terrain, `consume_unit`/`consume`/`consume_mix`
+> drawing its habitat element down, with no mass-balance relationship
+> between them, and terrain's `apply_consume` decrementing a layer with
+> nothing on the receiving end — are replaced by one coupled conversion
+> (`race::Conversion`, `terrain::apply_conversion`): a race's governed
+> habitat draw resolves at a fixed per-race ratio (`ratio_out <= ratio_in`
+> always — a conversion can never manufacture mass) into units of its own
+> element, split three ways — background terrain deposit, the drawing
+> body's own held material (`Entity.material`, growth/reserves), and an
+> explicit waste byproduct — remainder-corrected so the three sum to
+> exactly what was produced, nothing conjured, nothing discarded.
+> `deposit_unit`/`deposit`/`deposit_mix` are gone from `RaceAttrs` entirely.
+> Several shipped races' old `deposit_unit` exceeded their `consume_unit`
+> (Wood, Earth, Metal), which conservation makes structurally impossible —
+> those three are clamped to a lossless 1:1 conversion instead, and their
+> terraform pressure necessarily dropped (see the rate-model update note
+> above); there is no conservative way to avoid that.
+>
+> The **create-from-nothing floor guarantee is retired on purpose**
+> (`governor.rs`'s module doc carries the full account). `Governor::settle`
+> used to emit a minimum grant even at zero demand, even from an extinct
+> race, specifically so a lost biome's terrain could never freeze into a
+> permanently absorbing state. Conservation has nothing to conjure that
+> floor's material from, so it is gone — an extinct race's own terrain
+> genuinely stops changing from that race's own activity now (other races'
+> conversions can still move it, since every layer stays readable/writable
+> by every race's own ring relations — "frozen" means "no longer moved by a
+> race that no longer exists," not frozen for the whole grid). `RateBand.
+> floor` survives, repurposed as a *reserve* — the slice of a race's own
+> banked bucket one tick may never spend below — rather than a source of
+> free material. `Grant.forced` is kept as a field for hash/shape
+> continuity but is now structurally always `0`. See the governor update
+> note above and "Reading the live view" for what this changed on screen.
+>
+> **Body-held material** (`Entity.material: u64`) is new: how much of its
+> own element a living body currently holds, grown by its own share of the
+> conversion above and, for Animals, by predation — "you are what you eat":
+> killing prey transfers the prey's entire current `material` to the
+> predator's, in full, replacing the old flat `feed_gain` as the source of
+> what a meal is materially worth (`feed_gain`/`hp`/`hunger`/`satiation`
+> stay exactly as they were — the separate vitality system, untouched, not
+> claimed to be material). A dying body's `material` returns to terrain at
+> its exact death position (`World::charge_death`), replacing the old
+> abstract `OnDeath` deposit-demand charge — the corpse's actual mass *is*
+> the death deposit now, not a separate abstract accounting share.
+>
+> **Items and inventory**, new on top of the law above: `Entity.carried`
+> (loose stock of other elements) and `Entity.items` (portable
+> single-element bundles, `entity::Item`), driven by four new input
+> commands (`CmdKind::Mine`/`Smelt`/`MakeItem`/`BreakItem`; the input log
+> version bumped to 3, but old v1/v2 logs still replay bit-identically —
+> the bump exists only so a reader handed a log using the new tags fails
+> fast rather than mid-stream). `Mine` (`World::mine`) is a pure 1:1
+> terrain→carried transfer, `Kind::Animal` only, capped by a new per-race
+> `mining_rate` that is structurally `0` for every `Kind::Plant` row
+> (rooted bodies never mine). `Smelt` (`World::smelt`) converts whole
+> `SMELT_RATIO_IN`(50)-unit batches of carried element `X` into
+> `SMELT_RATIO_OUT`(1) units of carried `X.generates()`, with the
+> 49-per-batch difference returned to terrain at the smelting body's
+> position as tailings — one fixed ratio for every race and element, unlike
+> the per-race `Conversion` above. `MakeItem`/`BreakItem` bundle and
+> unbundle `carried`↔`Item`; breaking one returns its full quantity to
+> terrain at the breaking body's position. Deferred, not built this pass:
+> trading/exchange between races and any enmity-gated permission layer for
+> it, multi-element composite items or alloys, and artifact durability as a
+> depleting-use-count stat — an `Item` is a pure material-quantity
+> container, nothing more.
+>
+> One real bug found and fixed while proving this end-to-end
+> (`tests/conservation.rs`, below): `apportion`'s per-cell subtraction
+> saturates (Invariant II) and used to silently clip below what a race's
+> governed grant requested whenever its occupied cells' actual habitat
+> stock ran low — commonly true early in a fresh run, before a habitat
+> layer has any stock at all — while `apply_conversion` credited the
+> race's own element in full regardless, manufacturing mass out of habitat
+> the race never actually had. `apportion` now returns the amount it
+> actually applied, and `apply_conversion` credits exactly that amount, not
+> the requested one
+> (`terrain::tests::apply_conversion_caps_production_at_the_actual_available_habitat_stock`
+> pins this down). A narrower residual edge is not solved here, flagged
+> rather than silently left: `apportion`'s proportional split is blind to
+> *which* specific occupied cell holds the stock, so a race whose demand is
+> aggregately payable but skewed toward a cell that individually can't
+> cover its own share can still see a small under-delivery relative to what
+> a fully cell-aware allocation would have paid out — a graceful
+> under-delivery, not a conservation violation, and out of this pass's
+> scope.
+>
+> Invariant VIII's home in code: `race::Conversion`, `terrain::
+> apply_conversion`, `entity::Entity`'s `material`/`carried`/`items`
+> fields, and `world.rs`'s mining/smelting/item commands (see the
+> invariants table above). `tests/conservation.rs` proves it end-to-end: a
+> real run with growth, death, mining, smelting, and item bundling, then
+> asserts the total material per element (terrain + every living body's
+> `material`/`carried` + every item's `quantity`) balances exactly against
+> every ring-conversion that actually fired that run — not a raw
+> before/after equality, which would trivially fail the moment any
+> conversion happens.
 
 ## Next
 

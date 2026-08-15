@@ -21,7 +21,18 @@ pub const MAGIC: u32 = 0x5047_494C; // "PGIL"
 /// *readable*, not hash-reproducing: replaying a v1 log against an S3 world
 /// will not reproduce its originally recorded hashes, because the
 /// simulation itself changed.
-pub const VERSION: u32 = 2;
+///
+/// v3 (Invariant VIII / items-inventory) adds four new `CmdKind` variants —
+/// `Mine`, `Smelt`, `MakeItem`, `BreakItem` — for the mining/smelting/item
+/// layer. Unlike the v1→v2 change, this does **not** touch the byte layout of
+/// any existing tag (0/`SetHeading`, 1/`Spawn`, 2/`Kill` are all unchanged),
+/// so a v1 or v2 log is not just readable but fully hash-reproducing under
+/// v3 code too — there is nothing in an old log to reinterpret, since none of
+/// the new tags could ever appear in one. The version is still bumped rather
+/// than silently widening `VERSION`'s own meaning, so an *old* reader handed
+/// a *new* log (one that actually uses tags 3-6) fails fast with a clean
+/// `BadVersion` at the header instead of a confusing mid-stream `BadTag`.
+pub const VERSION: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmdKind {
@@ -29,6 +40,28 @@ pub enum CmdKind {
     SetHeading { dir: V2 },
     Spawn { element: Element, kind: Kind, at: V2 },
     Kill,
+    /// Invariant VIII / items: an `Animal` (never a `Plant` — rooted bodies
+    /// don't mine) draws up to `RaceAttrs::mining_rate` units of `element`
+    /// out of the terrain cell it currently occupies, into its own
+    /// `Entity.carried` — a pure 1:1 transfer, capped by whatever the cell
+    /// actually holds (never more). See `World::mine`.
+    Mine { element: Element },
+    /// Invariant VIII / items: an `Animal` converts whole batches of its own
+    /// carried `element` into carried `element.generates()`, at the fixed
+    /// ratio `World::SMELT_RATIO_IN`:`World::SMELT_RATIO_OUT` (50:1, the
+    /// project's own worked example) — the difference (tailings) returns to
+    /// terrain at the smelting body's position, as `element`, fully
+    /// accounted. See `World::smelt`.
+    Smelt { element: Element },
+    /// Invariant VIII / items: bundle `quantity` units of carried `element`
+    /// (which must be at least that much, else this is a no-op) into a new
+    /// `Item` pushed onto `Entity.items`. See `World::make_item`.
+    MakeItem { element: Element, quantity: u64 },
+    /// Invariant VIII / items: destroy the item at `index` in `Entity.items`
+    /// (a no-op if out of range), returning its full quantity to terrain at
+    /// the breaking body's position, as the item's own element. See
+    /// `World::break_item`.
+    BreakItem { index: u32 },
 }
 
 impl CmdKind {
@@ -38,6 +71,10 @@ impl CmdKind {
             CmdKind::SetHeading { .. } => 0,
             CmdKind::Spawn { .. } => 1,
             CmdKind::Kill => 2,
+            CmdKind::Mine { .. } => 3,
+            CmdKind::Smelt { .. } => 4,
+            CmdKind::MakeItem { .. } => 5,
+            CmdKind::BreakItem { .. } => 6,
         }
     }
 }
@@ -133,6 +170,19 @@ impl InputLog {
                     out.extend_from_slice(&at.y.raw().to_le_bytes());
                 }
                 CmdKind::Kill => {}
+                CmdKind::Mine { element } => {
+                    out.push(element as u8);
+                }
+                CmdKind::Smelt { element } => {
+                    out.push(element as u8);
+                }
+                CmdKind::MakeItem { element, quantity } => {
+                    out.push(element as u8);
+                    out.extend_from_slice(&quantity.to_le_bytes());
+                }
+                CmdKind::BreakItem { index } => {
+                    out.extend_from_slice(&index.to_le_bytes());
+                }
             }
         }
         out
@@ -146,8 +196,10 @@ impl InputLog {
         let v = r.u32()?;
         // v1 predates the `Kind` byte on `Spawn` — still readable, decoded
         // as `Kind::Animal` below, but not hash-reproducing against an S3
-        // world (see `VERSION`'s own doc comment).
-        if v != VERSION && v != 1 {
+        // world (see `VERSION`'s own doc comment). v2 and v3 (current) share
+        // an identical byte layout for every tag that existed in v2, so both
+        // are fully readable *and* hash-reproducing.
+        if v != VERSION && v != 1 && v != 2 {
             return Err(LogError::BadVersion(v));
         }
         let n = r.u64()? as usize;
@@ -160,10 +212,7 @@ impl InputLog {
                     dir: V2::new(Fx::from_raw(r.i32()?), Fx::from_raw(r.i32()?)),
                 },
                 1 => {
-                    let e = r.u8()?;
-                    if e as usize >= Element::COUNT {
-                        return Err(LogError::BadElement(e));
-                    }
+                    let element = r.element()?;
                     let kind = if v == 1 {
                         Kind::Animal
                     } else {
@@ -174,12 +223,16 @@ impl InputLog {
                         }
                     };
                     CmdKind::Spawn {
-                        element: Element::from_index(e as usize),
+                        element,
                         kind,
                         at: V2::new(Fx::from_raw(r.i32()?), Fx::from_raw(r.i32()?)),
                     }
                 }
                 2 => CmdKind::Kill,
+                3 => CmdKind::Mine { element: r.element()? },
+                4 => CmdKind::Smelt { element: r.element()? },
+                5 => CmdKind::MakeItem { element: r.element()?, quantity: r.u64()? },
+                6 => CmdKind::BreakItem { index: r.u32()? },
                 t => return Err(LogError::BadTag(t)),
             };
             cmds.push(Command { tick, entity, kind: cmd_kind });
@@ -225,6 +278,15 @@ impl Reader<'_> {
     }
     fn u64(&mut self) -> Result<u64, LogError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    /// Shared by `Spawn`/`Mine`/`Smelt`/`MakeItem` — every `CmdKind` that
+    /// carries an `Element` byte decodes it the same validated way.
+    fn element(&mut self) -> Result<Element, LogError> {
+        let e = self.u8()?;
+        if e as usize >= Element::COUNT {
+            return Err(LogError::BadElement(e));
+        }
+        Ok(Element::from_index(e as usize))
     }
 }
 
@@ -340,6 +402,42 @@ mod tests {
                 at: V2::new(Fx::from_int(4), Fx::from_int(5)),
             }
         );
+    }
+
+    /// S3.9 / Invariant VIII: the four new `CmdKind` variants round-trip
+    /// through bytes the same way every existing one does — a separate log
+    /// from `sample()` above so this doesn't disturb that function's own
+    /// pinned tick/entity-count assertions.
+    #[test]
+    fn new_cmdkinds_round_trip() {
+        let mut l = InputLog::new();
+        l.push(Command { tick: 1, entity: 1, kind: CmdKind::Mine { element: Element::Wood } });
+        l.push(Command { tick: 2, entity: 1, kind: CmdKind::Smelt { element: Element::Fire } });
+        l.push(Command {
+            tick: 3,
+            entity: 1,
+            kind: CmdKind::MakeItem { element: Element::Earth, quantity: 12_345 },
+        });
+        l.push(Command { tick: 4, entity: 1, kind: CmdKind::BreakItem { index: 2 } });
+        l.finalize();
+        let back = InputLog::from_bytes(&l.to_bytes()).expect("round trip");
+        assert_eq!(back.as_slice(), l.as_slice());
+    }
+
+    #[test]
+    fn a_v2_log_is_still_readable_under_v3() {
+        // v2 predates Mine/Smelt/MakeItem/BreakItem, but none of the tags a
+        // v2 log could ever contain (0/1/2) changed byte layout going to v3
+        // — a hand-built v2 header over an ordinary Kill command must still
+        // decode cleanly.
+        let mut bytes = MAGIC.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // v2
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one command
+        bytes.extend_from_slice(&9u64.to_le_bytes()); // tick
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // entity
+        bytes.push(CmdKind::Kill.tag());
+        let log = InputLog::from_bytes(&bytes).expect("v2 log must still be readable under v3");
+        assert_eq!(log.as_slice()[0].kind, CmdKind::Kill);
     }
 
     #[test]
