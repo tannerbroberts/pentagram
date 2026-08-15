@@ -850,6 +850,12 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         // Old deposit_unit (7 650 000) exceeded consume_unit (3 600 000) —
         // clamped to lossless. Old deposit_mix was overwhelmingly
         // existence-dominant (800‰): background share stays highest.
+        // Deliberately kept lossless (`ratio_in == ratio_out`) rather than
+        // just left that way by the Invariant VIII migration: Evergreen is
+        // meant to replenish Earth from Fire as efficiently as this system
+        // allows -- 1:1 is the ceiling, not a placeholder. See Metal-Plant's
+        // own comment below for the paired, deliberately inefficient half of
+        // this design (keeping Earth the persistent bottleneck resource).
         conversion: Conversion::new(1, 1, 750, 200, 50),
         mining_rate: 0, // rooted — Plants never mine
         fantasy: "Older than the animal that shares its name — patience that outlasts even Earth's own long-lived fauna, terraforming by simply persisting the longest.",
@@ -883,9 +889,18 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         consume_unit: 144_000,
         consume: RateBand::new(200, 950, 2400, 12),
         consume_mix: ChannelMix::new(60, 60, 100, 180, 600),
-        // Old deposit_unit (273 000) exceeded consume_unit (144 000) —
-        // clamped to lossless.
-        conversion: Conversion::new(1, 1, 550, 350, 100),
+        // Deliberately inefficient (`ratio_in` >> `ratio_out`), not the
+        // Invariant-VIII-migration lossless default every other row still
+        // ships with: Earth is meant to stay the persistent bottleneck
+        // resource for the whole life of a run, not get consumed away once
+        // Metal's habitat draw catches up. `apply_conversion`'s own doc
+        // comment: net habitat actually removed from terrain is `produced =
+        // floor(N/ratio_in) * ratio_out`, not the granted demand `N` itself
+        // -- so this throttles net Earth drawdown by roughly 50x relative to
+        // a lossless conversion at the same granted demand, not merely
+        // Metal's output. Paired with Earth-Plant's deliberately lossless
+        // Fire-to-Earth conversion above.
+        conversion: Conversion::new(50, 1, 550, 350, 100),
         mining_rate: 0, // rooted — Plants never mine
         fantasy: "An ore-vein growth, embedded and slow — it forges nothing, it just sits in the seam and the seam changes around it.",
     },
@@ -899,12 +914,15 @@ pub const RACES: PerRace<RaceAttrs> = PerRace([
         consume_unit: 48_000,
         consume: RateBand::new(200, 950, 2400, 12),
         consume_mix: ChannelMix::new(100, 50, 250, 600, 0),
-        // Old deposit_unit (91 000) exceeded consume_unit (48 000) —
-        // clamped to lossless. Old deposit_mix was refining-only, zero
-        // existence share ("writes to the world only at the moment of
-        // forging"); that flavour now lives in a high waste_share — forging
-        // sheds scrap — rather than a channel-timing knob.
-        conversion: Conversion::new(1, 1, 400, 350, 250),
+        // Old deposit_mix was refining-only, zero existence share ("writes
+        // to the world only at the moment of forging"); that flavour now
+        // lives in a high waste_share — forging sheds scrap — rather than a
+        // channel-timing knob. Same deliberate inefficiency as Metal-Plant
+        // just above, same reason: Armored Dwarf shares Forge's exact Earth
+        // habitat, so leaving this row at the old lossless default would
+        // let Dwarves alone drain Earth at full speed and undermine the
+        // whole point of throttling Forge.
+        conversion: Conversion::new(50, 1, 400, 350, 250),
         mining_rate: 40, // first-guess, uniform across every Animal row
         fantasy: "Precise and scheduled. Writes to the world only at the moment of forging.",
     },
@@ -1098,15 +1116,28 @@ mod tests {
         // race's own conversion ratio, not an independent `deposit_unit` —
         // see `RaceAttrs::terraform_pressure`'s own doc comment), and the
         // `ratio_out <= ratio_in` clamp (`Conversion`'s doc comment) forces
-        // Wood/Earth/Metal down to a lossless 1:1 conversion while Fire/
-        // Water keep their old, already-lossy ratio almost exactly — so the
-        // ten rows no longer cluster inside the old 2x band on their own.
-        // Widened to 2.5x, comfortably covering the ~2.2x spread the shipped
-        // table actually produces (see
+        // Wood/Earth down to a lossless 1:1 conversion while Fire/Water keep
+        // their old, already-lossy ratio almost exactly — so the remaining
+        // eight rows no longer cluster inside the old 2x band on their own.
+        // Widened to 2.5x, comfortably covering the spread the shipped table
+        // actually produces among them (see
         // `combined_per_element_pressure_reflects_the_invariant_viii_
         // migration` below for the concrete per-element accounting), while
         // still catching a real regression toward one race dwarfing another.
-        let ps: Vec<u64> = Race::ALL.iter().map(|r| attrs(*r).terraform_pressure()).collect();
+        //
+        // Metal is deliberately excluded from this parity band, not folded
+        // into a wider one: Forge and Armored Dwarf were retuned to a
+        // dramatically inefficient Earth-to-Metal conversion on purpose (see
+        // their own `race.rs` comments and the Metal-specific check in
+        // `combined_per_element_pressure_reflects_the_invariant_viii_
+        // migration`), so "parity with the other nine races" is no longer a
+        // property this table is meant to have -- asserting it here would
+        // just be re-litigating a settled design decision on every test run.
+        let ps: Vec<u64> = Race::ALL
+            .iter()
+            .filter(|r| r.element != Element::Metal)
+            .map(|r| attrs(*r).terraform_pressure())
+            .collect();
         let lo = *ps.iter().min().unwrap();
         let hi = *ps.iter().max().unwrap();
         assert!(lo > 0, "a race has zero terraform pressure");
@@ -1168,7 +1199,7 @@ mod tests {
             );
         }
 
-        for (e, baseline) in [(Element::Wood, WOOD_BASELINE), (Element::Earth, EARTH_BASELINE), (Element::Metal, METAL_BASELINE)] {
+        for (e, baseline) in [(Element::Wood, WOOD_BASELINE), (Element::Earth, EARTH_BASELINE)] {
             let combined = combined_of(e);
             assert!(
                 combined < baseline,
@@ -1185,6 +1216,29 @@ mod tests {
                 baseline
             );
         }
+
+        // Metal is deliberately excluded from the "within a fifth of the old
+        // baseline" check above: Forge and Armored Dwarf were retuned to a
+        // dramatically inefficient (`ratio_in` = 50 * `ratio_out`) Earth-to-
+        // Metal conversion on purpose, so Earth stays the persistent
+        // bottleneck resource for the life of a run instead of getting
+        // consumed away once Metal's habitat draw catches up (paired with
+        // Earth-Plant's own deliberately *lossless* Fire-to-Earth
+        // conversion). A ~50x drop below `METAL_BASELINE` is the point, not
+        // a miscalibration -- still checked for nonzero and for landing in
+        // the right ballpark of the intended throttle, so a future retune
+        // that silently un-throttles Metal (e.g. an accidental `ratio_in`
+        // reset back to 1) still gets caught here.
+        let metal_combined = combined_of(Element::Metal);
+        assert!(metal_combined > 0, "Metal's combined pressure collapsed to zero -- production has fully stalled, not just throttled");
+        assert!(
+            metal_combined * 20 < METAL_BASELINE,
+            "Metal's combined pressure {metal_combined} is not throttled far enough below the old baseline {METAL_BASELINE} -- did the deliberate ratio_in/ratio_out gap get lost?"
+        );
+        assert!(
+            metal_combined * 200 > METAL_BASELINE,
+            "Metal's combined pressure {metal_combined} collapsed to near-zero relative to the old baseline {METAL_BASELINE} -- that's stalled, not throttled"
+        );
     }
 
     // Invariant VIII retired `deposit_mix` — deposition no longer has its
