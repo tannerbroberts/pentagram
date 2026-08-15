@@ -35,10 +35,11 @@ fn terrain_replays_bit_identically_and_the_grid_moves() {
     let log = scripted_log(0x5EED, ticks, 20);
 
     let mut a = World::new(SEED, 24);
-    // Terrain starts all-zero and there is no longer any population-
-    // independent influx, so a race's habitat draw needs something to
-    // actually draw from before conversion can move anything -- same
-    // reasoning as `tests/conservation.rs`'s own terrain seeding.
+    // World::new only seeds Earth (GENESIS_EARTH), and there is no longer
+    // any population-independent influx, so every other element's habitat
+    // draw needs something to actually draw from before conversion can move
+    // anything -- same reasoning as `tests/conservation.rs`'s own terrain
+    // seeding, generalized to every element here.
     for y in 0..24i32 {
         for x in 0..24i32 {
             for e in Element::ALL {

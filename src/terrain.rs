@@ -217,6 +217,20 @@ impl Terrain {
         self.cells.iter().map(|c| c[e] as u64).sum()
     }
 
+    /// Set every cell's `element` to exactly `amount`, leaving every other
+    /// element untouched. A one-time genesis choice for `World::new` to call
+    /// -- not an ongoing population-independent per-tick influx (Invariant
+    /// VIII closed off that whole category of source): this fixes the
+    /// *starting* state once, the same category of choice as any other
+    /// initial condition (`RACES`' shipped defaults, an entity's starting
+    /// `hp`), not a create-from-nothing operator that runs during the
+    /// simulation.
+    pub fn seed_uniform(&mut self, element: Element, amount: u16) {
+        for c in &mut self.cells {
+            c[element] = amount;
+        }
+    }
+
     pub fn state_hash(&self) -> u64 {
         let mut h = Hasher::new();
         self.hash_into(&mut h);
@@ -300,6 +314,130 @@ impl Occupancy {
     /// iterate the whole weight map by other means already.
     pub fn count(&self, race: Race, cell_index: u32) -> u32 {
         self.weight.get(race).get(&cell_index).copied().unwrap_or(0)
+    }
+}
+
+/// A uniform-grid broadphase over currently-alive entities, bucketed by the
+/// same 1:1 cell grid `Terrain` already uses. `World::phase_movement`
+/// (behavior sensing), `phase_collisions`, and `phase_feeding` used to each
+/// scan every other entity per candidate -- three separate O(n²) passes per
+/// tick, "correct and fast enough for Stage 0" per this file's own long-
+/// standing note, with a uniform-grid broadphase always the intended fix
+/// once something needed it (see `docs/S1_TERRAIN_DESIGN.md`'s file-layout
+/// table: *"Terrain's row-major indexing is ready for it, but nothing
+/// consumes it yet"*). This is that broadphase.
+///
+/// Not a cache: entity positions move between `phase_movement`,
+/// `phase_collisions`, and `phase_feeding`, so a single index built once per
+/// tick would already be stale by the second phase that wanted it. Cheap to
+/// rebuild (one `O(n)` pass) each time it's needed -- what it replaces is
+/// the `O(n)` *inner* scan per candidate, not the `O(n)` build itself.
+///
+/// `query_ring` always returns candidates in ascending original-index order,
+/// the same order a brute-force `for j in 0..n` scan would visit them in
+/// (`self.entities` is already sorted ascending by id -- Invariant IV) --
+/// so a call site that switches from brute force to this index sees
+/// *exactly* the same candidates in *exactly* the same order, an
+/// accelerated enumeration, not an approximation. Callers whose result
+/// doesn't depend on visiting order (a pure min/max reduction, like nearest-
+/// prey-by-distance) don't need this guarantee, but nothing is lost by
+/// providing it uniformly rather than maintaining two variants.
+/// CSR (compressed-sparse-row) layout, the same shape a sparse matrix's row
+/// index uses -- not `Occupancy`'s `BTreeMap` and not a dense
+/// `Vec<Vec<u32>>` per cell. Both of those were tried first and both lost to
+/// brute force at real scale: a `BTreeMap` pays real pointer-chasing and
+/// per-lookup overhead on every one of the handful of cells a query touches,
+/// and a `Vec<Vec<u32>>` means one small heap allocation per bucket even
+/// when empty. CSR is two flat, contiguous allocations total —
+/// `offsets[c]..offsets[c+1]` is cell `c`'s slice into the single `packed`
+/// array -- so build is two cache-friendly linear passes (no per-entity
+/// allocation) and a query is direct slice indexing (no tree, no hashing).
+/// Measured, not assumed: swapping this in over the `BTreeMap` version took
+/// a 2 000-population soak run from roughly 3x *slower* than brute force to
+/// a real win.
+pub struct SpatialIndex {
+    side: i32,
+    /// Length `side*side + 1`. `offsets[side*side]` is the total alive count.
+    offsets: Vec<u32>,
+    /// Length `offsets[side*side]`. Ascending original-index order within
+    /// each cell's slice — entities are scattered into it in ascending
+    /// index order, one cursor per cell, so each slice comes out sorted for
+    /// free (Invariant IV: `entities` is already ascending by id).
+    packed: Vec<u32>,
+}
+
+impl SpatialIndex {
+    /// Build from every currently alive entity's current position. `O(n)`,
+    /// two linear passes (count, then scatter) plus one prefix sum over the
+    /// cell count -- no per-entity or per-bucket heap allocation.
+    pub fn build(entities: &[Entity], terrain: &Terrain) -> SpatialIndex {
+        let side = terrain.side;
+        let n_cells = (side as usize) * (side as usize);
+        let mut offsets = vec![0u32; n_cells + 1];
+        for e in entities {
+            if !e.alive {
+                continue;
+            }
+            let (x, y) = terrain.cell_of(e.pos);
+            offsets[terrain.index(x, y) + 1] += 1;
+        }
+        for c in 1..offsets.len() {
+            offsets[c] += offsets[c - 1];
+        }
+        let mut cursor = offsets.clone();
+        let mut packed = vec![0u32; offsets[n_cells] as usize];
+        for (i, e) in entities.iter().enumerate() {
+            if !e.alive {
+                continue;
+            }
+            let (x, y) = terrain.cell_of(e.pos);
+            let c = terrain.index(x, y);
+            packed[cursor[c] as usize] = i as u32;
+            cursor[c] += 1;
+        }
+        SpatialIndex { side, offsets, packed }
+    }
+
+    /// A conservative (rounded up, with a one-cell safety margin) cell-radius
+    /// bound for a world-unit reach — how far `query_ring` must search to be
+    /// guaranteed not to miss a candidate a brute-force scan would have
+    /// found within `reach` of a point anywhere inside the query cell.
+    /// `floor_int() + 2` dominates `ceil(reach) + 1`, the actual tight bound,
+    /// for every non-negative `reach` -- a `Fx` without floats has no cheap
+    /// exact `ceil`, and a slightly wider search costs a little extra
+    /// candidate-filtering, not correctness, so there is no reason to chase
+    /// the tight bound here.
+    pub fn radius_cells(reach: crate::fx::Fx) -> i32 {
+        reach.max(crate::fx::Fx::ZERO).floor_int() + 2
+    }
+
+    /// Every alive entity's original index whose cell lies within
+    /// `radius_cells` (inclusive) of cell `(cx, cy)`, in ascending index
+    /// order. The caller still owns the exact distance check -- this only
+    /// narrows which cells are worth looking in, exactly the same
+    /// broadphase-then-narrowphase split `phase_collisions`'s own bounding
+    /// check already performs per pair, just applied before the pair is
+    /// ever formed instead of after.
+    pub fn query_ring(&self, cx: i32, cy: i32, radius_cells: i32) -> Vec<u32> {
+        let r = radius_cells.max(0);
+        let mut out = Vec::new();
+        for dy in -r..=r {
+            let y = cy + dy;
+            if y < 0 || y >= self.side {
+                continue;
+            }
+            for dx in -r..=r {
+                let x = cx + dx;
+                if x < 0 || x >= self.side {
+                    continue;
+                }
+                let idx = (y as usize) * (self.side as usize) + (x as usize);
+                let (start, end) = (self.offsets[idx] as usize, self.offsets[idx + 1] as usize);
+                out.extend_from_slice(&self.packed[start..end]);
+            }
+        }
+        out.sort_unstable();
+        out
     }
 }
 
@@ -885,6 +1023,22 @@ mod tests {
     }
 
     #[test]
+    fn seed_uniform_sets_every_cell_of_one_element_and_leaves_the_rest_alone() {
+        let mut t = Terrain::new(6);
+        t.seed_uniform(Element::Earth, 1000);
+        for y in 0..6i32 {
+            for x in 0..6i32 {
+                assert_eq!(t.cell(x, y)[Element::Earth], 1000, "every cell must hold exactly the seeded amount");
+                for e in Element::ALL {
+                    if e != Element::Earth {
+                        assert_eq!(t.cell(x, y)[e], 0, "{} must be untouched by seeding a different element", e.name());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hash_changes_when_a_cell_changes() {
         let mut t = Terrain::new(8);
         let a = t.state_hash();
@@ -904,6 +1058,56 @@ mod tests {
             let mut tt = Terrain::new(8);
             apportion(&mut tt, Element::Fire, total, &weight, 0xABC, 1, true, animal(Element::Fire));
             assert_eq!(tt.total(Element::Fire), total, "total={total}");
+        }
+    }
+
+    #[test]
+    fn spatial_index_query_ring_finds_exactly_the_brute_force_candidates() {
+        // Random entities, random query point/radius, many trials: the set
+        // `query_ring` returns (after the caller's own exact distance
+        // filter, exactly like every real call site applies) must equal a
+        // brute-force `for j in 0..n` scan's set, every time -- this is the
+        // whole correctness claim the broadphase rewire depends on.
+        use crate::fx::Fx;
+        use crate::race::{attrs, Race};
+        let terrain = Terrain::new(20);
+        let race = Race { element: Element::Wood, kind: Kind::Animal };
+        let a = attrs(race);
+        let mut entities = Vec::new();
+        for seed in 0..200u64 {
+            let x = Fx::from_int(((seed * 7919) % 20) as i32);
+            let y = Fx::from_int(((seed * 104729) % 20) as i32);
+            let mut e = Entity::spawn(seed as u32 + 1, Element::Wood, V2::new(x, y), seed, 0, &a);
+            e.alive = seed % 11 != 0; // a handful of dead bodies mixed in
+            entities.push(e);
+        }
+        let index = SpatialIndex::build(&entities, &terrain);
+
+        for trial in 0..50i32 {
+            let cx = trial % 20;
+            let cy = (trial * 3) % 20;
+            let reach = Fx::ratio(300 + trial * 17, 100); // varying reach, up to ~11.6 cells
+            let reach_sq = reach * reach;
+            let center = V2::new(Fx::from_int(cx), Fx::from_int(cy));
+
+            let mut brute: Vec<u32> = (0..entities.len())
+                .filter(|&j| entities[j].alive && (entities[j].pos - center).len_sq() <= reach_sq)
+                .map(|j| j as u32)
+                .collect();
+            brute.sort_unstable();
+
+            let r = SpatialIndex::radius_cells(reach);
+            let mut indexed: Vec<u32> = index
+                .query_ring(cx, cy, r)
+                .into_iter()
+                .filter(|&j| {
+                    let e = &entities[j as usize];
+                    e.alive && (e.pos - center).len_sq() <= reach_sq
+                })
+                .collect();
+            indexed.sort_unstable();
+
+            assert_eq!(indexed, brute, "trial {trial}: cx={cx} cy={cy} reach={reach:?}");
         }
     }
 

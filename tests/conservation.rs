@@ -77,9 +77,10 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
 
     w.retune_ecology(EcologyTuning { forage_radius: PerElement::filled(Fx::ZERO), ..EcologyTuning::default() });
 
-    // Seed every element generously across the whole grid -- terrain starts
-    // all-zero, so without this there is nothing to mine, and (more
-    // importantly for the accounting below) every race's
+    // Seed every element generously across the whole grid -- World::new only
+    // seeds Earth (GENESIS_EARTH), so without this there is nothing of any
+    // other element to mine, and (more importantly for the accounting
+    // below) every race's
     // habitat draw would be starved at the start of an otherwise-ordinary
     // run. `terrain::apply_conversion` correctly caps a race's produced
     // output at whatever its occupied cells actually hold (a real,

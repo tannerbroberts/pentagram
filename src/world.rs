@@ -143,6 +143,18 @@ pub struct World {
     pub stats: Stats,
 }
 
+/// Genesis terrain state (`World::new`'s one-time `seed_uniform` call): every
+/// cell starts holding this much Earth, nothing else. A fresh world used to
+/// rely on an always-on per-tick population-independent influx to ever have
+/// anything for a race's habitat draw to work with; with that mechanism torn
+/// out entirely, `World::new` has to choose a starting condition itself,
+/// once, the same way it already chooses starting `hp`/positions -- see
+/// `Terrain::seed_uniform`'s own doc comment for why this is a genesis
+/// choice, not a repeat of the exogenous-source problem.
+/// First guess, not a derived constant -- the live-tuning loop's next target
+/// once there's a client for it.
+const GENESIS_EARTH: u16 = 1000;
+
 impl World {
     pub fn new(seed: u64, size_cells: i32) -> World {
         // `size` is an `Fx`, which saturates past `i32::MAX >> Fx::SHIFT`
@@ -152,6 +164,8 @@ impl World {
         // shrunk would desync the terrain grid from the entity coordinate
         // space the design's 1:1 resolution decision depends on.
         let size_cells = size_cells.clamp(1, i32::MAX >> crate::fx::SHIFT);
+        let mut terrain = Terrain::new(size_cells);
+        terrain.seed_uniform(Element::Earth, GENESIS_EARTH);
         World {
             seed,
             tick: 0,
@@ -159,7 +173,7 @@ impl World {
             next_id: 1,
             size: Fx::from_int(size_cells),
             races: RACES,
-            terrain: Terrain::new(size_cells),
+            terrain,
             terrain_tuning: TerrainTuning::default(),
             ecology: EcologyTuning::default(),
             behavior: BehaviorTuning::default(),
@@ -564,10 +578,14 @@ impl World {
         // snapshot-then-apply already documents. See
         // `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §6.
         let n = self.entities.len();
+        // Built once, shared across every Animal's Hunt scan this phase —
+        // see `SpatialIndex`'s own doc comment for why it can't be reused
+        // past this phase (positions move again in phase_collisions).
+        let index = crate::terrain::SpatialIndex::build(&self.entities, &self.terrain);
         let mut drives: Vec<Option<(Drive, Option<V2>)>> = vec![None; n];
         for i in 0..n {
             if self.entities[i].alive && self.entities[i].kind == Kind::Animal {
-                drives[i] = Some(crate::behavior::drive(&self.entities, &self.terrain, &ecology, &behavior, i));
+                drives[i] = Some(crate::behavior::drive(&self.entities, &self.terrain, &index, &ecology, &behavior, i));
             }
         }
 
@@ -646,25 +664,42 @@ impl World {
         let n = self.entities.len();
         let mut fix = vec![V2::ZERO; n];
 
+        // Broadphase: the same unordered-pair set a brute-force `for j in
+        // (i+1)..n` scan would find, just without visiting every other
+        // entity to find it. `fix`'s accumulation and `stats.collisions`
+        // are both order-independent (every qualifying pair contributes
+        // exactly once, and addition commutes), so — unlike phase_feeding
+        // just below — this rewire only needs the *set* of pairs to match,
+        // not the visiting order. `max_radius` bounds how far any race's
+        // collision footprint can reach, so `a_radius + max_radius` is a
+        // safe upper bound on `min` for every possible `b`, regardless of
+        // which race `b` turns out to be — `SpatialIndex` doesn't know
+        // about per-race radii, only cells.
+        let index = crate::terrain::SpatialIndex::build(&self.entities, &self.terrain);
+        let max_radius = self.races.iter().map(|(_, a)| a.radius).max().unwrap_or(Fx::ZERO);
+
         for i in 0..n {
             if !self.entities[i].alive {
                 continue;
             }
-            for j in (i + 1)..n {
-                if !self.entities[j].alive {
+            let a = &self.entities[i];
+            let a_race = a.race();
+            let a_radius = self.races[a_race].radius * Fx::ratio(a.size as i32, 1000);
+            let (cx, cy) = self.terrain.cell_of(a.pos);
+            let r = crate::terrain::SpatialIndex::radius_cells(a_radius + max_radius);
+            for j in index.query_ring(cx, cy, r) {
+                let j = j as usize;
+                if j <= i || !self.entities[j].alive {
                     continue;
                 }
-                let a = &self.entities[i];
                 let b = &self.entities[j];
-                let d = b.pos - a.pos;
-                let a_race = a.race();
+                let d = b.pos - self.entities[i].pos;
                 let b_race = b.race();
                 // S3.5: a seedling's collision footprint scales with its
                 // current growth (Entity.size, per-mille of full size) --
                 // the one place size is read. Animals and mature/unrooted
                 // Plants are always at size 1000, so this is a no-op for
                 // them (radius times 1.0 equals radius).
-                let a_radius = self.races[a_race].radius * Fx::ratio(a.size as i32, 1000);
                 let b_radius = self.races[b_race].radius * Fx::ratio(b.size as i32, 1000);
                 let min = a_radius + b_radius;
                 let dist_sq = d.len_sq();
@@ -742,11 +777,30 @@ impl World {
         // mapping.
         let mut ate: Vec<Option<usize>> = vec![None; n];
 
+        // Broadphase: unlike phase_collisions, this scan's result genuinely
+        // depends on visiting order (a body can only feed once per tick,
+        // enforced by `eaten`/`fed` flags checked mid-scan — see this
+        // function's own doc comment on Invariant IV), so `query_ring`'s
+        // ascending-index guarantee is load-bearing here, not just a nicety.
+        // Which of `(i, j)` ends up `pred` isn't known until the Kind/element
+        // match below runs, so the reach bound has to cover *either*
+        // direction: `max_forage`, the largest `forage_radius` any element
+        // ships, dominates whichever `ecology.forage_radius[pred_el]` this
+        // pair actually resolves to.
+        let index = crate::terrain::SpatialIndex::build(&self.entities, &self.terrain);
+        let max_forage = ecology.forage_radius.iter().map(|(_, r)| *r).max().unwrap_or(Fx::ZERO);
+        let search_r = crate::terrain::SpatialIndex::radius_cells(max_forage);
+
         for i in 0..n {
             if !self.entities[i].alive || eaten[i] {
                 continue;
             }
-            for j in (i + 1)..n {
+            let (cx, cy) = self.terrain.cell_of(self.entities[i].pos);
+            for j in index.query_ring(cx, cy, search_r) {
+                let j = j as usize;
+                if j <= i {
+                    continue;
+                }
                 if !self.entities[j].alive || eaten[j] {
                     continue;
                 }
@@ -1168,6 +1222,21 @@ mod tests {
         let mut w = World::new(0xC0FFEE, 64);
         w.seed_population(8);
         w
+    }
+
+    #[test]
+    fn a_fresh_world_starts_with_genesis_earth_everywhere_and_nothing_else() {
+        let w = World::new(0xC0FFEE, 5);
+        for y in 0..5i32 {
+            for x in 0..5i32 {
+                assert_eq!(w.terrain.cell(x, y)[Element::Earth], GENESIS_EARTH);
+                for e in Element::ALL {
+                    if e != Element::Earth {
+                        assert_eq!(w.terrain.cell(x, y)[e], 0, "{} should start at zero", e.name());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2139,6 +2208,9 @@ mod tests {
         // directly, pinning its own accounting down independent of which
         // death path calls it.
         let mut w = World::new(1, 16);
+        // Genesis seeds every cell with GENESIS_EARTH -- an unrelated
+        // confound for this probe's exact-conservation arithmetic below.
+        w.terrain.seed_uniform(Element::Earth, 0);
         let race = Race { element: Element::Fire, kind: Kind::Animal };
         let pos = V2::new(Fx::from_int(3), Fx::from_int(3));
         let mut carried = PerElement::filled(0u64);
@@ -2267,6 +2339,9 @@ mod tests {
         // silently wraps -- the exact failure mode this probe is checking
         // for).
         let mut w = World::new(31, 16);
+        // Genesis seeds every cell with GENESIS_EARTH -- an unrelated
+        // confound for this probe's exact-conservation arithmetic below.
+        w.terrain.seed_uniform(Element::Earth, 0);
         let race = Race { element: Element::Metal, kind: Kind::Animal };
         let pos = V2::new(Fx::from_int(4), Fx::from_int(4));
         let id = w.spawn(race, pos);
@@ -2597,6 +2672,9 @@ mod tests {
         // its prey's `carried`/`items` -- both always fall to the ground at
         // the death position, the same as any other death.
         let mut w = World::new(3, 16);
+        // Genesis seeds every cell with GENESIS_EARTH -- an unrelated
+        // confound for this probe's exact-conservation arithmetic below.
+        w.terrain.seed_uniform(Element::Earth, 0);
         w.retune_ecology(EcologyTuning {
             satiation: PerElement::filled(0),
             hunt_weight: PerRace::filled(1000),
@@ -2639,6 +2717,9 @@ mod tests {
         // element (Earth) via `charge_death`, not Z's original element
         // (Fire), with no Conversion/mining/smelting action responsible.
         let mut w = World::new(0x5EED, 32);
+        // Genesis seeds every cell with GENESIS_EARTH -- an unrelated
+        // confound for the exact-zero "no phantom Earth deposit" check below.
+        w.terrain.seed_uniform(Element::Earth, 0);
         w.retune_ecology(EcologyTuning {
             satiation: PerElement::filled(0),
             hunt_weight: PerRace::filled(1000),

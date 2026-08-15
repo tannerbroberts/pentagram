@@ -121,12 +121,23 @@ impl Hashable for BehaviorTuning {
     }
 }
 
-/// Pure — testable against a bare `&[Entity]` + `&Terrain` with no `World`
-/// involved, the same shape `ecology::apply_attrition` already uses. Caller
-/// (`World::phase_movement`) must only call this for an alive
-/// `Kind::Animal` entity at `i`; that contract is asserted, not silently
-/// assumed.
-pub fn drive(entities: &[Entity], terrain: &Terrain, ecology: &EcologyTuning, tuning: &BehaviorTuning, i: usize) -> (Drive, Option<V2>) {
+/// Pure — testable against a bare `&[Entity]` + `&Terrain` (+ a `SpatialIndex`
+/// built from that same pair) with no `World` involved, the same shape
+/// `ecology::apply_attrition` already uses. Caller (`World::phase_movement`)
+/// must only call this for an alive `Kind::Animal` entity at `i`; that
+/// contract is asserted, not silently assumed. `index` is a caller-owned
+/// broadphase, not built here, so `phase_movement` can build it once and
+/// share it across every Animal's Hunt scan this tick rather than paying an
+/// `O(n)` build per candidate — see `SpatialIndex`'s own doc comment for why
+/// it can't just be cached across ticks.
+pub fn drive(
+    entities: &[Entity],
+    terrain: &Terrain,
+    index: &crate::terrain::SpatialIndex,
+    ecology: &EcologyTuning,
+    tuning: &BehaviorTuning,
+    i: usize,
+) -> (Drive, Option<V2>) {
     let e = &entities[i];
     debug_assert!(e.alive && e.kind == Kind::Animal, "drive() called for a non-Animal or dead entity");
     let race = e.race();
@@ -165,8 +176,12 @@ pub fn drive(entities: &[Entity], terrain: &Terrain, ecology: &EcologyTuning, tu
         let animal_prey_el = e.element.eats_animal();
         let reach = tuning.sense_radius[race];
         let reach_sq = reach * reach;
+        let (cx, cy) = terrain.cell_of(e.pos);
+        let search_r = crate::terrain::SpatialIndex::radius_cells(reach);
         let mut nearest: Option<(usize, Fx)> = None;
-        for (j, other) in entities.iter().enumerate() {
+        for j in index.query_ring(cx, cy, search_r) {
+            let j = j as usize;
+            let other = &entities[j];
             if j == i || !other.alive {
                 continue;
             }
@@ -246,7 +261,7 @@ mod tests {
         let entities = vec![wood, water];
         let ecology = EcologyTuning::default();
         let tuning = BehaviorTuning::default();
-        let (d, _) = drive(&entities, &terrain, &ecology, &tuning, 0);
+        let (d, _) = drive(&entities, &terrain, &crate::terrain::SpatialIndex::build(&entities, &terrain), &ecology, &tuning, 0);
         assert_eq!(d, Drive::Flee, "danger above threshold must win over an available hunt");
     }
 
@@ -267,7 +282,7 @@ mod tests {
         let entities = vec![wood];
         let ecology = EcologyTuning::default();
         let tuning = BehaviorTuning::default();
-        let (d, dir) = drive(&entities, &terrain, &ecology, &tuning, 0);
+        let (d, dir) = drive(&entities, &terrain, &crate::terrain::SpatialIndex::build(&entities, &terrain), &ecology, &tuning, 0);
         assert_eq!(d, Drive::Flee);
         let dir = dir.expect("flee should always produce a direction here");
         // N is (0,-1); fleeing away from N means steering toward (0, 1) = south.
@@ -282,7 +297,7 @@ mod tests {
         let entities = vec![wood];
         let ecology = EcologyTuning::default();
         let tuning = BehaviorTuning::default();
-        let (d, target) = drive(&entities, &terrain, &ecology, &tuning, 0);
+        let (d, target) = drive(&entities, &terrain, &crate::terrain::SpatialIndex::build(&entities, &terrain), &ecology, &tuning, 0);
         assert_eq!(d, Drive::Graze);
         assert_eq!(target, None);
     }
@@ -295,7 +310,7 @@ mod tests {
         let entities = vec![wood, water];
         let ecology = EcologyTuning::default();
         let tuning = BehaviorTuning::default();
-        let (d, target) = drive(&entities, &terrain, &ecology, &tuning, 0);
+        let (d, target) = drive(&entities, &terrain, &crate::terrain::SpatialIndex::build(&entities, &terrain), &ecology, &tuning, 0);
         assert_eq!(d, Drive::Graze);
         assert_eq!(target, None);
     }
@@ -312,7 +327,7 @@ mod tests {
         let entities = vec![wood, far_water, near_low_id, near_high_id];
         let ecology = EcologyTuning::default();
         let tuning = BehaviorTuning::default();
-        let (d, target) = drive(&entities, &terrain, &ecology, &tuning, 0);
+        let (d, target) = drive(&entities, &terrain, &crate::terrain::SpatialIndex::build(&entities, &terrain), &ecology, &tuning, 0);
         assert_eq!(d, Drive::Hunt);
         // Steering toward (8,6) from (8,8) is straight up: (0, -1).
         let target = target.expect("nearer prey should produce a direction");
@@ -328,7 +343,7 @@ mod tests {
         let entities = vec![wood, water];
         let ecology = EcologyTuning::default();
         let tuning = BehaviorTuning::default();
-        let (d, target) = drive(&entities, &terrain, &ecology, &tuning, 0);
+        let (d, target) = drive(&entities, &terrain, &crate::terrain::SpatialIndex::build(&entities, &terrain), &ecology, &tuning, 0);
         assert_eq!(d, Drive::Hunt);
         assert_eq!(target, None, "co-located prey has no meaningful direction");
     }
@@ -340,7 +355,7 @@ mod tests {
         let entities = vec![wood];
         let ecology = EcologyTuning::default();
         let tuning = BehaviorTuning::default();
-        let (d, target) = drive(&entities, &terrain, &ecology, &tuning, 0);
+        let (d, target) = drive(&entities, &terrain, &crate::terrain::SpatialIndex::build(&entities, &terrain), &ecology, &tuning, 0);
         assert_eq!(d, Drive::Graze);
         assert_eq!(target, None);
     }
