@@ -78,8 +78,8 @@ const HUNT_WEIGHT_DEFAULT: u16 = 150;
 
 /// The rate knobs `World::phase_feeding` and the starvation half of
 /// `World::phase_aging` read. `PerElement`-shaped throughout, so it drops
-/// into the `chaos` knob/page machinery the same way `TerrainTuning` and
-/// `ClimateTuning` already do.
+/// into the `chaos` knob/page machinery the same way `TerrainTuning` already
+/// does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EcologyTuning {
     /// How far a body can reach to eat prey on its ring edge, in cells.

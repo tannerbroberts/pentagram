@@ -16,7 +16,6 @@
 use std::fmt::Write as _;
 
 use crate::behavior::BehaviorTuning;
-use crate::climate::ClimateTuning;
 use crate::ecology::{EcologyTuning, PropagationTuning};
 use crate::element::Element;
 use crate::fx::Fx;
@@ -28,7 +27,7 @@ use crate::race::{
 pub enum Axis {
     /// Every row differs per (element, kind) -- races/behavior knobs.
     Race,
-    /// Every row is shared by both kinds of an element -- terrain/climate/
+    /// Every row is shared by both kinds of an element -- terrain/
     /// ecology/propagation knobs. The Kind toggle has no effect on this
     /// page's values; the header should say so rather than silently
     /// implying two independent numbers that are actually the same cell.
@@ -47,7 +46,6 @@ pub struct Tuning {
     pub races: PerRace<RaceAttrs>,
     pub restock: PerRace<u32>,
     pub terrain: crate::terrain::TerrainTuning,
-    pub climate: ClimateTuning,
     pub ecology: EcologyTuning,
     pub propagation: PropagationTuning,
     pub behavior: BehaviorTuning,
@@ -59,7 +57,6 @@ impl Tuning {
             races: RACES,
             restock: PerRace::filled(per_race),
             terrain: crate::terrain::TerrainTuning::default(),
-            climate: ClimateTuning::default(),
             ecology: EcologyTuning::default(),
             propagation: PropagationTuning::default(),
             behavior: BehaviorTuning::default(),
@@ -301,12 +298,11 @@ static MIX: [Knob; 5] = [
     mix_knobs!("con existence", consume_mix, Channel::OnExistence, "taken by being present"),
 ];
 
-/// Terrain's two rate/cap knobs, then climate's five — one combined static
-/// since Rust statics can't be concatenated. See `TerrainTuning` (src/terrain.rs)
-/// and `ClimateTuning` (src/climate.rs) for what each field actually drives.
-/// Ring/star used to live here — terrain isn't its own actor, so those two
-/// relations moved to the `ecology (S2)` page below as attrition/suppression.
-static TERRAIN_AND_CLIMATE: [Knob; 7] = [
+/// Terrain's two rate/cap knobs. See `TerrainTuning` (src/terrain.rs) for
+/// what each field actually drives. Ring/star used to live here — terrain
+/// isn't its own actor, so those two relations moved to the `ecology (S2)`
+/// page below as attrition/suppression.
+static TERRAIN: [Knob; 2] = [
     knob!("diffuse rate", Fmt::Permille, Step::Add(1), 0, 1000,
           "permille of the concentration difference across an edge that moves each terrain tick",
           |t, e| t.terrain.diffuse_rate[e.element] as i64,
@@ -315,27 +311,6 @@ static TERRAIN_AND_CLIMATE: [Knob; 7] = [
           "flat units per edge per terrain tick — no edge can ever carry more than this in one tick",
           |t, e| t.terrain.diffuse_cap[e.element] as i64,
           |t, e, v| t.terrain.diffuse_cap[e.element] = v as u16),
-
-    knob!("base lo", Fmt::Int, Step::Add(1), 0, u16::MAX as i64,
-          "low end of the one-time per-cell geography draw for this element",
-          |t, e| t.climate.base_range[e.element].0 as i64,
-          |t, e, v| t.climate.base_range[e.element].0 = v as u16),
-    knob!("base hi", Fmt::Int, Step::Add(1), 0, u16::MAX as i64,
-          "high end of the one-time per-cell geography draw for this element",
-          |t, e| t.climate.base_range[e.element].1 as i64,
-          |t, e, v| t.climate.base_range[e.element].1 = v as u16),
-    knob!("climate floor", Fmt::Int, Step::Add(1), 0, u16::MAX as i64,
-          "always-on climate influx added every terrain tick, regardless of season",
-          |t, e| t.climate.floor[e.element] as i64,
-          |t, e, v| t.climate.floor[e.element] = v as u16),
-    knob!("season peak", Fmt::Int, Step::Add(50), 0, u16::MAX as i64,
-          "peak seasonal bonus applied to this element while it is in season",
-          |t, e| t.climate.season_peak[e.element] as i64,
-          |t, e, v| t.climate.season_peak[e.element] = v as u16),
-    knob!("season length", Fmt::Ticks, Step::Scale, 1, TICKS_PER_DAY as i64 * 90,
-          "GLOBAL: terrain ticks per season — five seasons, one per element, make one full lap",
-          |t, _e| t.climate.season_ticks as i64,
-          |t, _e, v| t.climate.season_ticks = v as u64),
 ];
 
 /// S2's five feeding/starvation knobs, plus attrition and suppression —
@@ -424,7 +399,7 @@ static BEHAVIOR: [Knob; 3] = [
 pub static PAGES: &[Page] = &[
     Page { title: "body & rates", knobs: &BODY, axis: Axis::Race },
     Page { title: "channel mix ‰  (edits rebalance the rest to keep the sum at 1000)", knobs: &MIX, axis: Axis::Race },
-    Page { title: "terrain & climate", knobs: &TERRAIN_AND_CLIMATE, axis: Axis::Element },
+    Page { title: "terrain", knobs: &TERRAIN, axis: Axis::Element },
     Page { title: "ecology (S2)", knobs: &ECOLOGY, axis: Axis::Element },
     Page { title: "propagation (S3.5)", knobs: &PROPAGATION, axis: Axis::Element },
     Page { title: "behavior (S3.4)", knobs: &BEHAVIOR, axis: Axis::Race },
@@ -507,10 +482,10 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
     let mut s = String::from(
         "// Written by the chaos live view. Not compiled — copy the rows you want\n\
          // into the RACES table in race.rs, keeping the comments there. The\n\
-         // TERRAIN_TUNING, CLIMATE_TUNING and ECOLOGY_TUNING constants below\n\
-         // follow the same rule: copy fields into terrain.rs / climate.rs /\n\
-         // ecology.rs by hand. PROPAGATION_TUNING and BEHAVIOR_TUNING follow the\n\
-         // same copy-by-hand rule, into ecology.rs and behavior.rs respectively.\n\n\
+         // TERRAIN_TUNING and ECOLOGY_TUNING constants below follow the same\n\
+         // rule: copy fields into terrain.rs / ecology.rs by hand.\n\
+         // PROPAGATION_TUNING and BEHAVIOR_TUNING follow the same copy-by-hand\n\
+         // rule, into ecology.rs and behavior.rs respectively.\n\n\
          pub const RACES: PerRace<RaceAttrs> = PerRace([\n",
     );
     for race in Race::ALL {
@@ -563,23 +538,6 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
         tt.diffuse_rate[Element::ALL[3]], tt.diffuse_rate[Element::ALL[4]],
         tt.diffuse_cap[Element::ALL[0]], tt.diffuse_cap[Element::ALL[1]], tt.diffuse_cap[Element::ALL[2]],
         tt.diffuse_cap[Element::ALL[3]], tt.diffuse_cap[Element::ALL[4]],
-    );
-
-    let ct = &t.climate;
-    let _ = write!(
-        s,
-        "pub const CLIMATE_TUNING: ClimateTuning = ClimateTuning {{\n    \
-         base_range: PerElement([{:?}, {:?}, {:?}, {:?}, {:?}]),\n    \
-         floor: PerElement([{}, {}, {}, {}, {}]),\n    \
-         season_peak: PerElement([{}, {}, {}, {}, {}]),\n    \
-         season_ticks: {},\n}};\n",
-        ct.base_range[Element::ALL[0]], ct.base_range[Element::ALL[1]], ct.base_range[Element::ALL[2]],
-        ct.base_range[Element::ALL[3]], ct.base_range[Element::ALL[4]],
-        ct.floor[Element::ALL[0]], ct.floor[Element::ALL[1]], ct.floor[Element::ALL[2]],
-        ct.floor[Element::ALL[3]], ct.floor[Element::ALL[4]],
-        ct.season_peak[Element::ALL[0]], ct.season_peak[Element::ALL[1]], ct.season_peak[Element::ALL[2]],
-        ct.season_peak[Element::ALL[3]], ct.season_peak[Element::ALL[4]],
-        ct.season_ticks,
     );
 
     let ec = &t.ecology;

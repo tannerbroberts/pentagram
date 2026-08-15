@@ -1,12 +1,12 @@
 //! S1 — the terrain field.
 //!
 //! Five `u16` saturations per cell. `phase_terrain` in `world.rs` (run right
-//! after `phase_settle`) now runs a fixed five-slot sequence every terrain
-//! tick, but only three of those slots are terrain operators now — this file
+//! after `phase_settle`) now runs a fixed four-slot sequence every terrain
+//! tick, but only two of those slots are terrain operators now — this file
 //! owns:
 //!
 //! ```text
-//!   1 conversion    4 climate    5 diffusion
+//!   1 conversion    6 diffusion
 //! ```
 //!
 //! **Invariant VIII update.** Slots 1 and 2 used to be independent `deposit`

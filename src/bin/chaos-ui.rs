@@ -176,7 +176,6 @@ impl App {
         self.w = World::new(seed, self.size);
         self.w.retune(self.t.races);
         self.w.retune_terrain(self.t.terrain);
-        self.w.retune_climate(self.t.climate);
         self.w.retune_ecology(self.t.ecology);
         self.w.retune_behavior(self.t.behavior);
         self.w.retune_propagation(self.t.propagation);
@@ -210,7 +209,6 @@ impl App {
         // same as the terminal client's main loop.
         self.w.retune(self.t.races);
         self.w.retune_terrain(self.t.terrain);
-        self.w.retune_climate(self.t.climate);
         self.w.retune_ecology(self.t.ecology);
         self.w.retune_behavior(self.t.behavior);
         self.w.retune_propagation(self.t.propagation);
@@ -556,7 +554,7 @@ impl App {
                         self.retuned = false;
                         self.say("Restarted at tick 0 — this run is reproducible from these knobs.");
                     }
-                    if ui.button("New world").on_hover_text("A different seed: new climate geography, same knobs.").clicked() {
+                    if ui.button("New world").on_hover_text("A different seed: fresh population placement and randomness, same knobs.").clicked() {
                         let seed = self.seed.wrapping_add(1);
                         self.restart(seed);
                         self.say(format!("New world — seed {seed:#x}."));

@@ -30,7 +30,7 @@ cursor keys move between cells.
 ↑↓←→ / hjkl   move the cursor        - +   adjust        [ ]   adjust ×10
 space         pause                  .     advance one simulated minute
 < >           halve / double sim speed
-tab           knob page (body & rates ⇄ channel mix ⇄ terrain & climate ⇄
+tab           knob page (body & rates ⇄ channel mix ⇄ terrain ⇄
               ecology ⇄ propagation ⇄ behavior)
 x             toggle Plant / Animal on the current page (Race-scoped pages only)
 m             show or hide the map   w     how much the view steers bodies
@@ -233,27 +233,27 @@ limit). All three still drive the gauge and the state column in the live view.
 
 ## S1 — the terrain field
 
-Landed: five `u16` saturations per cell (`terrain.rs`), six operator slots in a
+Landed: five `u16` saturations per cell (`terrain.rs`), operator slots in a
 fixed order every terrain tick — deposit, consume, attrition, suppression,
-climate, diffusion (see the S2 update note below: slots 3–4 shipped as
+diffusion (see the S2 update note below: slots 3–4 shipped as
 terrain's own `ring`/`star` originally, and moved to `ecology.rs` post-S2) —
 gated at the terrain-tick boundary within `World::step`'s phase
 order (`commands → aging → movement → collisions → feeding → flora → settle →
 terrain → reap`; `feeding` is S2's addition and `flora` is S3.5's, both
-below) — and a deterministic
-climate influx map with a five-season, 30-simulated-day cycle (`climate.rs`).
+below).
 Every design choice the README's one-sentence spec left open — the deposit/consume element
 mapping, the diffusion boundary, the operator order's justification, the exit
-condition made numeric — is written up in `docs/S1_TERRAIN_DESIGN.md`. The
-exit condition ships as `tests/succession.rs`, run via
-`cargo test --release -- --ignored`.
+condition made numeric — is written up in `docs/S1_TERRAIN_DESIGN.md`; the
+always-on, per-cell, population-independent terrain-influx mechanism that
+document's exit condition depended on, and the 30-day tests that proved it,
+were later removed outright (see the update note below) — `tests/succession.rs`
+now keeps a fast, non-ignored bit-identical-replay smoke test instead.
 
 Also landed: headless filmstrip export (`src/bin/filmstrip.rs`, PPM frames +
 `manifest.txt`, run via `cargo run --release --bin filmstrip -- [seed] [size]
 [per_race] [ticks] [cadence] [outdir]`) and hot-reload through the `chaos`
-live view — a third knob page (`terrain & climate`, diffuse rate/cap plus
-climate's base range/floor/season peak/season length), pushed to a running
-world every frame via `World::retune_terrain`/`retune_climate`, and `map()`
+live view — a third knob page (`terrain`, diffuse rate/cap), pushed to a running
+world every frame via `World::retune_terrain`, and `map()`
 now paints the terrain grid's blended colour as a background behind bodies
 instead of drawing bodies only.
 
@@ -269,15 +269,31 @@ row-major indexing is ready for it, but nothing consumes it yet.
 > deposit/consume already worked that way — ring/star didn't. The two
 > *relations* survive, redirected onto whatever body is standing on the cell
 > instead of onto the cell itself: see S2's own update note below for
-> `attrition`/`suppression`. `chaos`'s "terrain & climate" knob page lost the
-> `ring rate`/`star rate` knobs as a result — two knobs, not four, remain
-> (`diffuse rate`, `diffuse cap`). One concrete, measured consequence:
-> `tests/succession.rs`'s two 30-day exit-condition tests now fail (Wood
-> saturates to the grid maximum within the first climate season and stays
-> there, tripping the "no frozen extreme" check) — star was quietly
-> load-bearing for that guarantee. Documented, not silently patched over, in
-> `docs/S1_TERRAIN_DESIGN.md` §7; the fix is retuning `ClimateTuning` via the
-> live view, not reintroducing star.
+> `attrition`/`suppression`. `chaos`'s terrain knob page lost the
+> `ring rate`/`star rate` knobs as a result — two knobs, not four, remained
+> at the time (`diffuse rate`, `diffuse cap`). One concrete, measured
+> consequence at the time: `tests/succession.rs`'s two 30-day
+> exit-condition tests failed (Wood saturated to the grid maximum and
+> stayed there, tripping the "no frozen extreme" check) — star was quietly
+> load-bearing for that guarantee, documented in
+> `docs/S1_TERRAIN_DESIGN.md` §7. Both tests, and the always-on per-cell
+> terrain-influx mechanism they depended on, were later removed outright
+> rather than retuned back to passing — see the update note below.
+>
+> **Later update: the always-on, per-cell, population-independent
+> terrain-influx mechanism is gone.** It was "deliberately redundant" with
+> the Governor's own extinct-race-still-churns-its-floor guarantee — except
+> that guarantee was itself retired when material conservation (Invariant
+> VIII) landed, making this mechanism the last thing standing between a
+> fully depopulated world and permanently frozen terrain. That trade was
+> accepted rather than patched: population never actually goes to zero and
+> stays there (every race has its own spawn/reproduction path back into the
+> ecosystem), so an absorbing-state guarantee for a permanently empty world
+> was never a real requirement. Torn out entirely — the module, its tuning
+> table, its knob page, its retune call, its `rand.rs` channel, and the two
+> 30-day exit-condition tests above — rather than left half-wired. See
+> `docs/S1_TERRAIN_DESIGN.md` for the historical design record of what was
+> removed.
 
 ## S2 — feeding, starvation and reproduction
 
@@ -293,7 +309,7 @@ without a meal starves — `hp` drains after a grace period and death follows
 the same path as old age. `EcologyTuning` (`src/ecology.rs`) holds the six
 rate knobs — `forage_radius`, `satiation`, `feed_gain`, `starve_after`,
 `starve_rate`, `repro_threshold` — retunable live the same way
-`TerrainTuning` and `ClimateTuning` are, and exposed as a fourth `chaos`
+`TerrainTuning` is, and exposed as a fourth `chaos`
 knob page (`ecology (S2)`).
 
 This reads the README's "plants and animals" as *the ecology layer* rather
@@ -452,7 +468,7 @@ Also landed: the `chaos` live view's two-axis (Element × Kind) support
 (S3.6) — a `Kind` toggle (`x`) on the current knob page, driving a real
 `view.kind` field rather than a hardcoded `Kind::Animal`, ten-wide
 `PerRace`-shaped history and race rows, and new `propagation`/`behavior`
-knob pages. Terrain/climate/propagation knobs stay Element-scoped — a
+knob pages. Terrain/propagation knobs stay Element-scoped — a
 Wood-Plant and a Wood-Animal share one diffusion rate, one root-min stock —
 while race/ecology/behavior knobs are Race-scoped; each page's own `Axis`
 says which, so the Kind toggle doesn't imply two independent numbers where

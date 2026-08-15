@@ -20,11 +20,11 @@
 //!
 //! [`fx`] and [`rand`] are the foundation — everything else is downstream of
 //! those two files being correct. [`element`] is the five-cycle. [`race`] and
-//! [`governor`] carry the design's rate model. [`terrain`] and [`climate`]
-//! are Stage 1's field and `phase_terrain`'s six fixed-order operator slots —
-//! see `docs/S1_TERRAIN_DESIGN.md`. Terrain is not its own actor: only four
-//! of those six slots (deposit, consume, climate, diffusion) live in
-//! `terrain`/`climate` themselves; the other two are `ecology`'s
+//! [`governor`] carry the design's rate model. [`terrain`] is Stage 1's field
+//! and `phase_terrain`'s fixed-order operator slots — see
+//! `docs/S1_TERRAIN_DESIGN.md`. Terrain is not its own actor: only the
+//! conversion and diffusion slots live in `terrain` itself; the other two are
+//! `ecology`'s
 //! `apply_attrition`/`apply_suppression`, which read terrain and act on
 //! bodies rather than the other way around. [`ecology`] is Stage 2's
 //! feeding/starvation/reproduction rates plus those two terrain-tick-gated
@@ -49,7 +49,6 @@
 //! way every other explicit action in this crate is (`input`).
 
 pub mod behavior;
-pub mod climate;
 pub mod ecology;
 pub mod element;
 pub mod entity;
@@ -65,7 +64,6 @@ pub mod tuning;
 pub mod world;
 
 pub use behavior::{BehaviorTuning, Drive};
-pub use climate::{Climate, ClimateTuning};
 pub use ecology::EcologyTuning;
 pub use element::{Element, PerElement};
 pub use fx::{Fx, V2};

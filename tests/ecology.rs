@@ -62,8 +62,8 @@ fn ten_thousand_ticks_replay_bit_identically_with_ecology_active() {
 }
 
 /// A retuned ecology table is part of state exactly the way a retuned
-/// `TerrainTuning` or `ClimateTuning` is: two runs from the same seed and log
-/// but different `EcologyTuning` must diverge.
+/// `TerrainTuning` is: two runs from the same seed and log but different
+/// `EcologyTuning` must diverge.
 #[test]
 fn a_retuned_ecology_changes_the_run() {
     let ticks = 2_000u64;

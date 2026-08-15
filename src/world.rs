@@ -18,7 +18,6 @@
 //! doc comment.
 
 use crate::behavior::{BehaviorTuning, Drive};
-use crate::climate::{Climate, ClimateTuning};
 use crate::ecology::{EcologyTuning, PropagationTuning};
 use crate::element::{Element, PerElement};
 use crate::entity::{Entity, Item, ACTION_THRESHOLD, MAX_HP};
@@ -115,8 +114,6 @@ pub struct World {
     /// retuned world must not hash the same as an untuned one.
     pub terrain: Terrain,
     pub terrain_tuning: TerrainTuning,
-    pub climate: Climate,
-    pub climate_tuning: ClimateTuning,
 
     /// S2: feeding/starvation/reproduction rates. Covered by
     /// [`World::state_hash`] the same way `terrain_tuning` is.
@@ -149,14 +146,12 @@ pub struct World {
 impl World {
     pub fn new(seed: u64, size_cells: i32) -> World {
         // `size` is an `Fx`, which saturates past `i32::MAX >> Fx::SHIFT`
-        // cells — clamping here, once, before it reaches `Fx::from_int`,
-        // `Terrain::new` or `Climate::new` keeps all three in agreement.
-        // Leaving `Terrain`/`Climate` free to construct at a raw, unclamped
-        // size that `Fx` would have silently shrunk would desync the
-        // terrain grid from the entity coordinate space the design's 1:1
-        // resolution decision depends on.
+        // cells — clamping here, once, before it reaches `Fx::from_int` or
+        // `Terrain::new`, keeps both in agreement. Leaving `Terrain` free to
+        // construct at a raw, unclamped size that `Fx` would have silently
+        // shrunk would desync the terrain grid from the entity coordinate
+        // space the design's 1:1 resolution decision depends on.
         let size_cells = size_cells.clamp(1, i32::MAX >> crate::fx::SHIFT);
-        let climate_tuning = ClimateTuning::default();
         World {
             seed,
             tick: 0,
@@ -166,8 +161,6 @@ impl World {
             races: RACES,
             terrain: Terrain::new(size_cells),
             terrain_tuning: TerrainTuning::default(),
-            climate: Climate::new(seed, size_cells, &climate_tuning),
-            climate_tuning,
             ecology: EcologyTuning::default(),
             behavior: BehaviorTuning::default(),
             propagation: PropagationTuning::default(),
@@ -211,15 +204,6 @@ impl World {
     /// six operators carry internal state that needs reconciling.
     pub fn retune_terrain(&mut self, terrain_tuning: TerrainTuning) {
         self.terrain_tuning = terrain_tuning;
-    }
-
-    /// Swap the climate tuning table. The static geography cache is a pure
-    /// function of `(seed, side, tuning.base_range)`, so it is rebuilt here
-    /// rather than left stale — otherwise a retuned `base_range` would
-    /// silently disagree with the cache still baked from the old one.
-    pub fn retune_climate(&mut self, climate_tuning: ClimateTuning) {
-        self.climate = Climate::new(self.seed, self.terrain.side, &climate_tuning);
-        self.climate_tuning = climate_tuning;
     }
 
     /// Swap the ecology tuning table. A straight field replacement — feeding
@@ -722,8 +706,8 @@ impl World {
     /// Without the `satiation` gate every predator in reach eats every
     /// single tick it can, which empirically collapses every prey
     /// population within a few hundred ticks. The shipped `EcologyTuning`
-    /// defaults are, like `TerrainTuning`'s and `ClimateTuning`'s before
-    /// them, a first guess for the live tuning loop — a uniform five-way
+    /// defaults are, like `TerrainTuning`'s before it, a first guess for the
+    /// live tuning loop — a uniform five-way
     /// predation ring is a hard balance problem, and nothing here promises
     /// the shipped numbers converge to a stable population on their own.
     ///
@@ -1038,11 +1022,11 @@ impl World {
         }
     }
 
-    /// 8 — the five fixed-order operator slots gated at the same terrain-tick
+    /// 8 — the four fixed-order operator slots gated at the same terrain-tick
     /// boundary `phase_settle` uses so `apply_conversion` sees this tick's
     /// freshly computed `last_consume` grant. See `docs/S1_TERRAIN_DESIGN.md`
     /// and `terrain.rs`'s own doc comment for why this exact order —
-    /// conversion, attrition, suppression, climate, diffusion — is a wire
+    /// conversion, attrition, suppression, diffusion — is a wire
     /// format, not a stylistic choice.
     ///
     /// **Invariant VIII.** The old, independent deposit and consume operators
@@ -1069,7 +1053,6 @@ impl World {
         self.credit_body_material(&body_share);
         crate::ecology::apply_attrition(&mut self.entities, &self.terrain, &self.ecology);
         crate::ecology::apply_suppression(&mut self.entities, &self.terrain, &self.ecology);
-        crate::climate::apply_influx(&mut self.terrain, &self.climate, &self.climate_tuning, terrain_tick);
         crate::terrain::apply_diffusion(&mut self.terrain, &self.terrain_tuning);
     }
 
@@ -1143,13 +1126,12 @@ impl World {
         // world right now" — the same category as entity positions.
         self.terrain.hash_into(&mut h);
         // The tuning tables are state now, so a retuned world must not hash
-        // the same as an untuned one — otherwise `retune`/`retune_terrain`/
-        // `retune_climate` would be a silent divergence.
+        // the same as an untuned one — otherwise `retune`/`retune_terrain`
+        // would be a silent divergence.
         for (_, a) in self.races.iter() {
             a.hash_into(&mut h);
         }
         self.terrain_tuning.hash_into(&mut h);
-        self.climate_tuning.hash_into(&mut h);
         self.ecology.hash_into(&mut h);
         self.behavior.hash_into(&mut h);
         self.propagation.hash_into(&mut h);
@@ -1407,7 +1389,7 @@ mod tests {
         assert_ne!(a.state_hash(), b.state_hash());
     }
 
-    // S3.0: `retune_ecology`/`retune_terrain`/`retune_climate` each already
+    // S3.0: `retune_ecology`/`retune_terrain` each already
     // had a "retuned" coverage test; `retune` (the race table itself) did
     // not, despite `races` being exactly the field S3.1 rekeys to `PerRace`.
     // Closing this gap now, before that change lands, is the point of S3.0.
@@ -2189,12 +2171,6 @@ mod tests {
         // `Entity.carried` in `mine()`), then dies onto a cell that is
         // already near saturated on that element.
         let mut w = World::new(11, 16);
-        // Climate's ambient influx is a genuine, independent source term
-        // (see `tests/conservation.rs`'s own doc comment on why it is out
-        // of Invariant VIII's scope) -- zeroed here so the retry's landed
-        // total is exactly the banked shortfall, not that plus several
-        // terrain ticks of unrelated background influx.
-        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
         let race = Race { element: Element::Fire, kind: Kind::Animal };
         let pos = V2::new(Fx::from_int(6), Fx::from_int(6));
         let (x, y) = w.terrain.cell_of(pos);
@@ -2243,7 +2219,6 @@ mod tests {
         // `deposit_at`'s own unit tests call it directly, bypassing this call
         // site entirely). Same shape: saturate the tailings cell first.
         let mut w = World::new(21, 16);
-        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
         let race = Race { element: Element::Metal, kind: Kind::Animal };
         let pos = V2::new(Fx::from_int(6), Fx::from_int(6));
         let id = w.spawn(race, pos);
@@ -2292,7 +2267,6 @@ mod tests {
         // silently wraps -- the exact failure mode this probe is checking
         // for).
         let mut w = World::new(31, 16);
-        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
         let race = Race { element: Element::Metal, kind: Kind::Animal };
         let pos = V2::new(Fx::from_int(4), Fx::from_int(4));
         let id = w.spawn(race, pos);
@@ -2429,7 +2403,6 @@ mod tests {
         // neither the fix stage's own test nor `deposit_at`'s own unit tests
         // exercise this call site directly).
         let mut w = World::new(22, 16);
-        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
         let race = Race { element: Element::Earth, kind: Kind::Animal };
         let pos = V2::new(Fx::from_int(9), Fx::from_int(9));
         let id = w.spawn(race, pos);
@@ -2500,7 +2473,6 @@ mod tests {
         // same-channel-via-two-items, and a channel with room to spare
         // sitting right alongside two that don't.
         let mut w = World::new(23, 16);
-        w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
         let race = Race { element: Element::Fire, kind: Kind::Animal };
         let other_race = Race { element: Element::Metal, kind: Kind::Animal };
         let pos = V2::new(Fx::from_int(11), Fx::from_int(11));

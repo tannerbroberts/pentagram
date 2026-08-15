@@ -498,7 +498,7 @@ The design work itself, deferred to S3.6:
   clamps per-column cell width to a readable 8-14 chars at 5 columns; ten columns on an
   80-column terminal would give 4-7 chars, unreadable. Keep 5 columns, add a Kind
   selector in the page header bound to a new key.
-- Terrain/climate/propagation knobs are **Element**-scoped (a Wood-Plant and a
+- Terrain/propagation knobs are **Element**-scoped (a Wood-Plant and a
   Wood-Animal share one diffusion rate), while race/ecology/behavior knobs are
   **Race**-scoped. A `Page { title, knobs, axis: Axis::Race | Axis::Element }` field is
   needed so Element-scoped pages can say so in their header and ignore the Kind toggle,

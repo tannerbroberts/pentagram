@@ -1,12 +1,11 @@
 use pentagram::element::PerElement;
 use pentagram::fx::{Fx, V2};
 use pentagram::race::{Kind, Race, TERRAIN_PERIOD};
-use pentagram::{ClimateTuning, EcologyTuning, World};
+use pentagram::{EcologyTuning, World};
 
 #[test]
 fn rev9_probe_conservation_test_scenario_has_zero_deaths() {
     let mut w = World::new(0xBEEF, 24);
-    w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
     w.retune_ecology(EcologyTuning { forage_radius: PerElement::filled(Fx::ZERO), ..EcologyTuning::default() });
     for y in 0..24i32 {
         for x in 0..24i32 {

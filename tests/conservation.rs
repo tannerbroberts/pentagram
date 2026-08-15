@@ -16,17 +16,9 @@
 //! comment, and smelting, `World::smelt`'s), then asserts the observed delta
 //! matches it exactly, element by element.
 //!
-//! Two mechanisms are deliberately neutralised for this run, both flagged in
-//! their own comments below rather than silently avoided:
+//! One mechanism is deliberately neutralised for this run, flagged in its
+//! own comment below rather than silently avoided:
 //!
-//! - **Climate's ambient influx** (`climate.rs`) is a genuine, pre-existing,
-//!   non-entity-mediated source term -- "weather, mineral seepage,
-//!   background decay" -- that predates Invariant VIII and is explicitly out
-//!   of its scope (the law governs terrain/body/item material that moves
-//!   through *entity-mediated* transfers and conversions; climate is neither).
-//!   Zeroed here so this test proves the closed part of the economy exactly,
-//!   rather than also having to reconstruct climate's own saturating-add
-//!   arithmetic to account for it.
 //! - **Predation's reach** (`EcologyTuning::forage_radius`) is zeroed so no
 //!   kill ever happens. Predation moves material too ("you are what you
 //!   eat" -- prey's entire `material` transfers to the predator's, in full),
@@ -35,6 +27,14 @@
 //!   rather than testing against it. Growth-via-conversion, natural/
 //!   starvation death, mining, smelting, and item bundling/breaking are all
 //!   still fully live and exercised below.
+//!
+//! An always-on, per-cell, population-independent terrain influx mechanism
+//! used to be a second, genuinely exogenous source term here -- material
+//! entering the ledger with no entity-mediated transfer behind it,
+//! explicitly out of Invariant VIII's scope. That mechanism has since been
+//! torn out entirely, so that carve-out is gone too: every unit this test
+//! tracks now traces to an explicit transfer or conversion, full stop, with
+//! nothing left to neutralise.
 
 use pentagram::element::{Element, PerElement};
 use pentagram::entity::Item;
@@ -42,7 +42,7 @@ use pentagram::fx::{Fx, V2};
 use pentagram::input::{CmdKind, Command, InputLog};
 use pentagram::race::{Kind, PerRace, Race, TERRAIN_PERIOD};
 use pentagram::world::{SMELT_RATIO_IN, SMELT_RATIO_OUT};
-use pentagram::{ClimateTuning, EcologyTuning, World};
+use pentagram::{EcologyTuning, World};
 
 /// Every pool Invariant VIII's ledger actually covers, summed per element:
 /// terrain stock, every living body's own held material, everything it
@@ -75,16 +75,11 @@ fn total_material(w: &World) -> PerElement<u64> {
 fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
     let mut w = World::new(0xBEEF, 24);
 
-    w.retune_climate(ClimateTuning {
-        floor: PerElement::filled(0),
-        season_peak: PerElement::filled(0),
-        ..ClimateTuning::default()
-    });
     w.retune_ecology(EcologyTuning { forage_radius: PerElement::filled(Fx::ZERO), ..EcologyTuning::default() });
 
     // Seed every element generously across the whole grid -- terrain starts
-    // all-zero and climate is off above, so without this there is nothing
-    // to mine, and (more importantly for the accounting below) every race's
+    // all-zero, so without this there is nothing to mine, and (more
+    // importantly for the accounting below) every race's
     // habitat draw would be starved at the start of an otherwise-ordinary
     // run. `terrain::apply_conversion` correctly caps a race's produced
     // output at whatever its occupied cells actually hold (a real,
@@ -249,9 +244,9 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
 ///   `carried`/`items`, so bug 1's fix is exercised on the predation death
 ///   path too, not just the natural-death path above.
 ///
-/// Unlike the primary test, terrain is left entirely unseeded (all zero) and
-/// climate stays off, so `apply_conversion`'s ring-conversion never has any
-/// habitat stock to draw from and never actually produces anything
+/// Unlike the primary test, terrain is left entirely unseeded (all zero), so
+/// `apply_conversion`'s ring-conversion never has any habitat stock to draw
+/// from and never actually produces anything
 /// (`terrain::apply_conversion`'s own doc comment: production is capped at
 /// what a race's occupied cells actually hold), and `World::smelt` is never
 /// invoked -- both are structurally neutralised, not just left unexercised.
@@ -274,7 +269,6 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
 #[test]
 fn material_is_conserved_through_a_natural_death_and_a_predation_chain() {
     let mut w = World::new(0xDEAD, 24);
-    w.retune_climate(ClimateTuning { floor: PerElement::filled(0), season_peak: PerElement::filled(0), ..ClimateTuning::default() });
     w.retune_ecology(EcologyTuning {
         // Comfortably larger than any body's per-tick movement (fastest
         // shipped Animal speed is 0.46/tick) could carry the three chain

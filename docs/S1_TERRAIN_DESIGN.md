@@ -10,7 +10,7 @@ why) or an **assumption** (flagged, not asserted as given).
 The only spec for S1 is one sentence in `README.md`'s "Next" section:
 
 > S1 — the terrain field: five `u16` saturations per cell, six operators in fixed
-> order, climate influx map, filmstrip output, hot reload. Exit condition is
+> order, filmstrip output, hot reload. Exit condition is
 > succession visibly cycling with no absorbing state over 30 simulated days.
 
 Everything below is this document's answer to that sentence, written to be handed to
@@ -64,14 +64,11 @@ pub struct World {
     // ...existing fields unchanged...
     pub terrain: crate::terrain::Terrain,
     pub terrain_tuning: crate::terrain::TerrainTuning,   // §2, §6
-    pub climate: crate::climate::Climate,                // §4
-    pub climate_tuning: crate::climate::ClimateTuning,   // §4, §6
 }
 ```
 
-`World::new(seed, size_cells)` constructs `Terrain::new(size_cells)` and
-`Climate::new(seed, size_cells, &ClimateTuning::default())` from the same size already
-passed in.
+`World::new(seed, size_cells)` constructs `Terrain::new(size_cells)` from the size
+already passed in.
 
 **Hashing.** `Terrain` gets a straightforward `Hashable` impl (row-major cells,
 ring-order per cell):
@@ -89,25 +86,17 @@ impl Hashable for Terrain {
 
 `World::state_hash` gains this call placed **next to `entities`**, not next to
 `races`: terrain cells are moving world state ("what's physically in the world right
-now"), the same category as entity positions, while `terrain_tuning`/`climate_tuning`
-are configuration and belong next to `races` — mirroring the existing comment there,
+now"), the same category as entity positions, while `terrain_tuning`
+is configuration and belongs next to `races` — mirroring the existing comment there,
 *"a retuned world must not hash the same as an untuned one,"* which now has to hold for
-terrain and climate tuning too.
-
-**The climate map's per-cell static geography is *not* separately stored-and-hashed.**
-It is generated once, at `World::new` time, as a cached array (§4) — but that array is
-a pure function of `(seed, side, climate_tuning)`, all three of which are already
-covered by the hash (`seed` directly, `side` via `Terrain`'s own hash, `climate_tuning`
-via its own block). Hashing it again would be redundant, not wrong: two worlds with
-equal `seed`/`side`/`climate_tuning` already provably have an identical climate base
-array, so nothing is lost by treating it as derived rather than as independent state.
+terrain tuning too.
 
 **Memory cost, at the sizes the live view already offers:**
 
-| size | cells | grid (5×u16/cell) | + diffusion double-buffer | + climate base cache (5×u16/cell) |
-|---|---|---|---|---|
-| 96×96 | 9 216 | 92 160 B (~90 KiB) | ~180 KiB | ~270 KiB |
-| 256×256 | 65 536 | 655 360 B (~640 KiB) | ~1.28 MiB | ~1.9 MiB |
+| size | cells | grid (5×u16/cell) | + diffusion double-buffer |
+|---|---|---|---|
+| 96×96 | 9 216 | 92 160 B (~90 KiB) | ~180 KiB |
+| 256×256 | 65 536 | 655 360 B (~640 KiB) | ~1.28 MiB |
 
 Trivial at either size — this section exists to show the arithmetic, not because
 memory is a real constraint at S1. `World` already derives `Clone` (used by tests and
@@ -145,7 +134,6 @@ in your head as a wire format than a conditional one.
 2. **Consume** — apply
 3. **Attrition** — ring's relation (`eaten_by`), applied to bodies
 4. **Suppression** — star's relation (`suppressed_by`), applied to bodies
-5. **Climate** — influx
 6. **Diffusion** — bounded spread
 
 > **Update, post-S2.** Slots 3 and 4 originally shipped as `terrain.rs`
@@ -227,41 +215,18 @@ edge"*). This was meant to stop deposit- and ring-driven growth from running awa
 inside a single cell; with ring gone and `apply_suppression` no longer writing terrain
 at all, that balancing job has no owner — §7's "no frozen extreme" check is no longer
 mechanically guaranteed the way it was, only empirically true or false of whatever
-`ClimateTuning`/`EcologyTuning` are shipped (see the exit-condition update in §7).
+`EcologyTuning` is shipped (see the exit-condition update in §7).
 `apply_suppression` still runs immediately after `apply_attrition` (4 after 3), since
 nothing forces a different order and keeping the slot stable minimizes the diff.
 
-**5 — Climate influx.** The deterministic, population-independent baseline (§4) is
-added after every entity- and terrain-chemistry operator has acted, so its job stays
-narrow: top up whatever's left, rather than adding fresh mass that the *same* tick's
-suppression pass could immediately annihilate before it's ever observable (suppression
-already ran, in step 4). This is what guarantees the anti-absorbing-state floor
-actually *survives* the tick it's granted on, not just gets granted.
-
 **6 — Bounded diffusion.** Runs last, and this is **Invariant I's literal home** (see
-below for the concrete cap). Running it last means every one of this tick's other five
+below for the concrete cap). Running it last means every one of this tick's other
 operators gets exactly one diffusion pass before the tick ends — deposit, consume,
-ring, star, and climate's output all spread by the same fixed, bounded amount this
+ring, and star's output all spread by the same fixed, bounded amount this
 tick, with no exceptions and no operator's contribution waiting an extra tick to begin
 propagating. That uniformity is what makes the diffusion cap's claim — "influence `N`
 cells away needs at least `N` terrain ticks" — exact for *every* source term, not just
 some of them.
-
-### Rejected alternative ordering: climate after diffusion
-
-One of the three source drafts places diffusion at position 5 and climate last, on the
-grounds that it makes a filmstrip frame diff exactly isolate climate's contribution
-(`frame(t) - frame after diffusion(t)` == that tick's climate injection, undiluted).
-**This document rejects that ordering.** It buys a debugging convenience at the cost of
-a real inconsistency: it would make diffusion spread every other operator's output the
-same tick it's produced, *except* climate's, which would then sit un-diffused for a
-full extra terrain tick before its first spread — an arbitrary, source-dependent
-exception to the diffusion cap's own claim. A uniform rule ("every tick ends with
-exactly one diffusion pass over the fully-updated grid, no exceptions") is easier to
-state, easier to test (§7), and easier to reason about under Invariant I than a rule
-with a carve-out for one specific operator. If isolating climate's contribution in a
-frame diff is ever actually needed, the filmstrip tool can capture an extra
-pre-diffusion intermediate frame without touching operator order.
 
 ### Adjacent-swap failure table — what breaks, concretely
 
@@ -270,8 +235,7 @@ pre-diffusion intermediate frame without touching operator order.
 | **Deposit ↔ Consume** | Consumption would always act on *last* tick's terrain rather than this tick's. A race that both produces and consumes in one window would show a spurious one-terrain-tick lag between production and feeding with no ecological cause — visible in the filmstrip as production and consumption never quite lining up spatially, even when the entities are co-located. |
 | **Consume ↔ Attrition/Suppression** *(was Consume ↔ Ring)* | Attrition/suppression must run after consume so a body's damage/hunger this tick reflects terrain that already includes this tick's deposit and consume — the same "react to fresh, not stale, terrain" reasoning the original Ring justification stated, still true of its replacement. Unlike the original Ring, there's no longer a *competing-demand* concern here (attrition/suppression don't touch `Grant`/the governor at all), so this row is weaker than it was: it's about data freshness, not about two mechanisms colliding over the same budget. |
 | **Attrition ↔ Suppression** *(was Ring ↔ Star)* | The original row's reasoning was about a conserving transfer (ring) vs. a destructive nullification (star) racing over the *same terrain stock* — order mattered because one drained what the other might annihilate first. Neither `apply_attrition` nor `apply_suppression` writes to terrain anymore; each independently reads terrain and writes to a different `Entity` field (`hp` vs. `hunger`). They no longer interact with each other at all, so this swap is now inert — the two could run in either order with an identical result. The slot order is kept as-is (attrition before suppression) purely to minimize the diff from the original six-slot layout, not because anything breaks if reversed. |
-| **Suppression ↔ Climate** *(was Star ↔ Climate)* | The original concern — suppression annihilating a cell's fresh climate floor the same tick it arrives — no longer applies, because suppression doesn't touch terrain at all. Consume (slot 2) is now the only operator that destroys terrain mass outright rather than moving or adding it, and it already runs well before climate; nothing between consume and climate can touch a cell's stock anymore, so climate's floor is safe regardless of this swap. This swap is now inert. See the exit-condition update in §7 for what the loss of a *destructive* slot-3/4 pass implies for saturation. |
-| **Climate ↔ Diffusion** | Diffusion must be last. If it ran before climate, this tick's fresh influx would sit un-diffused for a full extra terrain tick — see the rejected-alternative discussion above. Beyond the cap's exactness, it also means an empty region between two populated ones takes one extra terrain tick to see any floor effect at all after every reload of tuning, complicating the exit-condition test's numeric expectations for no benefit. |
+| **Suppression ↔ Diffusion** | Diffusion must be last. Consume (slot 2) is the only operator that destroys terrain mass outright rather than moving or adding it, and it already runs well before diffusion; nothing between consume and diffusion touches a cell's stock, so this swap is inert in the same way the row above is — kept in order purely to minimize the diff. |
 
 ### Snapshot semantics — the correctness trap that used to span three of the six operators
 
@@ -465,124 +429,6 @@ so it stays cheap even at 256×256.
 
 ---
 
-## 4. Climate influx map
-
-**New file `src/climate.rs`.** No floats, no Perlin noise, no external crate — every
-term is either a cached integer produced once from `rand.rs`'s stateless hash, or plain
-modular/triangle-wave arithmetic on the terrain-tick counter.
-
-**What it represents physically:** a per-cell, per-element **baseline** — weather,
-mineral seepage, background decay — that keeps every cell turning over even where no
-race has ever set foot. It is deliberately redundant with the Governor's own
-"extinct race still churns its floor" guarantee (§3 step 2): two independently
-sufficient reasons no cell can freeze forever is a belt-and-suspenders choice, not an
-oversight — one operates at the aggregate-per-race level (Governor), the other at the
-per-cell level regardless of population (climate).
-
-### Two layers: a static geography, cached once, and a temporal cycle, computed live
-
-```rust
-pub struct ClimateTuning {
-    /// Static per-cell "fertility" range for each element — how much this
-    /// baseline can vary from one cell to the next. `PerElement<(u16, u16)>`
-    /// as (lo, hi).
-    pub base_range: PerElement<(u16, u16)>,
-    /// Always-on floor, added every tick regardless of season — the part of
-    /// the anti-absorbing-state guarantee that never turns off.
-    pub floor: PerElement<u16>,
-    /// Peak seasonal bonus applied to the in-season element, scaled by that
-    /// cell's static base and an integer triangle wave over the season.
-    pub season_peak: PerElement<u16>,
-    /// Terrain ticks per season. Default: 6 simulated days
-    /// (6 * TICKS_PER_DAY / TERRAIN_PERIOD = 8_640).
-    pub season_ticks: u64,
-}
-
-pub struct Climate {
-    side: i32,
-    /// Cached once at construction, from (seed, side, tuning.base_range).
-    /// Not separately hashed — see §1.
-    base: Vec<PerElement<u16>>,
-}
-
-impl Climate {
-    pub fn new(seed: u64, side: i32, tuning: &ClimateTuning) -> Climate {
-        let n = (side.max(1) as usize).pow(2);
-        let mut base = Vec::with_capacity(n);
-        for cell in 0..n as u32 {
-            let mut row = PerElement::filled(0u16);
-            for e in Element::ALL {
-                let (lo, hi) = tuning.base_range[e];
-                let span = hi.saturating_sub(lo).saturating_add(1);
-                // tick=0 is a fixed, deliberate coordinate: this is a
-                // one-shot SPATIAL draw (geography), not a per-tick temporal
-                // one, so it must never vary with terrain_tick.
-                let r = rand_below(seed, 0, cell * 5 + e.index() as u32, Channel::Climate, span as u32);
-                row[e] = lo + r as u16;
-            }
-            base.push(row);
-        }
-        Climate { side: side.max(1), base }
-    }
-
-    /// The per-cell, per-tick influx operator 5 applies.
-    pub fn influx_at(&self, x: i32, y: i32, terrain_tick: u64, t: &ClimateTuning) -> PerElement<u16> {
-        let idx = (y as usize) * (self.side as usize) + (x as usize);
-        let base = self.base[idx];
-        let season_len = t.season_ticks.max(1);
-        let in_season = Element::from_index(((terrain_tick / season_len) % 5) as usize);
-        let phase = terrain_tick % season_len;
-        let half = season_len / 2;
-        let tri = if phase <= half { phase } else { season_len - phase }; // 0..half..0
-        let mut out = PerElement::filled(0u16);
-        for e in Element::ALL {
-            let mut v = t.floor[e] as u64;
-            if e == in_season {
-                let peak = t.season_peak[e] as u64;
-                v += (base[e] as u64 * peak * tri) / (half.max(1) as u64) / 1000;
-            }
-            out[e] = v.min(u16::MAX as u64) as u16;
-        }
-        out
-    }
-}
-```
-
-**Decision — a five-season, 30-day ring cycle, and why.** Two of the three source
-drafts, independently, proposed the same temporal model: `season_ticks` such that five
-seasons (one per element, in ring order) sum to exactly 30 simulated days —
-`season_ticks = 6 days = 8_640 terrain ticks`, `5 × 8_640 = 43_200 terrain ticks = 30
-days`. This document adopts it, because it is the only proposal across all three drafts
-that gives the exit condition's specific number (30 days) and the crate's specific
-element count (5) a *mechanical* relationship rather than a coincidental one: over
-exactly one exit-condition window, each element gets to be climatically favored once,
-in ring order, before the window closes. That gives "succession visibly cycling ...
-over 30 simulated days" (§7) a concrete driver independent of population dynamics
-alone — which matters because S1 has no reproduction (§9 item 8), so a long headless
-run with a fixed starting population will simply age out over the window, and climate
-is what keeps the terrain itself moving regardless.
-
-**This entire seasonal mechanism is this document's invention, not a README
-requirement** — flagged plainly, as all three source drafts already flag their own
-version of it. A day/night sub-cycle layered on top (proposed by one of the three
-drafts) is dropped here as an unforced addition relative to what the README's single
-sentence actually asks for; it is a cheap follow-up knob if the tuning loop later shows
-the map needs faster visible motion than a 6-day season provides, but it is not part of
-the S1 baseline.
-
-**Composition with operator 5's position:** climate lands via `saturating_add` in
-operator 5, one tick before diffusion (operator 6) runs — see §2's ordering discussion.
-A fresh influx begins spreading the same tick it's applied; it is not a separate source
-that bypasses the diffusion cap.
-
-**New `rand.rs` channel required:** `Channel::Climate` (next free discriminant after
-`Governor = 7`), used only by the one-time static-geography draw above. A second new
-channel, `Channel::Terrain`, is used by §3's apportionment tie-break and fallback
-rotation. Both are pure additions, appended after `Governor`, never renumbering an
-existing discriminant, per `rand.rs`'s own stated rule.
-
----
-
 ## 5. Filmstrip output
 
 **New standalone bin, `src/bin/filmstrip.rs`**, following the exact pattern of
@@ -644,16 +490,15 @@ for itself: *"if you see it called anywhere outside a renderer, that is the bug.
 
 ## 6. Hot reload
 
-**Applies to two new tuning tables**, analogous in shape and role to `race.rs`'s
+**Applies to one new tuning table**, analogous in shape and role to `race.rs`'s
 `RaceAttrs`/`RACES`: `TerrainTuning` (ring rate, star rate, diffuse rate + cap — all
-`PerElement`, §2) and `ClimateTuning` (base range, floor, season peak, season length,
-§4). **Decision, all three drafts agree and for the same reason:** every field is
-`PerElement<_>` rather than one global scalar per operator. This is not strictly
+`PerElement`, §2). **Decision, all three drafts agree and for the same reason:** every
+field is `PerElement<_>` rather than one global scalar per operator. This is not strictly
 required by "six operators in fixed order," but it drops straight into the *existing*
 `chaos/knobs.rs` machinery unmodified — that file's `Knob { get: fn(&Tuning, Element)
 -> i64, set: fn(&mut Tuning, Element, i64) }` abstraction is already built entirely
 around "one value per race/element," and a global scalar would need a second, parallel
-knob abstraction just for this page. Per-element terrain/climate tuning means "adding a
+knob abstraction just for this page. Per-element terrain tuning means "adding a
 knob means adding a row to a table," exactly the promise the existing file already
 makes for race attributes.
 
@@ -663,16 +508,14 @@ pub struct Tuning {
     pub races: PerElement<RaceAttrs>,   // existing
     pub restock: PerElement<u32>,       // existing
     pub terrain: TerrainTuning,         // new
-    pub climate: ClimateTuning,         // new
 }
 
 static TERRAIN: [Knob; N] = [ /* ring rate, star rate, diffuse rate, diffuse cap */ ];
-static CLIMATE: [Knob; M] = [ /* base lo/hi, floor, season peak, season length */ ];
 
 pub static PAGES: &[Page] = &[
     Page { title: "body & rates", knobs: &BODY },
     Page { title: "channel mix ‰", knobs: &MIX },
-    Page { title: "terrain & climate", knobs: &TERRAIN_AND_CLIMATE }, // new
+    Page { title: "terrain", knobs: &TERRAIN }, // new
 ];
 ```
 
@@ -684,22 +527,22 @@ extends the existing runtime tier rather than inventing a third:
    formula term). Out of scope for this document (`chaos` lives outside this repo, in
    `~/.local/bin`).
 2. **Runtime (this design's tier).** `World` gains `retune_terrain(&mut self,
-   t: TerrainTuning)` and `retune_climate(&mut self, c: ClimateTuning)`, mirroring the
-   existing `World::retune` exactly — straight field replacement, since neither table
-   carries governor-style internal state (no burst bucket to reconcile). `chaos/main.rs`'s
-   per-frame line `w.retune(t.races)` gains two siblings,
-   `w.retune_terrain(t.terrain)` / `w.retune_climate(t.climate)`, pushed every frame
+   t: TerrainTuning)`, mirroring the
+   existing `World::retune` exactly — straight field replacement, since the table
+   carries no governor-style internal state (no burst bucket to reconcile). `chaos/main.rs`'s
+   per-frame line `w.retune(t.races)` gains a sibling,
+   `w.retune_terrain(t.terrain)`, pushed every frame
    unconditionally — turning a terrain knob is visible on the very next frame's map
    render, on a running world, with no rebuild and no restart. `T` (write table) gains
-   a matching block for the two new tables, in the same `*.tuned.rs` style.
+   a matching block for the new table, in the same `*.tuned.rs` style.
 
-**Why it matters:** the ring/star/diffuse/climate rates are exactly the numbers nobody
+**Why it matters:** the ring/star/diffuse rates are exactly the numbers nobody
 can pick correctly on paper — per the exit condition (§7), they are what decides
 whether succession actually cycles or collapses to monoculture, which is precisely the
 category of number this project's whole live-view apparatus exists to let someone feel
 by turning a knob and watching the map, rather than compute in advance. `race.rs`'s own
 header already says it about itself: *"every number here is a knob, and every one is
-meant to be moved"* — S1's terrain and climate numbers are the same kind of thing.
+meant to be moved"* — S1's terrain numbers are the same kind of thing.
 
 ---
 
@@ -707,36 +550,26 @@ meant to be moved"* — S1's terrain and climate numbers are the same kind of th
 
 > **Update, post-S2 (ring/star removal).** Confirmed by actually running both
 > `#[ignore]`d tests below after `ring`/`star` were removed (§2's update box):
-> **both now fail.** `thirty_days_of_climate_alone_cycles_through_every_element`
-> and `thirty_days_of_succession_visibly_cycles_with_a_population` both hit the
-> same failure — Wood (the first element climate's five-season cycle favors)
-> saturates to `cells × u16::MAX` and stays there past day 8, tripping check
-> (c). This is mechanical, not surprising in hindsight: check (c) was
-> guaranteed by star's balancing pass (§2's original justification for
-> operator 4 said so explicitly — "what stops deposit- and ring-driven growth
-> from running away inside a single cell"). With star gone and nothing else in
+> **both now fail.** Both hit the same failure — Wood saturates to
+> `cells × u16::MAX` and stays there past day 8, tripping check (c). This is
+> mechanical, not surprising in hindsight: check (c) was guaranteed by
+> star's balancing pass (§2's original justification for operator 4 said so
+> explicitly — "what stops deposit- and ring-driven growth from running
+> away inside a single cell"). With star gone and nothing else in
 > `phase_terrain` capable of *destroying* terrain mass except entity-driven
-> consume, a climate-favored element that outpaces consume in its own season
-> has nothing left to check its growth once that season ends and diffusion can
-> only spread the surplus, never remove it.
+> consume, an element that outpaces consume has nothing left to check its
+> growth once diffusion can only spread the surplus, never remove it.
 >
 > Per the project's standing decision that terrain must not be its own actor,
-> the fix is **not** reintroducing star. Two real options, neither exercised
-> by this document (that's `chaos`'s live-view job, the same way S2's own
-> ecology balance is): retune `ClimateTuning`'s `season_peak`/`floor` down so
-> a season's favored element doesn't out-accumulate what bodies actually
-> consume, or accept that "no frozen extreme" is no longer a property this
-> stage guarantees by construction and instead becomes a live-tuning target,
-> exactly like S2's shipped `EcologyTuning` defaults not holding a population
-> indefinitely (`docs/S1_TERRAIN_DESIGN.md` originally, now see `ecology.rs`'s
-> own module doc and the README's S2 section). The two tests stay `#[ignore]`d
-> and unmodified below — they still assert a real, meaningful property; they
-> just now document a known, open gap rather than a guarantee.
+> the fix is **not** reintroducing star; "no frozen extreme" became a
+> live-tuning target rather than a property this stage guarantees by
+> construction, exactly like S2's shipped `EcologyTuning` defaults not
+> holding a population indefinitely (`docs/S1_TERRAIN_DESIGN.md` originally,
+> now see `ecology.rs`'s own module doc and the README's S2 section).
 
 **30 simulated days, in ticks:** `TICKS_PER_DAY = 144 000` (confirmed from `race.rs`:
 `TICKS_PER_MINUTE(100) × 60 × 24`). 30 days = **4 320 000 sim ticks** = **43 200
-terrain ticks** (`TERRAIN_PERIOD = 100`) — and, by construction (§4), exactly five
-6-day climate seasons, one full lap of the ring.
+terrain ticks** (`TERRAIN_PERIOD = 100`).
 
 ### "Absorbing state," made numeric for a `u16` grid
 
@@ -761,21 +594,14 @@ Define the **dominant element** at any sampled point as `argmax_e Σ_cells sat[e
 ties broken by ascending ring index. Sample once per simulated day (30 samples over the
 window) and require:
 
-- **In a zero-population run** (climate and terrain mechanics alone, isolating them
-  from ecological noise — the same spirit as `tests/determinism.rs`'s existing
-  `the_world_keeps_churning_with_no_players_at_all`): **all five elements** appear as
-  the dominant element at least once, in an order consistent with the ring — this is
-  the strong, exact claim the seasonal design (§4) makes directly checkable, since with
-  no population muddying the signal, dominance should track the season almost exactly.
 - **In a populated run** (a starting population per race, run headless with no
   restocking — S1 has no reproduction, so the back half of a long run is realistically
-  testing terrain/climate mechanics more than population dynamics; see §9 item 8): the
-  weaker, more defensible claim — **at least 3 of the 5 elements** appear as dominant
+  testing terrain mechanics more than population dynamics; see §9 item 8): the
+  defensible claim — **at least 3 of the 5 elements** appear as dominant
   across the 30 samples, and no element's dominant run is longer than 10 consecutive
   daily samples. Population dynamics add enough noise that requiring all five here
   would be asserting something about *entity* behavior this document has no basis to
-  promise; the zero-population test above is where the exact ring-cycling claim
-  belongs.
+  promise.
 
 ### Test sketch, in the style of `tests/determinism.rs`
 
@@ -785,26 +611,7 @@ window) and require:
 const DAYS: u64 = 30;
 const TICKS: u64 = DAYS * TICKS_PER_DAY;          // 4_320_000
 const SIZE: i32 = 64;                              // kept small — see cost note
-const SEASON_TICKS_SIM: u64 = TICKS_PER_DAY * 6;   // matches ClimateTuning default
-
-#[test]
-#[ignore] // expensive — run via `cargo test --release -- --ignored`
-fn thirty_days_of_climate_alone_cycles_through_every_element() {
-    let mut w = World::new(SEED, SIZE);   // zero population
-    let log = InputLog::new();
-    let mut dominant = Vec::with_capacity(DAYS as usize);
-    let mut last_hash = None;
-    for day in 0..DAYS {
-        for _ in 0..TICKS_PER_DAY { w.step(&log); }
-        let h = w.terrain.state_hash();
-        assert_ne!(Some(h), last_hash, "terrain frozen at day {day}");
-        last_hash = Some(h);
-        assert_no_absorbing_totals(&w.terrain, SEASON_TICKS_SIM); // (b), (c), (d)
-        dominant.push(dominant_element(&w.terrain));
-    }
-    let distinct: std::collections::BTreeSet<_> = dominant.iter().collect();
-    assert_eq!(distinct.len(), 5, "climate alone did not cycle through every element: {:?}", dominant);
-}
+const SEASON_TICKS_SIM: u64 = TICKS_PER_DAY * 6;
 
 #[test]
 #[ignore]
@@ -862,30 +669,29 @@ would be needed to notice it.
 | file | contents |
 |---|---|
 | `src/terrain.rs` | `Terrain`, `TerrainTuning`, indexing, `Hashable` impl, operators 1, 2 and 6 (`apply_deposit`, `apply_consume`, `apply_diffusion`), the shared RGB palette constant, `render_ppm`, unit + property tests. Operators 3 and 4 (`apply_ring`, `apply_star`) shipped here originally; post-S2 they're gone — see `src/ecology.rs`. |
-| `src/climate.rs` | `Climate`, `ClimateTuning`, `influx_at`, the seasonal triangle-wave math, operator 5 (`apply_influx`) |
 | `src/ecology.rs` *(post-S2)* | `EcologyTuning`, S2's feeding/starvation/reproduction rates, plus operators 3 and 4 (`apply_attrition`, `apply_suppression`) — terrain's old ring/star relations, redirected onto bodies. Not a "new file" for S1 — noted here because these two operators now live in this file instead of `terrain.rs`. |
 | `src/bin/filmstrip.rs` | headless PPM-frame export (§5) |
 | `tests/succession.rs` | the exit-condition tests (§7) |
 
 **Existing files that change:**
 
-- `src/lib.rs` — `pub mod terrain; pub mod climate;`; re-export `Terrain`,
-  `TerrainTuning`, `Climate`, `ClimateTuning`; update the Invariant I table row from
+- `src/lib.rs` — `pub mod terrain;`; re-export `Terrain`,
+  `TerrainTuning`; update the Invariant I table row from
   *"S1: terrain diffusion cap"* (placeholder) to point at `terrain::apply_diffusion`.
-- `src/world.rs` — new fields `terrain`, `terrain_tuning`, `climate`, `climate_tuning`;
+- `src/world.rs` — new fields `terrain`, `terrain_tuning`;
   `World::new` constructs them from `size_cells`; new `phase_terrain` inserted between
   `phase_settle` and `phase_reap`, calling the six operators in the fixed order from
-  §2; `state_hash` gains the terrain block (next to `entities`) and the two tuning
-  blocks (next to `races`); new `retune_terrain`/`retune_climate` mirroring `retune`;
+  §2; `state_hash` gains the terrain block (next to `entities`) and the tuning
+  block (next to `races`); new `retune_terrain` mirroring `retune`;
   the file's own "tick phase order is a wire format" doc comment updated to list all
   seven phases.
-- `src/rand.rs` — append `Channel::Terrain = 8` and `Channel::Climate = 9` after
+- `src/rand.rs` — append `Channel::Terrain = 8` after
   `Governor = 7`, never renumbering an existing discriminant.
-- `src/bin/chaos/knobs.rs` — `Tuning` gains `terrain: TerrainTuning` and `climate:
-  ClimateTuning`; new knob arrays and a third `Page` entry (§6).
-- `src/bin/chaos/main.rs` — `w.retune_terrain(t.terrain)` / `w.retune_climate(t.climate)`
-  alongside the existing `w.retune(t.races)`; `write_table` extended for the two new
-  tables; `z` (restart) reconstructs terrain/climate fresh along with the world.
+- `src/bin/chaos/knobs.rs` — `Tuning` gains `terrain: TerrainTuning`; new knob array
+  and a third `Page` entry (§6).
+- `src/bin/chaos/main.rs` — `w.retune_terrain(t.terrain)`
+  alongside the existing `w.retune(t.races)`; `write_table` extended for the new
+  table; `z` (restart) reconstructs terrain fresh along with the world.
 - `src/bin/chaos/view.rs` — `map()` currently draws bodies only, with an explicit
   caveat comment that the map is not yet meaningful; this becomes false at S1 and the
   function is replaced: terrain's dominant-element color as background (reusing the
@@ -921,45 +727,40 @@ indexing rather than invent a second one.
    text, but it is still an interpretation, not an assertion. Flip is a one-line change.
 3. **The six operators' formulas and every rate constant are first guesses**, in the
    same spirit `race.rs`'s own header states of itself: *"every number here is a knob,
-   and every one is meant to be moved."* Ring/star/diffuse rates and caps, climate base
-   ranges, floor, season peak, and season length are all starting points that need the
+   and every one is meant to be moved."* Ring/star/diffuse rates and caps are
+   starting points that need the
    live-view tuning pass §6 exists to enable — whether the shipped defaults actually
    produce visible ring-cycling rather than (a) a boring near-uniform grid or (b) an
    early-locked monoculture is an empirical question this document cannot answer
    without running the simulation.
 4. **Boundary condition for diffusion is closed/no-flux, not toroidal wrap.** Materially
    changes edge-cell behavior and hash values; the README does not say either way (§2).
-5. **The five-season, 30-day climate cycle is this document's own invention**, motivated
-   only by the fact that the exit condition names 30 days and the crate has 5 elements.
-   If the actual intent behind "30 simulated days" was something else entirely (e.g.
-   "just run it a while and eyeball it"), the whole temporal model in §4 should be
-   revisited — this is the single biggest liberty taken anywhere in this document.
-6. **Extinct-race spatial fallback is uniform-across-the-grid with a rotating offset,
+5. **Extinct-race spatial fallback is uniform-across-the-grid with a rotating offset,
    with no memory of where the race last had living bodies.** Simpler, no new hashed
    state, but loses "this used to be Fire territory" fidelity. A memory-based
    alternative is plausible future work, not designed here.
-7. **Consumption below zero is silently lost, not borrowed, not redistributed, and not
+6. **Consumption below zero is silently lost, not borrowed, not redistributed, and not
    fed back into the Governor's next-tick demand signal.** A cell running out mid-tick
    does not currently make the Governor "aware" that demand physically could not be met
    at a location — whether a scarcity → `clipped` coupling belongs at S1 or later
    (S2/S3) is not resolved here.
-8. **S1 has no reproduction** (per README's "Known and deliberate": that's S2). A
+7. **S1 has no reproduction** (per README's "Known and deliberate": that's S2). A
    30-day headless run with a fixed starting population and no restocking will age
    every race out well inside the window — even Earth's 14-day lifespan means the
    population is gone partway through 30 days — leaving the back half of any such run
-   testing climate/terrain mechanics essentially alone, not ecological succession in
-   any populated sense. §7 runs the exit-condition check both ways (zero-population and
-   populated-but-not-restocked) specifically because this ambiguity cannot be resolved
+   testing terrain mechanics essentially alone, not ecological succession in
+   any populated sense. §7 runs the exit-condition check on a fixed cohort that ages
+   out mid-window specifically because this ambiguity cannot be resolved
    from the repo alone; only S2's arrival fully answers what "succession" is meant to
    include.
-9. **Filmstrip cadence, format, and manifest shape are proposals**, not specified
+8. **Filmstrip cadence, format, and manifest shape are proposals**, not specified
    anywhere in the README. PPM was chosen only because it is the smallest
    zero-dependency-compatible format; hourly cadence was chosen to balance smoothness
    against file count. Either is easy to change.
-10. **The out-of-repo `chaos` wrapper script** (`~/.local/bin`) is not visible or
+9. **The out-of-repo `chaos` wrapper script** (`~/.local/bin`) is not visible or
     editable from this checkout — whether it should grow a `chaos filmstrip` alias is
     unaddressed here, by necessity.
-11. **The collision broadphase** mentioned in "Known and deliberate" is treated as a
+10. **The collision broadphase** mentioned in "Known and deliberate" is treated as a
     separate, out-of-scope performance item (§8) rather than folded into this design,
     since it is not part of the literal "Next" sentence this document answers.
 
@@ -975,23 +776,19 @@ answer is "no":
    consequential interpretive call in the document (§2, §9.2) — it decides what the
    grid actually *means* mechanically. Confirm, or specify the intended alternative
    (self/self, or something else) before any code is written against it.
-2. **The five-season, 30-day climate cycle**, and therefore the entire numeric shape of
-   the exit-condition test in §7, is invented to fit the "30 days / 5 elements"
-   coincidence, not derived from a stated requirement (§9.5). If "30 simulated days" was
-   meant more loosely, both §4 and §7 need to be revisited together.
-3. **Terrain grid is 1:1 with `World::size`.** Confirm this is intended, versus a
+2. **Terrain grid is 1:1 with `World::size`.** Confirm this is intended, versus a
    coarser terrain resolution for large worlds (§9.1).
-4. **Diffusion boundary is closed/no-flux, not toroidal.** A small but hash-affecting
+3. **Diffusion boundary is closed/no-flux, not toroidal.** A small but hash-affecting
    choice (§9.4) — confirm before it becomes load-bearing in recorded replays.
-5. **Filmstrip is a standalone headless bin, not a `chaos` mode**, and produces PPM
-   frames rather than any packaged video/GIF format (§5, §9.9). Confirm this matches
+4. **Filmstrip is a standalone headless bin, not a `chaos` mode**, and produces PPM
+   frames rather than any packaged video/GIF format (§5, §9.8). Confirm this matches
    how the team actually intends to *watch* succession day to day.
-6. **Hot reload means the existing runtime-knob tier (§6), not `chaos watch`'s
+5. **Hot reload means the existing runtime-knob tier (§6), not `chaos watch`'s
    rebuild-on-save.** Confirm this reading of "hot" against what the project owner had
    in mind — the README's only precedent for "hot" is file-watch-and-rebuild, and this
    document deliberately reads S1's "hot reload" as the *other*, faster tier instead.
-7. **No reproduction exists yet (S2), so the 30-day exit-condition run is necessarily
-   either zero-population or a fixed cohort that ages out mid-window (§9.8).** Confirm
-   the two-tier test design in §7 (climate-alone strong claim + populated weaker claim)
-   is an acceptable reading of "succession visibly cycling," given S1 cannot yet
+6. **No reproduction exists yet (S2), so the 30-day exit-condition run is necessarily
+   a fixed cohort that ages out mid-window (§9.7).** Confirm
+   the test design in §7 (a fixed starting population, no restocking) is an acceptable
+   reading of "succession visibly cycling," given S1 cannot yet
    populate the whole window with living entities.

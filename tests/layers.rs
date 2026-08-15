@@ -36,15 +36,6 @@
 //! constructed, the same category of scenario-isolation
 //! `tests/ecology.rs`'s `reproduction_sustains_fire_past_its_own_maximum_
 //! lifespan` already establishes precedent for.
-//!
-//! `tests/succession.rs`'s two `#[ignore]`d 30-day tests were re-run as part
-//! of landing this file: **both still fail**, on the identical signature
-//! already documented in `README.md`'s "Post-S2 update" note and
-//! `docs/S1_TERRAIN_DESIGN.md` §7 (Wood saturates to the grid's maximum
-//! within the first climate season and stays there). S3 neither fixes nor
-//! worsens it — the failure is a climate/terrain tuning gap, unrelated to
-//! the Kind split — so nothing here re-tests that; it is recorded in
-//! `README.md`'s S3 section instead.
 
 use pentagram::element::Element;
 use pentagram::fx::{Fx, V2};

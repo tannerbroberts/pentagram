@@ -173,10 +173,9 @@ fn main() {
 
         // The knobs are the authority; push them at the world every frame. It
         // is a handful of small copies, so there is no point being clever
-        // about when — a terrain/climate edit shows up on the very next frame.
+        // about when — a terrain edit shows up on the very next frame.
         w.retune(t.races);
         w.retune_terrain(t.terrain);
-        w.retune_climate(t.climate);
         w.retune_ecology(t.ecology);
         w.retune_behavior(t.behavior);
         w.retune_propagation(t.propagation);
@@ -325,7 +324,6 @@ fn handle(
                 races: RACES,
                 restock: t.restock,
                 terrain: pentagram::terrain::TerrainTuning::default(),
-                climate: pentagram::climate::ClimateTuning::default(),
                 ecology: pentagram::ecology::EcologyTuning::default(),
                 propagation: PropagationTuning::default(),
                 behavior: BehaviorTuning::default(),
@@ -337,7 +335,6 @@ fn handle(
             *w = World::new(seed, size);
             w.retune(t.races);
             w.retune_terrain(t.terrain);
-            w.retune_climate(t.climate);
             w.retune_ecology(t.ecology);
             w.retune_behavior(t.behavior);
             w.retune_propagation(t.propagation);

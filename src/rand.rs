@@ -32,8 +32,6 @@ pub enum Channel {
     /// S1: terrain apportionment — the extinct-race uniform-fallback rotating
     /// offset and the largest-remainder tie-break (see `terrain.rs`).
     Terrain = 8,
-    /// S1: climate's one-time static-geography draw (see `climate.rs`).
-    Climate = 9,
     /// S3.3: per-predator-per-tick roll gating Animal-vs-Animal predation
     /// (`World::phase_feeding`) against a race's `hunt_weight`. Grazing Plant
     /// prey never rolls this channel — only the Animal-prey edge is a dial.
