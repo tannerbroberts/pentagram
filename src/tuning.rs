@@ -20,7 +20,7 @@ use crate::ecology::{EcologyTuning, PropagationTuning};
 use crate::element::Element;
 use crate::fx::Fx;
 use crate::race::{
-    Channel, Edge, PerRace, Race, RaceAttrs, Share, TICKS_PER_DAY, TICKS_PER_MINUTE, RACES,
+    ActionRecipe, ActionSlot, PerRace, Race, RaceAttrs, RateLaw, TICKS_PER_DAY, TICKS_PER_MINUTE,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,7 +41,7 @@ pub enum Axis {
 /// has no reproduction and no goals, so without a hand on the tiller the map
 /// empties out and the survivors travel in straight lines. Both are applied as
 /// ordinary input commands, which is exactly what a player would be.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Tuning {
     pub races: PerRace<RaceAttrs>,
     pub restock: PerRace<u32>,
@@ -54,7 +54,7 @@ pub struct Tuning {
 impl Tuning {
     pub fn new(per_race: u32) -> Tuning {
         Tuning {
-            races: RACES,
+            races: crate::race::seeded_races(),
             restock: PerRace::filled(per_race),
             terrain: crate::terrain::TerrainTuning::default(),
             ecology: EcologyTuning::default(),
@@ -176,25 +176,7 @@ macro_rules! knob {
     };
 }
 
-/// A band edge. Deposit and consume are the same three edges twice over, and
-/// each one has to go through `set_edge` so the band cannot be left inverted.
-macro_rules! edge_knob {
-    ($name:literal, $field:ident, $read:ident, $edge:expr, $help:literal) => {
-        knob!($name, Fmt::Int, Step::Scale, 0, 1_000_000, $help,
-              |t, e| t.races[e].$field.$read as i64,
-              |t, e, v| t.races[e].$field.set_edge($edge, v as u32))
-    };
-}
-
-macro_rules! burst_knob {
-    ($name:literal, $field:ident, $help:literal) => {
-        knob!($name, Fmt::Int, Step::Add(1), 1, 500, $help,
-              |t, e| t.races[e].$field.burst_ticks as i64,
-              |t, e, v| t.races[e].$field.burst_ticks = v as u32)
-    };
-}
-
-static BODY: [Knob; 16] = [
+static BODY: [Knob; 9] = [
     knob!("lifespan", Fmt::Ticks, Step::Scale, 100, TICKS_PER_DAY as i64 * 90,
           "how long one body persists before it expires of old age",
           |t, e| t.races[e].lifespan as i64,
@@ -216,87 +198,66 @@ static BODY: [Knob; 16] = [
           |t, e| t.restock[e] as i64,
           |t, e, v| t.restock[e] = v as u32),
 
-    // Invariant VIII: deposition is no longer an independent rate axis —
-    // `deposit_unit`/`deposit`/`deposit_mix` are retired (see
-    // `race::Conversion`'s doc comment). These five knobs replace them with
-    // the coupled conversion: a fixed ratio from the habitat draw below into
-    // the race's own element, and where the produced amount goes.
-    knob!("ratio in", Fmt::Int, Step::Add(1), 1, 100_000,
-          "habitat-element units consumed per conversion batch",
-          |t, e| t.races[e].conversion.ratio_in as i64,
-          |t, e, v| t.races[e].conversion.ratio_in = v as u32),
-    knob!("ratio out", Fmt::Int, Step::Add(1), 1, 100_000,
-          "own-element units produced per batch — never exceeds ratio in; a conversion cannot manufacture mass",
-          |t, e| t.races[e].conversion.ratio_out as i64,
-          |t, e, v| t.races[e].conversion.ratio_out = (v as u32).min(t.races[e].conversion.ratio_in)),
-    // Bug 4 (Invariant VIII audit): these three used to each write their own
-    // field directly and independently -- nothing stopped two adjacent
-    // keystrokes from pushing the sum past 1000, which
-    // `terrain::apply_conversion`'s `waste_amt` remainder subtraction then
-    // underflows (a live panic under this crate's `overflow-checks = true`).
-    // `Conversion::set_share_rebalanced` mirrors `ChannelMix::set_rebalanced`
-    // (the `MIX` page below already uses that pattern for `consume_mix`) --
-    // the invariant holds after every single keystroke instead.
-    knob!("dep share", Fmt::Permille, Step::Add(25), 0, 1000,
-          "permille of produced material written to terrain as background deposit",
-          |t, e| t.races[e].conversion.deposit_share as i64,
-          |t, e, v| t.races[e].conversion.set_share_rebalanced(Share::Deposit, v as u16)),
-    knob!("body share", Fmt::Permille, Step::Add(25), 0, 1000,
-          "permille of produced material added to the body's own held material",
-          |t, e| t.races[e].conversion.body_share as i64,
-          |t, e, v| t.races[e].conversion.set_share_rebalanced(Share::Body, v as u16)),
-    knob!("waste share", Fmt::Permille, Step::Add(25), 0, 1000,
-          "permille of produced material returned to terrain as an explicit waste byproduct",
-          |t, e| t.races[e].conversion.waste_share as i64,
-          |t, e, v| t.races[e].conversion.set_share_rebalanced(Share::Waste, v as u16)),
+    // Action-recipe system: `RaceAttrs.actions` replaces the old
+    // `consume_unit`/`consume`/`consume_mix`/`conversion`/`mining_rate`
+    // fields entirely. These three knobs retarget at the surviving `Exist`
+    // recipe (auto-fired every terrain tick — see `race.rs`'s module doc);
+    // `dep share`/`body share`/`waste share` (the old `Conversion` three-way
+    // split) have no equivalent anymore — production credits
+    // `Entity.material` in full now, a documented hole in the migration, not
+    // a knob still worth keeping around as a dead control.
+    knob!("exist ratio in", Fmt::Int, Step::Add(1), 1, 100_000,
+          "habitat-element units consumed per Exist batch",
+          |t, e| t.races[e].action(ActionSlot::Exist).map_or(0, |a| a.ratio_in as i64),
+          |t, e, v| if let Some(a) = t.races[e].action_mut(ActionSlot::Exist) {
+              a.ratio_in = v as u32;
+              a.ratio_out = a.ratio_out.min(a.ratio_in);
+          }),
+    knob!("exist ratio out", Fmt::Int, Step::Add(1), 1, 100_000,
+          "own-element units produced per Exist batch — never exceeds ratio in; a recipe cannot manufacture mass",
+          |t, e| t.races[e].action(ActionSlot::Exist).map_or(0, |a| a.ratio_out as i64),
+          |t, e, v| if let Some(a) = t.races[e].action_mut(ActionSlot::Exist) {
+              let cap = a.ratio_in;
+              a.ratio_out = (v as u32).min(cap);
+          }),
+    knob!("exist rate", Fmt::Int, Step::Scale, 1, u16::MAX as i64,
+          "flat per-body, per-terrain-tick cap on Exist's habitat draw",
+          |t, e| t.races[e].action(ActionSlot::Exist).map_or(0, flat_rate),
+          |t, e, v| set_flat_rate(t, e, ActionSlot::Exist, v)),
 
-    // Items/inventory (Invariant VIII extension): the one new per-race rate
-    // knob mining adds — see `race::RaceAttrs::mining_rate`'s own doc
-    // comment. Smelting's ratio is a fixed global constant
-    // (`World::SMELT_RATIO_IN`/`SMELT_RATIO_OUT`), not a per-race tunable, so
-    // it has no row here.
+    // Items/inventory: the one per-race rate knob mining has — see
+    // `race.rs`'s module doc. Smelting's ratio is fixed (50:1) across every
+    // Animal row's shipped `Smelt` recipe, not a per-race tunable, so it has
+    // no row here.
     knob!("mining rate", Fmt::Int, Step::Add(5), 0, 60_000,
           "terrain units of a chosen element drawn into carried stock per Mine command (Animal only)",
-          |t, e| t.races[e].mining_rate as i64,
-          |t, e, v| t.races[e].mining_rate = v as u32),
-
-    knob!("consume unit", Fmt::Int, Step::Scale, 1, 100_000_000,
-          "total a body draws from its habitat element over its entire life",
-          |t, e| t.races[e].consume_unit as i64,
-          |t, e, v| t.races[e].consume_unit = v as u64),
-    edge_knob!("con floor", consume, floor, Edge::Floor,
-               "reserve: the bucket is never spent below this in one tick (Invariant VIII — no longer a free minimum)"),
-    edge_knob!("con nominal", consume, nominal, Edge::Nominal,
-               "long-run average consumption under sustained demand"),
-    edge_knob!("con ceiling", consume, ceiling, Edge::Ceiling,
-               "never exceeded in one terrain tick"),
-    burst_knob!("con burst", consume,
-                "terrain ticks of nominal consumption that can be banked"),
+          |t, e| t.races[e].action(ActionSlot::Mine).map_or(0, flat_rate),
+          |t, e, v| set_flat_rate(t, e, ActionSlot::Mine, v)),
 ];
 
-/// One row per channel. The mix is what makes two races with identical
-/// rates feel nothing alike, so it gets its own page rather than being
-/// buried. Invariant VIII: `deposit_mix` is retired (deposition is a fixed,
-/// same-tick consequence of the draw below, not a separately timed channel
-/// of its own — see `race::Conversion`'s doc comment and the "body share"
-/// row on the body & rates page, which is what now carries a race's old
-/// "terraforms mostly at death" flavour). Only the habitat-draw timing
-/// (`consume_mix`) remains a channel mix.
-macro_rules! mix_knobs {
-    ($prefix:literal, $field:ident, $chan:expr, $help:literal) => {
-        knob!($prefix, Fmt::Permille, Step::Add(25), 0, 1000, $help,
-              |t, e| t.races[e].$field.permille($chan) as i64,
-              |t, e, v| t.races[e].$field.set_rebalanced($chan, v as u16))
-    };
+/// Every shipped `Exist`/`Mine` recipe uses `RateLaw::Flat` — this reads that
+/// value for a knob's getter, falling back to `NeighborScaled`'s own `base`
+/// so the knob still shows *something* sensible if a future race ships that
+/// rate law instead (nudging it further would just move `base`, which is a
+/// reasonable "increase the floor" interpretation of the same knob).
+fn flat_rate(a: &ActionRecipe) -> i64 {
+    match a.rate {
+        RateLaw::Flat(n) => n as i64,
+        RateLaw::NeighborScaled { base, .. } => base as i64,
+    }
 }
 
-static MIX: [Knob; 5] = [
-    mix_knobs!("con birth", consume_mix, Channel::OnBirth, "taken at incarnation"),
-    mix_knobs!("con death", consume_mix, Channel::OnDeath, "taken by the corpse"),
-    mix_knobs!("con action", consume_mix, Channel::OnAction, "taken by moving"),
-    mix_knobs!("con consume", consume_mix, Channel::OnConsume, "taken by feeding"),
-    mix_knobs!("con existence", consume_mix, Channel::OnExistence, "taken by being present"),
-];
+/// A knob setter's shared shape: retarget `slot`'s rate to a flat cap. A
+/// no-op if this race has no recipe in `slot` (nothing to mutate) or its
+/// rate law isn't `Flat` (the knob doesn't know how to edit a
+/// `NeighborScaled` row's three separate numbers through one control).
+fn set_flat_rate(t: &mut Tuning, e: Race, slot: ActionSlot, v: i64) {
+    if let Some(a) = t.races[e].action_mut(slot) {
+        if matches!(a.rate, RateLaw::Flat(_)) {
+            a.rate = RateLaw::Flat(v.clamp(0, u16::MAX as i64) as u16);
+        }
+    }
+}
 
 /// Terrain's two rate/cap knobs. See `TerrainTuning` (src/terrain.rs) for
 /// what each field actually drives. Ring/star used to live here — terrain
@@ -398,7 +359,6 @@ static BEHAVIOR: [Knob; 3] = [
 
 pub static PAGES: &[Page] = &[
     Page { title: "body & rates", knobs: &BODY, axis: Axis::Race },
-    Page { title: "channel mix ‰  (edits rebalance the rest to keep the sum at 1000)", knobs: &MIX, axis: Axis::Race },
     Page { title: "terrain", knobs: &TERRAIN, axis: Axis::Element },
     Page { title: "ecology (S2)", knobs: &ECOLOGY, axis: Axis::Element },
     Page { title: "propagation (S3.5)", knobs: &PROPAGATION, axis: Axis::Element },
@@ -489,7 +449,8 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
          pub const RACES: PerRace<RaceAttrs> = PerRace([\n",
     );
     for race in Race::ALL {
-        let a = t.races[race];
+        let a = &t.races[race];
+        let actions_src: String = a.actions.iter().map(|r| format!("            {},\n", action_recipe_src(r))).collect();
         let _ = write!(
             s,
             "    RaceAttrs {{\n        \
@@ -499,11 +460,7 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
              lifespan_variance: {},\n        \
              speed: Fx::ratio({}, 100),\n        \
              radius: Fx::ratio({}, 100),\n        \
-             consume_unit: {},\n        \
-             consume: RateBand::new({}, {}, {}, {}),\n        \
-             consume_mix: ChannelMix::new({}, {}, {}, {}, {}),\n        \
-             conversion: Conversion::new({}, {}, {}, {}, {}),\n        \
-             mining_rate: {},\n        \
+             actions: vec![\n{}        ],\n        \
              fantasy: {:?},\n    }},\n",
             race.element.name(),
             race.kind.name(),
@@ -511,18 +468,7 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
             a.lifespan_variance,
             (a.speed.raw() as i64 * 100 + 32_768) / 65_536,
             (a.radius.raw() as i64 * 100 + 32_768) / 65_536,
-            a.consume_unit,
-            a.consume.floor,
-            a.consume.nominal,
-            a.consume.ceiling,
-            a.consume.burst_ticks,
-            mix(&a, 0), mix(&a, 1), mix(&a, 2), mix(&a, 3), mix(&a, 4),
-            a.conversion.ratio_in,
-            a.conversion.ratio_out,
-            a.conversion.deposit_share,
-            a.conversion.body_share,
-            a.conversion.waste_share,
-            a.mining_rate,
+            actions_src,
             a.fantasy,
         );
     }
@@ -533,11 +479,13 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
         s,
         "pub const TERRAIN_TUNING: TerrainTuning = TerrainTuning {{\n    \
          diffuse_rate: PerElement([{}, {}, {}, {}, {}]),\n    \
-         diffuse_cap: PerElement([{}, {}, {}, {}, {}]),\n}};\n\n",
+         diffuse_cap: PerElement([{}, {}, {}, {}, {}]),\n    \
+         ground_decay: RateBand::new({}, {}, {}, {}),\n}};\n\n",
         tt.diffuse_rate[Element::ALL[0]], tt.diffuse_rate[Element::ALL[1]], tt.diffuse_rate[Element::ALL[2]],
         tt.diffuse_rate[Element::ALL[3]], tt.diffuse_rate[Element::ALL[4]],
         tt.diffuse_cap[Element::ALL[0]], tt.diffuse_cap[Element::ALL[1]], tt.diffuse_cap[Element::ALL[2]],
         tt.diffuse_cap[Element::ALL[3]], tt.diffuse_cap[Element::ALL[4]],
+        tt.ground_decay.floor, tt.ground_decay.nominal, tt.ground_decay.ceiling, tt.ground_decay.burst_ticks,
     );
 
     let ec = &t.ecology;
@@ -638,7 +586,19 @@ fn cells(v: Fx) -> i64 {
     (v.raw() as i64 * 100 + 32_768) / 65_536
 }
 
-fn mix(a: &RaceAttrs, i: usize) -> u16 {
-    let c = Channel::ALL[i];
-    a.consume_mix.permille(c)
+/// One `ActionRecipe` as a pasteable Rust literal — `write_table`'s
+/// `RACES` codegen emits one of these per row, per recipe.
+fn action_recipe_src(a: &ActionRecipe) -> String {
+    let rate = match a.rate {
+        RateLaw::Flat(n) => format!("RateLaw::Flat({n})"),
+        RateLaw::NeighborScaled { base, per_neighbor, per_size } => format!(
+            "RateLaw::NeighborScaled {{ base: {base}, per_neighbor: {per_neighbor}, per_size: {per_size} }}"
+        ),
+    };
+    format!(
+        "ActionRecipe {{ slot: ActionSlot::{:?}, input: RecipeSlot::{:?}, output: RecipeSlot::{:?}, \
+         transform: ElementTransform::{:?}, ratio_in: {}, ratio_out: {}, rate: {}, cooldown_ticks: {}, \
+         reach: Fx::ratio({}, 100) }}",
+        a.slot, a.input, a.output, a.transform, a.ratio_in, a.ratio_out, rate, a.cooldown_ticks, cells(a.reach),
+    )
 }

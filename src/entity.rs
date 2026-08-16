@@ -10,7 +10,7 @@ use crate::element::{Element, PerElement};
 use crate::fx::{Fx, V2};
 use crate::hash::{Hashable, Hasher};
 use crate::rand::{rand_range, rand_signed, Channel};
-use crate::race::{Kind, Race, RaceAttrs};
+use crate::race::{ActionSlot, Kind, Race, RaceAttrs};
 #[cfg(test)]
 use crate::race::attrs;
 
@@ -78,36 +78,41 @@ pub struct Entity {
     /// element (`self.element`) this specific body currently holds/embodies
     /// -- distinct from `size` (a structural/collision-radius fraction) and
     /// from `hp`/`hunger` (the separate vitality system, untouched by this
-    /// field). Grown by `World::credit_body_material` (this body's own
-    /// share of its race's conversion, `race::Conversion.body_share`) and,
-    /// for Animals, by predation -- killing prey transfers the prey's
-    /// entire `material` to the predator's, in full (`World::phase_feeding`;
-    /// "you are what you eat"). Lost entirely on death: `World::charge_death`
-    /// returns it to terrain as `self.element`, at `self.pos`, in place of
-    /// the old abstract `OnDeath` deposit-demand charge.
+    /// field). Grown by the `Body`-output arm of `World::apply_action_recipe`
+    /// (this body's own race's `Exist` recipe, fired once per terrain tick —
+    /// see `race.rs`'s module doc) and, for Animals, by predation -- killing
+    /// prey transfers the prey's entire `material` to the predator's, in
+    /// full (`World::phase_feeding`; "you are what you eat"). Lost entirely
+    /// on death: `World::charge_death` returns it to terrain as
+    /// `self.element`, at `self.pos`.
     pub material: u64,
     /// Items/inventory (post-Invariant-VIII): loose, unbundled material of
     /// *other* elements this body is physically carrying — distinct from
     /// `material` above, which is only ever this body's own element (what it
     /// is made of). Gained 1:1 from `World`'s `Mine` command (terrain →
-    /// carried, gated by `RaceAttrs::mining_rate`, `Kind::Animal` only —
-    /// Plants are rooted and never mine) and reshaped by `Smelt` (carried
-    /// element X → carried `X.generates()`, at a fixed lossy ratio, tailings
-    /// returned to terrain). Spent by `MakeItem`, which bundles a quantity of
-    /// one element out of here into a portable `Item` (below). Always zero
-    /// for a `Kind::Plant` body — nothing ever credits it, since mining is
-    /// the only source and Plants cannot mine — so `MakeItem`/`Smelt` are
-    /// naturally no-ops for a Plant without needing their own separate
-    /// `Kind` gate.
+    /// carried, gated by this race's `Mine` `ActionRecipe`, `Kind::Animal`
+    /// only — Plants are rooted and never mine) and reshaped by `Smelt`
+    /// (carried element X → carried `X.generates()`, at a fixed lossy ratio,
+    /// tailings returned to terrain). Spent by `MakeItem`, which bundles a
+    /// quantity of one element out of here into a portable `Item` (below).
+    /// Always zero for a `Kind::Plant` body — nothing ever credits it, since
+    /// mining is the only source and Plants cannot mine — so `MakeItem`/
+    /// `Smelt` are naturally no-ops for a Plant without needing their own
+    /// separate `Kind` gate.
     pub carried: PerElement<u64>,
     /// Items/inventory: portable, single-element material bundles this body
     /// holds, each created by `MakeItem` out of `carried` and destroyed by
     /// `BreakItem` (removed from here, its full `quantity` returned to
     /// terrain at this body's position, as its own `element` — Invariant
-    /// VIII, a pure transfer). Ground-dropped items lying on terrain
-    /// independent of any entity are a reasonable stretch goal, not built
-    /// this pass — see this crate's own inventory design notes.
+    /// VIII, a pure transfer). Ground-dropped items lying on terrain,
+    /// independent of any entity, live in `World::ground_items` instead —
+    /// populated by `World::charge_death`'s item split, reachable by a
+    /// `Pickup` command.
     pub items: Vec<Item>,
+    /// The action map's cooldown state: tick at or after which this body may
+    /// next fire the recipe in each `ActionSlot`, indexed by
+    /// `ActionSlot as usize`. See `World::apply_action_recipe`.
+    pub action_ready_at: [u64; ActionSlot::COUNT],
 }
 
 impl Entity {
@@ -152,6 +157,9 @@ impl Entity {
             // actions, never inherited from a parent.
             carried: PerElement::filled(0),
             items: Vec::new(),
+            // A newborn may fire any action immediately -- cooldowns are
+            // "ticks since last fired," not a startup delay.
+            action_ready_at: [0; ActionSlot::COUNT],
         }
     }
 
@@ -198,6 +206,9 @@ impl Hashable for Entity {
         h.u32(self.items.len() as u32);
         for item in &self.items {
             item.hash_into(h);
+        }
+        for v in self.action_ready_at {
+            h.u64(v);
         }
     }
 }
@@ -309,7 +320,7 @@ mod tests {
     fn a_retuned_lifespan_reaches_the_bodies_born_after_it() {
         // The live view's whole premise: turn a knob, and the next thing born
         // is built to the new number.
-        let mut a = *attrs(animal(Element::Fire));
+        let mut a = attrs(animal(Element::Fire)).clone();
         a.lifespan_variance = 0;
         a.lifespan = 4242;
         let e = Entity::spawn(1, Element::Fire, V2::ZERO, 5, 0, &a);
@@ -444,6 +455,8 @@ mod tests {
         carried.carried[Element::Wood] += 1;
         let mut items = base.clone();
         items.items.push(Item { element: Element::Wood, quantity: 1 });
+        let mut action_ready_at = base.clone();
+        action_ready_at.action_ready_at[0] += 1;
 
         for (name, variant) in [
             ("id", id),
@@ -463,6 +476,7 @@ mod tests {
             ("material", material),
             ("carried", carried),
             ("items", items),
+            ("action_ready_at", action_ready_at),
         ] {
             assert_ne!(hash_of(&variant), base_hash, "{name} does not affect the hash");
         }

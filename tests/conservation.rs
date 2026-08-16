@@ -1,20 +1,21 @@
 //! Invariant VIII (material conservation), proved end-to-end against a real
-//! run rather than only by construction. `race::Conversion`,
-//! `terrain::apply_conversion`, and `Entity.material`/`carried`/`items` are
-//! all covered by their own unit tests already; this file's job is the one
-//! those cannot do alone -- run the whole simulation, with growth, death,
-//! mining, smelting, and item bundling all actually happening, and show the
-//! books balance, the same way `tests/determinism.rs` proves its own
-//! properties against a real `World::step` loop rather than a mock.
+//! run rather than only by construction. The action-recipe system's own
+//! pieces -- `race::ActionRecipe`, `World::apply_action_recipe`,
+//! `Entity.material`/`carried`/`items` -- are all covered by their own unit
+//! tests already; this file's job is the one those cannot do alone -- run
+//! the whole simulation, with growth, death, mining, smelting, and item
+//! bundling all actually happening, and show the books balance, the same
+//! way `tests/determinism.rs` proves its own properties against a real
+//! `World::step` loop rather than a mock.
 //!
 //! A raw before/after equality per element would trivially fail the moment
 //! any conversion fires -- that is the whole point of a conversion, moving
 //! mass from one element's ledger to another's. So this test computes the
 //! *expected* per-element delta by replicating, from the outside, the exact
-//! arithmetic the two conversions in play use internally (the coupled
-//! deposit/consume conversion, `terrain::apply_conversion`'s own doc
-//! comment, and smelting, `World::smelt`'s), then asserts the observed delta
-//! matches it exactly, element by element.
+//! arithmetic the mechanisms in play use internally (`Exist`'s per-entity
+//! habitat draw -- see `race.rs`'s module doc -- and `Smelt`'s carried-stock
+//! conversion), then asserts the observed delta matches it exactly, element
+//! by element.
 //!
 //! One mechanism is deliberately neutralised for this run, flagged in its
 //! own comment below rather than silently avoided:
@@ -24,9 +25,9 @@
 //!   eat" -- prey's entire `material` transfers to the predator's, in full),
 //!   but reconstructing *which* pairs would match this tick from outside
 //!   `World::phase_feeding` would mean duplicating its own matching logic
-//!   rather than testing against it. Growth-via-conversion, natural/
-//!   starvation death, mining, smelting, and item bundling/breaking are all
-//!   still fully live and exercised below.
+//!   rather than testing against it. Growth-via-`Exist`, natural/starvation
+//!   death, mining, smelting, and item bundling/breaking are all still
+//!   fully live and exercised below.
 //!
 //! An always-on, per-cell, population-independent terrain influx mechanism
 //! used to be a second, genuinely exogenous source term here -- material
@@ -40,16 +41,17 @@ use pentagram::element::{Element, PerElement};
 use pentagram::entity::Item;
 use pentagram::fx::{Fx, V2};
 use pentagram::input::{CmdKind, Command, InputLog};
-use pentagram::race::{Kind, PerRace, Race, TERRAIN_PERIOD};
-use pentagram::world::{SMELT_RATIO_IN, SMELT_RATIO_OUT};
+use pentagram::race::{ActionSlot, Kind, PerRace, Race, RateLaw, TERRAIN_PERIOD};
 use pentagram::{EcologyTuning, World};
 
 /// Every pool Invariant VIII's ledger actually covers, summed per element:
 /// terrain stock, every living body's own held material, everything it
-/// carries of other elements, and every item it holds. A transfer between
-/// any two of these pools (mining, death, predation, make/break-item) is
-/// arithmetically invisible to this sum by construction -- it only moves
-/// within it -- so only an actual ring-conversion can change one of these
+/// carries of other elements, every item it holds, and every item lying on
+/// the ground independent of any entity (`World::ground_items`, populated by
+/// `charge_death`'s item split). A transfer between any two of these pools
+/// (mining, death, predation, make/break-item, pickup) is arithmetically
+/// invisible to this sum by construction -- it only moves within it -- so
+/// only an actual conversion (`Exist`, `Smelt`) can change one of these
 /// per-element totals.
 fn total_material(w: &World) -> PerElement<u64> {
     let mut total = PerElement::filled(0u64);
@@ -68,6 +70,9 @@ fn total_material(w: &World) -> PerElement<u64> {
             total[item.element] += item.quantity;
         }
     }
+    for g in &w.ground_items {
+        total[g.element] += g.quantity;
+    }
     total
 }
 
@@ -80,20 +85,15 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
     // Seed every element generously across the whole grid -- World::new only
     // seeds Earth (GENESIS_EARTH), so without this there is nothing of any
     // other element to mine, and (more importantly for the accounting
-    // below) every race's
-    // habitat draw would be starved at the start of an otherwise-ordinary
-    // run. `terrain::apply_conversion` correctly caps a race's produced
-    // output at whatever its occupied cells actually hold (a real,
-    // freshly-fixed edge case -- see `apply_conversion`'s own doc comment
-    // and `terrain::tests::apply_conversion_caps_production_at_the_actual_
-    // available_habitat_stock`), but replicating *that* cap from outside
-    // `Occupancy`'s private cell weighting is its own separate test, not
-    // this one. This run stays deliberately clear of the cap entirely: 20
-    // 000 per cell per element is far beyond any race's governed
-    // per-settlement ceiling (at most a few thousand, even summed across
-    // this run's three settlements), so every conversion here always gets
-    // exactly what it asks for, and the simple external replication below
-    // matches `apply_conversion`'s arithmetic exactly.
+    // below) every race's `Exist` habitat draw would be starved at the
+    // start of an otherwise-ordinary run. `apply_action_recipe` correctly
+    // caps a firing at whatever the entity's own cell actually holds, but
+    // this run stays deliberately clear of that cap entirely: 20 000 per
+    // cell per element is far beyond any shipped `Exist`/`Mine`/`Smelt`
+    // recipe's per-firing rate (at most a couple thousand), so every
+    // conversion here always gets exactly what it asks for, and the simple
+    // external replication below matches `apply_action_recipe`'s arithmetic
+    // exactly.
     for y in 0..24i32 {
         for x in 0..24i32 {
             for e in Element::ALL {
@@ -110,8 +110,7 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
     w.seed_population(3);
 
     let mut log = InputLog::new();
-    // Wood-Animal mines Water three times (mining_rate=40/race, well under
-    // the seeded 40 000).
+    // Wood-Animal mines Water three times (well under the seeded 20 000).
     for t in [5u64, 6, 7] {
         log.push(Command { tick: t, entity: wood_animal, kind: CmdKind::Mine { element: Element::Water } });
     }
@@ -144,38 +143,56 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
     for t in 0..ticks {
         if t == 40 {
             // `phase_commands` runs first inside `step`, so this is exactly
-            // the carried stock the scripted Smelt command below is about to
-            // see -- replicate `World::smelt`'s own batch arithmetic (its
-            // own doc comment) to know the exact expected cross-element
-            // delta rather than merely that one exists.
+            // the carried stock the scripted Smelt command below is about
+            // to see -- replicate `World::apply_action_recipe`'s own batch
+            // arithmetic against Wood-Animal's shipped `Smelt` recipe, so
+            // the exact expected cross-element delta is known rather than
+            // merely that one exists.
             let idx = w.entities.iter().position(|e| e.id == wood_animal).expect("wood_animal still alive at tick 40");
             let have = w.entities[idx].carried[Element::Water];
-            let batches = have / SMELT_RATIO_IN;
-            let produced = batches * SMELT_RATIO_OUT;
+            let smelt = w.races[Race { element: Element::Wood, kind: Kind::Animal }].action(ActionSlot::Smelt).unwrap();
+            let batches = have / smelt.ratio_in as u64;
+            let produced = batches * smelt.ratio_out as u64;
             expected_delta[Element::Water] -= produced as i64;
             expected_delta[Element::Water.generates()] += produced as i64;
         }
 
         w.step(&log);
 
-        // A terrain tick just settled and `apply_conversion` ran inside this
-        // same `step` call -- `last_consume` is this tick's freshly granted
-        // habitat draw per race. Replicate `apply_conversion`'s own
-        // documented arithmetic exactly (batches = N / ratio_in, produced =
-        // batches * ratio_out, net habitat removed = produced) so the
-        // expected delta is exact rather than approximate.
+        // A terrain tick just settled and every living entity's `Exist`
+        // recipe (if it has one) just fired inside this same `step` call,
+        // once per body, at whatever cell it occupies -- see
+        // `World::phase_terrain`. Genesis-seeding every cell far above any
+        // recipe's per-firing rate (this test's own setup above) means no
+        // firing is ever capped by actual stock, so the exact count of
+        // currently-living bodies per race (observable right now, since
+        // `phase_reap` -- which runs after `phase_terrain` in the same
+        // `step` -- only removes bodies, never changes who was alive when
+        // `Exist` fired) is enough to replicate the aggregate delta exactly,
+        // with no need to track individual positions.
         if w.tick % TERRAIN_PERIOD == 0 && w.tick > 0 {
+            let mut living: PerRace<u64> = PerRace::filled(0);
+            for e in &w.entities {
+                if e.alive {
+                    *living.get_mut(e.race()) += 1;
+                }
+            }
             for race in Race::ALL {
-                let n = w.last_consume[race].granted;
+                let n = living[race];
                 if n == 0 {
                     continue;
                 }
-                let conv = w.races[race].conversion;
-                let batches = n / conv.ratio_in as u64;
-                let produced = batches * conv.ratio_out as u64;
-                if produced == 0 {
+                let Some(exist) = w.races[race].action(ActionSlot::Exist) else { continue };
+                let rate = match exist.rate {
+                    RateLaw::Flat(r) => r as u64,
+                    RateLaw::NeighborScaled { .. } => panic!("test assumes every shipped Exist recipe is Flat"),
+                };
+                let batches_per_body = rate / exist.ratio_in as u64;
+                let produced_per_body = batches_per_body * exist.ratio_out as u64;
+                if produced_per_body == 0 {
                     continue;
                 }
+                let produced = produced_per_body * n;
                 expected_delta[race.element.habitat()] -= produced as i64;
                 expected_delta[race.element] += produced as i64;
             }
@@ -190,8 +207,8 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
         assert_eq!(
             observed,
             expected_delta[e],
-            "{}: observed delta {} != expected {} accounting for every ring-conversion this run \
-             (coupled deposit/consume conversion plus smelting)",
+            "{}: observed delta {} != expected {} accounting for every conversion this run \
+             (per-entity Exist draws plus smelting)",
             e.name(),
             observed,
             expected_delta[e]
@@ -200,7 +217,7 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
             any_conversion = true;
         }
     }
-    assert!(any_conversion, "test is vacuous -- no ring-conversion actually fired during the run");
+    assert!(any_conversion, "test is vacuous -- no conversion actually fired during the run");
 
     // Every mechanism active in this run is either a same-element transfer
     // (invisible to `total_material`'s per-element sum by construction) or a
@@ -245,28 +262,25 @@ fn material_is_conserved_across_growth_death_mining_smelting_and_items() {
 ///   `carried`/`items`, so bug 1's fix is exercised on the predation death
 ///   path too, not just the natural-death path above.
 ///
-/// Unlike the primary test, terrain is left entirely unseeded (all zero), so
-/// `apply_conversion`'s ring-conversion never has any habitat stock to draw
-/// from and never actually produces anything
-/// (`terrain::apply_conversion`'s own doc comment: production is capped at
-/// what a race's occupied cells actually hold), and `World::smelt` is never
-/// invoked -- both are structurally neutralised, not just left unexercised.
+/// This run is only 10 ticks -- nowhere near a terrain-tick boundary
+/// (`TERRAIN_PERIOD` = 100) -- so `phase_terrain` (and therefore every
+/// shipped race's `Exist` recipe, whatever habitat stock genesis seeding
+/// gave it) never fires at all, and `World::smelt` is never invoked either.
 /// So the *only* mechanism in this run that ever moves a unit between two
 /// different elements' `total_material` buckets is the predation chain's own
 /// material transfer -- predation retypes a killed body's material to its
 /// predator's own element (`Entity.material`'s own doc comment: "you are
 /// what you eat"), so unlike natural death's carried/items (which fall to
-/// terrain at their own unchanged element and are therefore invisible to the
-/// per-element sums), a predation chain's material really does move mass
-/// from the prey's element bucket to the predator's. `expected_delta` below
-/// is that one exact, hand-computed transfer -- Fire and Earth each lose
-/// exactly what Z and Y started with, Metal gains exactly their sum -- the
-/// same discipline the primary test above uses for its own ring-conversions.
-/// A bug-5-style misrouted chain would show up here as a wrong per-element
-/// delta even though the *grand* total across all five elements would still
-/// balance (misrouted mass is still mass, just typed wrong) -- which is
-/// exactly why this checks every element individually, not only the grand
-/// total.
+/// terrain, or into `World::ground_items` for bundled items, at their own
+/// unchanged element and are therefore invisible to the per-element sums), a
+/// predation chain's material really does move mass from the prey's element
+/// bucket to the predator's. `expected_delta` below is that one exact,
+/// hand-computed transfer -- Fire and Earth each lose exactly what Z and Y
+/// started with, Metal gains exactly their sum. A bug-5-style misrouted
+/// chain would show up here as a wrong per-element delta even though the
+/// *grand* total across all five elements would still balance (misrouted
+/// mass is still mass, just typed wrong) -- which is exactly why this checks
+/// every element individually, not only the grand total.
 #[test]
 fn material_is_conserved_through_a_natural_death_and_a_predation_chain() {
     let mut w = World::new(0xDEAD, 24);
@@ -339,7 +353,8 @@ fn material_is_conserved_through_a_natural_death_and_a_predation_chain() {
 
     // The old-age death and the predation chain both resolve on tick 0; run
     // a little further so `phase_reap` has unambiguously run and nothing is
-    // left half-applied.
+    // left half-applied. Well short of a terrain-tick boundary (see this
+    // test's own doc comment) -- `Exist`/`Smelt` never fire in this window.
     for _ in 0..10 {
         w.step(&empty_log);
     }

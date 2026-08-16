@@ -174,7 +174,7 @@ impl App {
     fn restart(&mut self, seed: u64) {
         self.seed = seed;
         self.w = World::new(seed, self.size);
-        self.w.retune(self.t.races);
+        self.w.retune(self.t.races.clone());
         self.w.retune_terrain(self.t.terrain);
         self.w.retune_ecology(self.t.ecology);
         self.w.retune_behavior(self.t.behavior);
@@ -207,7 +207,7 @@ impl App {
 
         // The knobs are the authority; push them at the world every frame,
         // same as the terminal client's main loop.
-        self.w.retune(self.t.races);
+        self.w.retune(self.t.races.clone());
         self.w.retune_terrain(self.t.terrain);
         self.w.retune_ecology(self.t.ecology);
         self.w.retune_behavior(self.t.behavior);

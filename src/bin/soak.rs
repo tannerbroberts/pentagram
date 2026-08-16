@@ -8,7 +8,7 @@
 // crate-wide lint is what made this exception visible, which is the point.
 #![allow(clippy::float_arithmetic)]
 
-use pentagram::race::{attrs, Race, TERRAIN_PERIOD};
+use pentagram::race::{attrs, ActionSlot, Race, RateLaw, TERRAIN_PERIOD};
 use pentagram::replay::{build, scripted_log};
 
 fn main() {
@@ -37,33 +37,31 @@ fn main() {
         w.stats.births, w.stats.deaths, w.stats.collisions, w.stats.actions
     );
 
-    println!(
-        "\n{:<14} {:>5} {:>9} {:>9} {:>9} {:>8} {:>9}",
-        "race", "alive", "granted", "floor", "ceiling", "forced", "clipped"
-    );
-    println!("{}", "-".repeat(70));
+    println!("\n{:<14} {:>5} {:>10} {:>10} {:>10}", "race", "alive", "exist rate", "ratio in", "ratio out");
+    println!("{}", "-".repeat(60));
 
     // `population()` aggregates by element across both kinds — S3.1 has no
     // per-kind population split yet — so the alive count printed here is
     // shared between a race's Plant and Animal row.
     let pop = w.population();
     for race in Race::ALL {
-        // Invariant VIII: deposit's own governor/band is retired (see
-        // `race::Conversion`'s doc comment) — this table now reports the
-        // one remaining governor, which gates the habitat draw the
-        // conversion runs on.
-        let b = attrs(race).consume;
-        let g = w.last_consume[race];
+        // Action-recipe system: there is no more population-aggregate
+        // governor to report (retired along with `race::Conversion`) — this
+        // table reports the per-entity `Exist` recipe every race's own
+        // existence dispatches through instead.
+        let exist = w.races[race].action(ActionSlot::Exist);
+        let rate = exist.map_or(0, |a| match a.rate {
+            RateLaw::Flat(n) => n as i64,
+            RateLaw::NeighborScaled { base, .. } => base as i64,
+        });
         println!(
-            "{:<7}-{:<6} {:>5} {:>9} {:>9} {:>9} {:>8} {:>9}",
+            "{:<7}-{:<6} {:>5} {:>10} {:>10} {:>10}",
             race.element.name(),
             race.kind.name(),
             pop[race.element],
-            g.granted,
-            b.floor,
-            b.ceiling,
-            g.forced,
-            g.clipped
+            rate,
+            exist.map_or(0, |a| a.ratio_in),
+            exist.map_or(0, |a| a.ratio_out),
         );
     }
 
@@ -71,12 +69,11 @@ fn main() {
     for race in Race::ALL {
         let a = attrs(race);
         println!(
-            "  {:<6}-{:<6} {:>9} ticks  ({:>6} sim-min)   pressure {:>5}",
+            "  {:<6}-{:<6} {:>9} ticks  ({:>6} sim-min)",
             race.element.name(),
             race.kind.name(),
             a.lifespan,
             a.lifespan / TERRAIN_PERIOD,
-            a.terraform_pressure()
         );
     }
 

@@ -34,7 +34,7 @@ use pentagram::ecology::PropagationTuning;
 use pentagram::element::Element;
 use pentagram::fx::{Fx, V2};
 use pentagram::input::{CmdKind, Command, InputLog};
-use pentagram::race::{Kind, PerRace, Race, RACES, TERRAIN_PERIOD};
+use pentagram::race::{Kind, PerRace, Race, TERRAIN_PERIOD};
 use pentagram::rand::{rand_below, rand_signed, Channel};
 use pentagram::world::World;
 
@@ -174,7 +174,7 @@ fn main() {
         // The knobs are the authority; push them at the world every frame. It
         // is a handful of small copies, so there is no point being clever
         // about when — a terrain edit shows up on the very next frame.
-        w.retune(t.races);
+        w.retune(t.races.clone());
         w.retune_terrain(t.terrain);
         w.retune_ecology(t.ecology);
         w.retune_behavior(t.behavior);
@@ -321,7 +321,7 @@ fn handle(
         }
         Key::Char('R') => {
             *t = Tuning {
-                races: RACES,
+                races: pentagram::race::seeded_races(),
                 restock: t.restock,
                 terrain: pentagram::terrain::TerrainTuning::default(),
                 ecology: pentagram::ecology::EcologyTuning::default(),
@@ -333,7 +333,7 @@ fn handle(
         }
         Key::Char('z') => {
             *w = World::new(seed, size);
-            w.retune(t.races);
+            w.retune(t.races.clone());
             w.retune_terrain(t.terrain);
             w.retune_ecology(t.ecology);
             w.retune_behavior(t.behavior);
