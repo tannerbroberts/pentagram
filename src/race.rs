@@ -290,6 +290,15 @@ pub struct ActionRecipe {
     /// (`Pickup`); ignored otherwise — conventionally `0` on every other
     /// recipe.
     pub reach: i32,
+    /// Opt-in: when set, `World::apply_action_recipe` scales this firing's
+    /// `requested` amount by `ecology::vitality_scale(entity.hunger,
+    /// ecology.satiation[element])` — the same continuous hunger-nerf
+    /// primitive `World::phase_feeding`'s hunting edge uses, generalized to
+    /// any recipe rather than wired only into predation. `false` on every
+    /// shipped recipe (zero behavior change to the shipped table) — a
+    /// tunable available for whichever race/action the live-tuning loop
+    /// wants to experiment with next, not a claim any of them need it today.
+    pub vitality_scaled: bool,
 }
 
 impl ActionRecipe {
@@ -314,7 +323,7 @@ impl Hashable for ActionRecipe {
                 h.u8(1).u16(base).u16(per_neighbor).u16(per_size);
             }
         }
-        h.u16(self.cooldown_ticks).i32(self.reach);
+        h.u16(self.cooldown_ticks).i32(self.reach).bool(self.vitality_scaled);
     }
 }
 
@@ -559,6 +568,7 @@ fn seed_actions(mut a: RaceAttrs) -> RaceAttrs {
         rate: RateLaw::Flat(nominal),
         cooldown_ticks: 0,
         reach: 0,
+        vitality_scaled: false,
     });
     if a.kind == Kind::Animal {
         a.actions.push(ActionRecipe {
@@ -571,6 +581,7 @@ fn seed_actions(mut a: RaceAttrs) -> RaceAttrs {
             rate: RateLaw::Flat(40), // first-guess, uniform across every Animal row
             cooldown_ticks: 0,
             reach: 0,
+            vitality_scaled: false,
         });
         a.actions.push(ActionRecipe {
             slot: ActionSlot::Smelt,
@@ -582,6 +593,7 @@ fn seed_actions(mut a: RaceAttrs) -> RaceAttrs {
             rate: RateLaw::Flat(u16::MAX), // "convert everything held" — see caveat in RaceAttrs::action's callers
             cooldown_ticks: 0,
             reach: 0,
+            vitality_scaled: false,
         });
     }
     a

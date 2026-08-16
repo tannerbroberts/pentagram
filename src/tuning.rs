@@ -574,7 +574,8 @@ fn action_recipe_src(a: &ActionRecipe) -> String {
     format!(
         "ActionRecipe {{ slot: ActionSlot::{:?}, input: RecipeSlot::{:?}, output: RecipeSlot::{:?}, \
          transform: ElementTransform::{:?}, ratio_in: {}, ratio_out: {}, rate: {}, cooldown_ticks: {}, \
-         reach: {} }}",
+         reach: {}, vitality_scaled: {} }}",
         a.slot, a.input, a.output, a.transform, a.ratio_in, a.ratio_out, rate, a.cooldown_ticks, a.reach,
+        a.vitality_scaled,
     )
 }

@@ -209,6 +209,29 @@ impl Hashable for EcologyTuning {
     }
 }
 
+/// A body's current potential, in permille, as a continuous function of how
+/// far its `hunger` is toward `satiation` — the generalized replacement for
+/// a hard `hunger < satiation` gate. Ramps linearly from `0` at `hunger ==
+/// 0` up to `1000` (full potential) once `hunger` reaches `satiation`, and
+/// stays flat at `1000` beyond it — so a body is never hard-denied an
+/// attempt purely for being under-satiated, it is only ever *nerfed*.
+/// `satiation == 0` (no gate configured for this element) returns `1000`
+/// unconditionally, matching the old hard gate's own degenerate case
+/// (`hunger < 0` is never true for a `u32`, so it always passed too).
+///
+/// Used directly by `World::phase_feeding`'s Animal-prey (hunting) edge —
+/// see that call site's own comment for why grazing (Plant prey) keeps its
+/// unrelated hard gate — and available generically to any `ActionRecipe`
+/// via its `vitality_scaled` flag (`race.rs`), so this is one shared,
+/// tunable primitive rather than a bespoke formula wired only into hunting.
+#[inline]
+pub fn vitality_scale(hunger: u32, satiation: u32) -> u16 {
+    if satiation == 0 {
+        return 1000;
+    }
+    ((hunger.min(satiation) as u64 * 1000) / satiation as u64) as u16
+}
+
 /// Operator 3 of `phase_terrain`, in `ecology.rs` not `terrain.rs`: terrain
 /// is read, never written, and only living bodies are affected. A body of
 /// element `e` takes hp damage proportional to the terrain concentration of

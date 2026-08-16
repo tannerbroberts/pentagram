@@ -355,6 +355,16 @@ impl World {
                 .saturating_add((per_neighbor as u64).saturating_mul(neighbors.saturating_sub(1) as u64))
                 .saturating_add((per_size as u64).saturating_mul(size as u64) / 1000),
         };
+        // Opt-in (`ActionRecipe.vitality_scaled`, off for every shipped
+        // recipe): the same continuous hunger-nerf primitive
+        // `phase_feeding`'s hunting edge uses, generalized to any recipe.
+        let requested = if recipe.vitality_scaled {
+            let hunger = self.entities[i].hunger;
+            let scale = crate::ecology::vitality_scale(hunger, self.ecology.satiation[element]);
+            requested * scale as u64 / 1000
+        } else {
+            requested
+        };
 
         let have = self.recipe_stock(i, recipe.input, element, recipe.reach);
         let batches = requested.min(have) / recipe.ratio_in as u64;
@@ -790,22 +800,25 @@ impl World {
         }
     }
 
-    /// 4 — feeding (S2). A body whose `hunger` has reached `ecology.satiation`
-    /// and which is within `ecology.forage_radius` of prey it can pair
-    /// against consumes it outright: the prey dies exactly as it would from
-    /// age or starvation (`charge_death`), and the predator's `hp` rises and
-    /// fires `OnConsume` — the channel every race's deposit/consume mix has
-    /// carried a nonzero share for since Stage 0, with nothing to fire it
-    /// until now. Pairing is now split by prey Kind (S3.8): an Animal grazes
-    /// a same-element Plant (`Element::eats_plant`, the Kind-sibling's
-    /// product) or hunts a ring-adjacent Animal (`Element::eats_animal`, the
-    /// original ring relation) — a Plant is never a predator either way. A
-    /// meal that carries a body's `hp` up across `repro_threshold` spawns one
-    /// offspring through the ordinary `World::spawn` path, so it charges
-    /// `OnBirth` the same way a command-spawned or seeded body always has.
-    /// Without the `satiation` gate every predator in reach eats every
-    /// single tick it can, which empirically collapses every prey
-    /// population within a few hundred ticks. The shipped `EcologyTuning`
+    /// 4 — feeding (S2). A body within `ecology.forage_radius` of prey it can
+    /// pair against consumes it outright: the prey dies exactly as it would
+    /// from age or starvation (`charge_death`), and the predator's `hp`
+    /// rises and fires `OnConsume` — the channel every race's deposit/
+    /// consume mix has carried a nonzero share for since Stage 0, with
+    /// nothing to fire it until now. Pairing is now split by prey Kind
+    /// (S3.8): an Animal grazes a same-element Plant (`Element::eats_plant`,
+    /// the Kind-sibling's product) — gated by `hunger >= ecology.satiation`,
+    /// a hard gate — or hunts a ring-adjacent Animal (`Element::eats_animal`,
+    /// the original ring relation) — no hard satiation gate, `hunger`
+    /// instead continuously nerfs the hunt-weight roll via
+    /// `ecology::vitality_scale` (see this function body's own comment) — a
+    /// Plant is never a predator either way. A meal that carries a body's
+    /// `hp` up across `repro_threshold` spawns one offspring through the
+    /// ordinary `World::spawn` path, so it charges `OnBirth` the same way a
+    /// command-spawned or seeded body always has. Without grazing's
+    /// `satiation` gate every predator in reach eats every single tick it
+    /// can, which empirically collapses every prey population within a few
+    /// hundred ticks. The shipped `EcologyTuning`
     /// defaults are, like `TerrainTuning`'s before it, a first guess for the
     /// live tuning loop — a uniform five-way
     /// predation ring is a hard balance problem, and nothing here promises
@@ -903,37 +916,45 @@ impl World {
                 if eaten[pred] || eaten[prey] || fed[pred] {
                     continue;
                 }
-                // Satiation, not an `hp`-below-max gate: a predator that just
-                // ate ignores further prey in reach until `hunger` has built
-                // back up. Gating on `hp < MAX_HP` instead would deadlock the
-                // whole ring — every body spawns below the cap on purpose
-                // (`Entity::spawn`), but would still only need one meal to
-                // top out, after which it stops hunting even though
-                // `hunger` (ticks since last meal) has reset to zero and
-                // prey is still plentiful.
                 let pred_el = self.entities[pred].element;
-                if self.entities[pred].hunger < ecology.satiation[pred_el] {
-                    continue;
-                }
                 let d = chebyshev_dist(self.entities[prey].pos, self.entities[pred].pos);
                 let reach = ecology.forage_radius[pred_el];
                 if d > reach {
                     continue;
                 }
-                // S3.3: the final, kind-specific gate. Grazing (Plant prey) is
-                // unconditional; hunting (Animal prey) additionally needs a
-                // per-race hunt-weight roll to succeed. Rolled on
-                // (seed, tick, predator id) only — never on prey id — so the
-                // result is the same no matter which prey candidate this
-                // predator is being tested against this tick (required so a
-                // future Hunt-drive steering pass, S3.4, can agree with this
-                // phase about which prey class a predator will actually take).
+                // S3.3, generalized: grazing (Plant prey) keeps its original
+                // satiation gate — not an `hp`-below-max gate: a predator
+                // that just ate ignores further prey in reach until
+                // `hunger` has built back up. Gating on `hp < MAX_HP`
+                // instead would deadlock the whole ring — every body spawns
+                // below the cap on purpose (`Entity::spawn`), but would
+                // still only need one meal to top out, after which it stops
+                // hunting even though `hunger` (ticks since last meal) has
+                // reset to zero and prey is still plentiful.
+                //
+                // Hunting (Animal prey) no longer hard-gates on satiation at
+                // all — a body is never denied an attempt purely for being
+                // under-satiated, only nerfed: `hunt_weight`'s roll is
+                // scaled by `ecology::vitality_scale`, which ramps
+                // continuously from 0 at `hunger == 0` up to `hunt_weight`'s
+                // full value once `hunger` reaches `satiation`, exactly
+                // matching the old gate's effective behavior at and above
+                // the threshold while softening the hard wall below it.
+                // Rolled on (seed, tick, predator id) only — never on prey
+                // id — so the result is the same no matter which prey
+                // candidate this predator is being tested against this tick
+                // (required so a future Hunt-drive steering pass, S3.4, can
+                // agree with this phase about which prey class a predator
+                // will actually take).
                 if self.entities[prey].kind == Kind::Animal {
                     let pred_race = self.entities[pred].race();
-                    let weight = ecology.hunt_weight[pred_race] as u32;
+                    let scale = crate::ecology::vitality_scale(self.entities[pred].hunger, ecology.satiation[pred_el]);
+                    let weight = (ecology.hunt_weight[pred_race] as u32 * scale as u32) / 1000;
                     if !rand_chance(self.seed, self.tick, self.entities[pred].id, Channel::Hunt, weight, 1000) {
                         continue;
                     }
+                } else if self.entities[pred].hunger < ecology.satiation[pred_el] {
+                    continue;
                 }
                 eaten[prey] = true;
                 fed[pred] = true;
