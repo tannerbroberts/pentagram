@@ -1,10 +1,9 @@
 //! Bounded churn — the guarantee that makes terrain forecastable.
 //!
 //! Player behaviour decides *where* the world changes and *through which
-//! channel*. It does not decide *how fast*. Every race's material conversion
-//! (see `race::Conversion`, `terrain::apply_conversion`) passes through a
-//! governor that enforces two properties, per terrain tick, per race, per
-//! territory:
+//! channel*. It does not decide *how fast*. A bounded aggregate rate (e.g.
+//! `TerrainTuning::ground_decay`) passes through a governor that enforces
+//! two properties, per terrain tick, per territory:
 //!
 //!   1. **Never above the ceiling.** No amount of coordination, exploitation,
 //!      or population spike moves more terrain in one tick than this.
@@ -144,8 +143,6 @@ impl Hashable for Grant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::element::Element;
-    use crate::race::{attrs, Kind, Race};
 
     fn band() -> RateBand {
         RateBand::new(100, 1000, 5000, 10)
@@ -282,33 +279,27 @@ mod tests {
     }
 
     #[test]
-    fn every_shipped_race_band_survives_the_hostile_pattern() {
+    fn the_shipped_ground_decay_band_survives_the_hostile_pattern() {
+        // Every per-race `RateBand` (`RaceAttrs.consume`) was retired along
+        // with `race::Conversion` in the action-recipe migration; the one
+        // shipped `RateBand` left in the crate is `TerrainTuning::
+        // ground_decay`. Same hostile alternating-zero/max demand pattern
+        // this test always used, now run against that band instead of
+        // iterating every race's own.
         use crate::rand::{rand_below, Channel};
-        for kind in [Kind::Plant, Kind::Animal] {
-            for e in Element::ALL {
-                let race = Race { element: e, kind };
-                let a = attrs(race);
-                let b = a.consume;
-                let mut g = Governor::new(b);
-                for t in 0..5_000u64 {
-                    let demand = if rand_below(1, t, race.index() as u32, Channel::Governor, 3) == 0 {
-                        0
-                    } else {
-                        u64::from(u32::MAX)
-                    };
-                    let grant = g.settle(demand);
-                    assert!(
-                        grant.granted <= b.ceiling as u64 && grant.granted <= demand,
-                        "{}-{} tick {}: {} outside [0, {}] or exceeded demand {}",
-                        e.name(),
-                        kind.name(),
-                        t,
-                        grant.granted,
-                        b.ceiling,
-                        demand
-                    );
-                }
-            }
+        let b = crate::terrain::TerrainTuning::default().ground_decay;
+        let mut g = Governor::new(b);
+        for t in 0..5_000u64 {
+            let demand = if rand_below(1, t, 0, Channel::Governor, 3) == 0 { 0 } else { u64::from(u32::MAX) };
+            let grant = g.settle(demand);
+            assert!(
+                grant.granted <= b.ceiling as u64 && grant.granted <= demand,
+                "tick {}: {} outside [0, {}] or exceeded demand {}",
+                t,
+                grant.granted,
+                b.ceiling,
+                demand
+            );
         }
     }
 

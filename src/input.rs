@@ -28,11 +28,16 @@ pub const MAGIC: u32 = 0x5047_494C; // "PGIL"
 /// any existing tag (0/`SetHeading`, 1/`Spawn`, 2/`Kill` are all unchanged),
 /// so a v1 or v2 log is not just readable but fully hash-reproducing under
 /// v3 code too — there is nothing in an old log to reinterpret, since none of
-/// the new tags could ever appear in one. The version is still bumped rather
-/// than silently widening `VERSION`'s own meaning, so an *old* reader handed
-/// a *new* log (one that actually uses tags 3-6) fails fast with a clean
-/// `BadVersion` at the header instead of a confusing mid-stream `BadTag`.
-pub const VERSION: u32 = 3;
+/// the new tags could ever appear in one.
+///
+/// v4 (the generic action-recipe system) adds one more variant, `Pickup`
+/// (tag 7) — same story as v3: no existing tag's byte layout changes, so
+/// every v1/v2/v3 log stays fully readable *and* hash-reproducing under v4.
+/// The version is still bumped rather than silently widening `VERSION`'s own
+/// meaning, so an *old* reader handed a *new* log (one that actually uses a
+/// tag past what it knows) fails fast with a clean `BadVersion` at the
+/// header instead of a confusing mid-stream `BadTag`.
+pub const VERSION: u32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmdKind {
@@ -41,10 +46,11 @@ pub enum CmdKind {
     Spawn { element: Element, kind: Kind, at: V2 },
     Kill,
     /// Invariant VIII / items: an `Animal` (never a `Plant` — rooted bodies
-    /// don't mine) draws up to `RaceAttrs::mining_rate` units of `element`
-    /// out of the terrain cell it currently occupies, into its own
-    /// `Entity.carried` — a pure 1:1 transfer, capped by whatever the cell
-    /// actually holds (never more). See `World::mine`.
+    /// don't mine) draws up to this race's `Mine` `ActionRecipe`'s rate-law
+    /// amount of `element` out of the terrain cell it currently occupies,
+    /// into its own `Entity.carried` — a pure 1:1 transfer, capped by
+    /// whatever the cell actually holds (never more). See
+    /// `World::apply_action_recipe`.
     Mine { element: Element },
     /// Invariant VIII / items: an `Animal` converts whole batches of its own
     /// carried `element` into carried `element.generates()`, at the fixed
@@ -62,6 +68,12 @@ pub enum CmdKind {
     /// the breaking body's position, as the item's own element. See
     /// `World::break_item`.
     BreakItem { index: u32 },
+    /// Action-recipe system: proximity-gated pickup — draws up to this
+    /// race's `Pickup` `ActionRecipe`'s rate-law amount of `element` out of
+    /// `World::ground_items` within that recipe's `reach` of this body's
+    /// current position, into its own `Entity.carried`. See
+    /// `World::apply_action_recipe`.
+    Pickup { element: Element },
 }
 
 impl CmdKind {
@@ -75,6 +87,7 @@ impl CmdKind {
             CmdKind::Smelt { .. } => 4,
             CmdKind::MakeItem { .. } => 5,
             CmdKind::BreakItem { .. } => 6,
+            CmdKind::Pickup { .. } => 7,
         }
     }
 }
@@ -183,6 +196,9 @@ impl InputLog {
                 CmdKind::BreakItem { index } => {
                     out.extend_from_slice(&index.to_le_bytes());
                 }
+                CmdKind::Pickup { element } => {
+                    out.push(element as u8);
+                }
             }
         }
         out
@@ -196,10 +212,10 @@ impl InputLog {
         let v = r.u32()?;
         // v1 predates the `Kind` byte on `Spawn` — still readable, decoded
         // as `Kind::Animal` below, but not hash-reproducing against an S3
-        // world (see `VERSION`'s own doc comment). v2 and v3 (current) share
-        // an identical byte layout for every tag that existed in v2, so both
-        // are fully readable *and* hash-reproducing.
-        if v != VERSION && v != 1 && v != 2 {
+        // world (see `VERSION`'s own doc comment). v2/v3/v4 all share an
+        // identical byte layout for every tag that existed in v2, so all
+        // three are fully readable *and* hash-reproducing.
+        if v != VERSION && v != 1 && v != 2 && v != 3 {
             return Err(LogError::BadVersion(v));
         }
         let n = r.u64()? as usize;
@@ -233,6 +249,7 @@ impl InputLog {
                 4 => CmdKind::Smelt { element: r.element()? },
                 5 => CmdKind::MakeItem { element: r.element()?, quantity: r.u64()? },
                 6 => CmdKind::BreakItem { index: r.u32()? },
+                7 => CmdKind::Pickup { element: r.element()? },
                 t => return Err(LogError::BadTag(t)),
             };
             cmds.push(Command { tick, entity, kind: cmd_kind });
@@ -428,8 +445,8 @@ mod tests {
     fn a_v2_log_is_still_readable_under_v3() {
         // v2 predates Mine/Smelt/MakeItem/BreakItem, but none of the tags a
         // v2 log could ever contain (0/1/2) changed byte layout going to v3
-        // — a hand-built v2 header over an ordinary Kill command must still
-        // decode cleanly.
+        // (or v4) — a hand-built v2 header over an ordinary Kill command
+        // must still decode cleanly.
         let mut bytes = MAGIC.to_le_bytes().to_vec();
         bytes.extend_from_slice(&2u32.to_le_bytes()); // v2
         bytes.extend_from_slice(&1u64.to_le_bytes()); // one command
@@ -438,6 +455,19 @@ mod tests {
         bytes.push(CmdKind::Kill.tag());
         let log = InputLog::from_bytes(&bytes).expect("v2 log must still be readable under v3");
         assert_eq!(log.as_slice()[0].kind, CmdKind::Kill);
+    }
+
+    /// Action-recipe system: `Pickup` round-trips through bytes the same way
+    /// every other `CmdKind` does — a separate log from `sample()`/
+    /// `new_cmdkinds_round_trip()` so it doesn't disturb either's own pinned
+    /// assertions.
+    #[test]
+    fn pickup_round_trips() {
+        let mut l = InputLog::new();
+        l.push(Command { tick: 1, entity: 1, kind: CmdKind::Pickup { element: Element::Metal } });
+        l.finalize();
+        let back = InputLog::from_bytes(&l.to_bytes()).expect("round trip");
+        assert_eq!(back.as_slice(), l.as_slice());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! they failed quietly.
 
 use pentagram::input::InputLog;
-use pentagram::race::{attrs, Race, TERRAIN_PERIOD};
+use pentagram::race::TERRAIN_PERIOD;
 use pentagram::replay::{build, record, scripted_log, verify};
 
 const SEED: u64 = 0xC0FFEE;
@@ -76,48 +76,13 @@ fn stepping_in_two_halves_matches_stepping_straight_through() {
 }
 
 #[test]
-fn governors_hold_their_bands_across_a_long_run() {
-    // Invariant VII under real simulation load rather than synthetic demand.
-    // Invariant VIII retired the lower bound (see `governor.rs`'s module
-    // doc) -- a grant is bounded above by the ceiling only now, never
-    // guaranteed a floor.
-    let ticks = 20_000;
-    let log = scripted_log(0x55, ticks, PER_RACE * 10);
-    let mut w = build(SEED, SIZE, PER_RACE);
-    let mut settlements = 0u32;
-    for _ in 0..ticks {
-        w.step(&log);
-        if w.tick.is_multiple_of(TERRAIN_PERIOD) && w.tick > 0 {
-            settlements += 1;
-            for race in Race::ALL {
-                let band = attrs(race).consume;
-                let g = w.last_consume[race];
-                assert!(
-                    g.granted <= band.ceiling as u64,
-                    "{}-{} granted {} above ceiling {} at tick {}",
-                    race.element.name(),
-                    race.kind.name(),
-                    g.granted,
-                    band.ceiling,
-                    w.tick
-                );
-            }
-        }
-    }
-    assert!(settlements > 100, "only {settlements} settlements observed");
-}
-
-#[test]
-fn an_empty_server_stops_moving_its_own_terrain_but_stays_up() {
-    // Invariant VIII retires the old create-from-nothing floor (see
-    // `governor.rs`'s module doc): zero population means zero demand,
-    // forever, and every race is granted exactly zero -- not a floor,
-    // conservation has nothing to conjure one from. This replaces
-    // `the_world_keeps_churning_with_no_players_at_all`, which pinned down
-    // exactly the guarantee that's now retired; there is no conservative
-    // equivalent of "still churns," so this asserts the new behaviour in
-    // the same scenario. The world itself must still run without panicking
-    // -- an empty server does not crash, it just goes quiet.
+fn an_empty_server_stays_up_and_stays_empty() {
+    // Action-recipe migration: every action (including `Exist`) dispatches
+    // per living entity, so a zero-population server has nothing to
+    // dispatch at all -- there is no separate per-race governor/demand
+    // pipeline left whose "granted nothing" guarantee is worth asserting on
+    // its own. What's left worth checking here: the world runs a long
+    // stretch with zero population without panicking, and stays at zero.
     let ticks = TERRAIN_PERIOD * 50;
     let log = InputLog::new();
     let mut w = build(SEED, SIZE, 0);
@@ -125,14 +90,4 @@ fn an_empty_server_stops_moving_its_own_terrain_but_stays_up() {
         w.step(&log);
     }
     assert_eq!(w.alive_count(), 0);
-    for race in Race::ALL {
-        assert_eq!(
-            w.last_consume[race].granted,
-            0,
-            "{}-{} should be granted nothing on an empty server",
-            race.element.name(),
-            race.kind.name()
-        );
-        assert_eq!(w.last_consume[race].forced, 0, "forced is structurally always 0 now");
-    }
 }

@@ -1,53 +1,34 @@
 //! S1 — the terrain field.
 //!
-//! Five `u16` saturations per cell. `phase_terrain` in `world.rs` (run right
-//! after `phase_settle`) now runs a fixed four-slot sequence every terrain
-//! tick, but only two of those slots are terrain operators now — this file
-//! owns:
-//!
-//! ```text
-//!   1 conversion    6 diffusion
-//! ```
-//!
-//! **Invariant VIII update.** Slots 1 and 2 used to be independent `deposit`
-//! and `consume` operators, each spending its own separately governed
-//! budget — the deposit side able to write more of a race's own element than
-//! it had ever drawn from anywhere, i.e. conjuring matter. Under material
-//! conservation there is one coupled operator instead:
-//! [`apply_conversion`] reads a race's already-settled habitat draw and
-//! converts it, at the race's own fixed ratio, into its own element, split
-//! across background terrain deposit / the drawing bodies' own held
-//! material / explicit waste — see that function's own doc comment for the
-//! exact accounting. The slot count this file owns drops from four to
-//! three; `world.rs`'s `phase_terrain` doc comment carries the equivalent
-//! note for the *other* two (ecology's) slots.
+//! Five `u16` saturations per cell. `phase_terrain` in `world.rs` runs a
+//! fixed sequence every terrain tick; this file owns the two operators that
+//! act on terrain directly: bounded diffusion (below), and (as of the
+//! action-recipe migration) whatever a race's `Exist` `ActionRecipe` does at
+//! each living body's own cell — see `race.rs`'s module doc and
+//! `World::apply_action_recipe`. The population-wide, governor-gated
+//! `apply_conversion` operator this file used to own was retired along with
+//! `race::Conversion` — every write to terrain now happens either through a
+//! single body's own action (`Mine`/`Smelt`/`Pickup`/`Exist`, all through
+//! `apply_action_recipe`), a direct single-cell return (`deposit_at`, below —
+//! death, smelting tailings, item breakage, ground-item decay), or diffusion.
 //!
 //! Slots that used to be `ring` and `star` (terrain converting a permille of
 //! a cell's own stock into the next ring element, and terrain nullifying a
 //! permille of a cell's stock against its suppressor's — both ran every
 //! terrain tick with no entity involved at all, terrain acting on itself)
-//! are gone too, predating this change. The ring and star *relations* still
-//! matter, but they now read terrain and act on bodies instead of the other
-//! way around — `ecology.rs`'s `apply_attrition` (ring's relation,
+//! are gone too, predating both changes above. The ring and star *relations*
+//! still matter, but they now read terrain and act on bodies instead of the
+//! other way around — `ecology.rs`'s `apply_attrition` (ring's relation,
 //! `eaten_by()`, redirected to body hp) and `apply_suppression` (star's
 //! relation, `suppressed_by()`, redirected to body `hunger`) fill two slots
 //! in `phase_terrain`, gated at the same terrain-tick cadence. Terrain only
 //! changes because of what bodies do; it does not act on its own.
 //!
-//! The slot order is still a wire format exactly the way `World::step`'s
-//! phase order already is — reordering any two of these changes every
-//! recorded replay. See `docs/S1_TERRAIN_DESIGN.md` for the full design and
-//! the reasoning behind the order, the deposit/consume element mapping, and
-//! every other choice this file makes that the README's one-line S1 spec
-//! left open (predates Invariant VIII; read `apply_conversion`'s doc comment
-//! for what changed since).
-//!
-//! **Conversion writes `race.element` (self, the produced side) and removes
-//! `race.element.habitat()`** (same ring-backward math as `eats()`/
-//! `eats_animal()`, read here as terrain consumption rather than predation)
-//! — a Fire body's deposit is a scorch mark on the Fire layer, its draw
-//! burns down the Wood layer under it. This is this design's interpretive
-//! call, not a README fact (see the design doc §9.2).
+//! `World::phase_terrain`'s operator order is a wire format exactly the way
+//! `World::step`'s phase order already is — reordering any two changes every
+//! recorded replay. See `docs/S1_TERRAIN_DESIGN.md` for the original design
+//! (predates both Invariant VIII and the action-recipe migration; read
+//! `apportion`'s and `deposit_at`'s own doc comments for what's current).
 //!
 //! Diffusion is not per-cell — it reads neighbours — so it snapshots the
 //! *whole grid* into a scratch double-buffer before writing anything back.
@@ -61,9 +42,8 @@ use std::collections::BTreeMap;
 use crate::element::{Element, PerElement};
 use crate::entity::Entity;
 use crate::fx::V2;
-use crate::governor::Grant;
 use crate::hash::{Hashable, Hasher};
-use crate::race::{PerRace, Race, RaceAttrs};
+use crate::race::{PerRace, Race};
 use crate::rand::{rand_below, Channel};
 
 /// Element colours. The single definition — `tuning::RGB` re-exports this
@@ -85,7 +65,7 @@ pub const RGB: PerElement<(u8, u8, u8)> = PerElement([
 /// Every number here is a first guess, in the same spirit `race.rs`'s own
 /// header states of itself: a starting point for the tuning loop, not a
 /// derived constant.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct TerrainTuning {
     /// Permille of the concentration difference between two neighbouring
     /// cells that moves across that edge each terrain tick, before the flat
@@ -95,6 +75,12 @@ pub struct TerrainTuning {
     /// of Invariant I at S1: no matter how saturated a source cell is, one
     /// edge can never carry more than this in one terrain tick.
     pub diffuse_cap: PerElement<u16>,
+    /// Bounded per-terrain-tick budget (Invariant VII, same `Governor`-gated
+    /// pattern every other aggregate rate in this crate follows) for
+    /// `World::decay_ground_items` — how many total units of ground-dropped
+    /// material (`World::ground_items`) may return to terrain in one terrain
+    /// tick. A first-guess tunable, same spirit as every other number here.
+    pub ground_decay: crate::race::RateBand,
 }
 
 impl Default for TerrainTuning {
@@ -102,6 +88,7 @@ impl Default for TerrainTuning {
         TerrainTuning {
             diffuse_rate: PerElement::filled(200),
             diffuse_cap: PerElement::filled(40),
+            ground_decay: crate::race::RateBand::new(50, 200, 2000, 8),
         }
     }
 }
@@ -114,6 +101,7 @@ impl Hashable for TerrainTuning {
         for (_, v) in self.diffuse_cap.iter() {
             h.u16(*v);
         }
+        self.ground_decay.hash_into(h);
     }
 }
 
@@ -131,33 +119,24 @@ pub struct Terrain {
     /// 6). Allocated once at construction and never resized, so a terrain
     /// tick after the first does zero allocation for diffusion.
     scratch: Vec<PerElement<u16>>,
-    /// Invariant VIII (bug 2 fix, later widened for the `deposit_at` gap):
-    /// `apply_conversion`'s deposit/waste side writes to a race's occupied
-    /// cells via `apportion`, which saturates a cell rather than exceed
-    /// `u16::MAX` (Invariant II) — a cell already near the ceiling can
-    /// silently accept less than requested. Rather than let that shortfall
-    /// simply vanish, `apply_conversion` banks it here, per race and per
-    /// element, and retries it (added on top of that race's own next
-    /// deposit) every subsequent terrain tick until it fully lands.
-    /// Diffusion (operator 6, same tick, right after conversion) keeps
-    /// draining saturated cells toward their neighbours in the meantime, so
-    /// a banked shortfall is delayed, never stuck forever.
+    /// `deposit_at` (a single-cell material return — corpse decomposition,
+    /// smelting tailings, a broken item's quantity, ground-item decay)
+    /// saturates a cell rather than exceed `u16::MAX` (Invariant II) — a
+    /// cell already near the ceiling can silently accept less than
+    /// requested. Rather than let that shortfall simply vanish, `deposit_at`
+    /// banks it here, per race (attribution only — whose action produced the
+    /// deposit) and per element.
     ///
-    /// Per-element, not just per-race, because `apply_conversion` is not
-    /// this ledger's only writer: `deposit_at` (a single-cell material
-    /// return — corpse decomposition, smelting tailings, a broken item's
-    /// quantity) can saturate too, and unlike `apply_conversion` — which
-    /// only ever deposits a race into its own element's layer — a
-    /// `deposit_at` shortfall can be for *any* element a body happened to
-    /// be carrying or holding as an item, attributed to that body's own
-    /// race so it retries the same way, spread across that race's currently
-    /// occupied cells (or the extinct-race uniform fallback if none are
-    /// left alive), right alongside `apply_conversion`'s own retry. Indexed
-    /// `[race][element]`; the race's own element channel is what
-    /// `apply_conversion` reads/writes, every other channel is
-    /// `deposit_at`-only. Hashed like every other piece of terrain state
-    /// (Invariant VI) — two worlds that diverge only in banked overflow are
-    /// not actually in the same state.
+    /// **Known hole, not solved in this pass:** before the action-recipe
+    /// migration, `apply_conversion` retried a banked shortfall every
+    /// subsequent terrain tick until it fully landed. That retry loop was
+    /// retired along with `apply_conversion` itself — nothing in this crate
+    /// currently reads `overflow` back out to retry it, so a banked
+    /// shortfall now stays banked permanently rather than eventually
+    /// landing. See `deposit_at`'s own doc comment. Indexed `[race][element]`.
+    /// Hashed like every other piece of terrain state (Invariant VI) — two
+    /// worlds that diverge only in banked overflow are not actually in the
+    /// same state.
     overflow: PerRace<PerElement<u64>>,
 }
 
@@ -452,15 +431,16 @@ impl SpatialIndex {
 /// **not necessarily `total`**. Every per-cell write below saturates
 /// (`saturating_add`/`saturating_sub`, Invariant II's usual discipline), so
 /// a cell that is already near `u16::MAX` (add) or already low on `target`
-/// (subtract) can silently accept less than its computed share. Invariant
-/// VIII: `apply_conversion` depends on this return value being honest on
-/// *both* sides it calls this with — the habitat-drawdown (subtract) side,
-/// where crediting a race's produced output must track what was *really*
-/// removed from its habitat rather than what was merely requested (or a
-/// habitat layer running low would let that race manufacture output from
-/// stock it never actually had), and the deposit/waste (add) side, where a
-/// shortfall against an already-near-saturated target cell must be banked
-/// (`Terrain::overflow`) rather than silently dropped.
+/// (subtract) can silently accept less than its computed share.
+///
+/// **Currently unused in production** — its only caller, `apply_conversion`
+/// (the population-wide, territory-weighted habitat draw/deposit), was
+/// retired along with `race::Conversion` in the action-recipe migration; see
+/// that migration's "known holes" note on losing population-wide
+/// apportionment for the new per-entity `Exist` recipe. Kept, tested, and
+/// `#[allow(dead_code)]` rather than deleted: this is exactly the primitive
+/// a future revisit of that hole would reach for again.
+#[allow(dead_code)]
 fn apportion(
     terrain: &mut Terrain,
     target: Element,
@@ -556,173 +536,13 @@ fn apportion(
     applied
 }
 
-/// Operator 1 (Invariant VIII). Each race's already-settled
-/// `last_consume[r].granted` — the governed draw of `r.element.habitat()` —
-/// resolves through `r`'s [`crate::race::Conversion`] into units of
-/// `r.element` itself, apportioned across the same cells that race's living
-/// bodies currently occupy (same race-unique salt discipline `apportion`
-/// itself documents).
-///
-/// # The arithmetic, exactly
-///
-/// Let `N = last_consume[r].granted` (habitat units), `conv = races[r].conversion`.
-///
-/// - `batches = N / conv.ratio_in` (integer floor) — any remainder
-///   (`N % ratio_in`) does not fill a whole batch and is simply never drawn
-///   from terrain in the first place.
-/// - `produced = batches * conv.ratio_out` — units of `r.element` the
-///   governed demand *asks* the conversion to create.
-/// - Net habitat removed from terrain is `produced`, **not** `N` or
-///   `batches * ratio_in`: of every batch's `ratio_in` habitat units, only
-///   `ratio_out` ever leave net — the remaining `ratio_in - ratio_out` per
-///   batch are tailings that return to the very same habitat layer, at the
-///   very same cells, in the very same tick (Conversion's own doc comment
-///   explains why `ratio_out <= ratio_in` always). Writing that as "subtract
-///   `batches * ratio_in`, then add back `batches * (ratio_in - ratio_out)`"
-///   would apportion across cells identically in total but through two
-///   separate largest-remainder roundings; folding it into the single net
-///   subtraction below is simpler and reaches the same conserved total, so
-///   that is what this function does.
-/// - **What actually leaves the habitat layer can be less than `produced`.**
-///   `apportion` saturates per cell (Invariant II) and returns the amount it
-///   actually managed to remove, which is capped by whatever `r`'s occupied
-///   cells actually hold — a governed grant is a demand ceiling, not a
-///   promise that the physical stock is there to back it (the same
-///   "can't spend what isn't in the bucket" principle `World::mine` already
-///   applies to a single cell, here applied to a race's whole apportioned
-///   territory). This actual amount, not the requested `produced`, is what
-///   the rest of this function calls `produced` and splits three ways below
-///   — crediting the full governed request regardless of physical
-///   availability would manufacture `r.element` out of habitat the race
-///   never actually had, which is exactly the create-from-nothing failure
-///   Invariant VIII exists to close off.
-/// - `produced` (now the actual, stock-backed amount) then splits three ways
-///   per `conv`'s permille shares, remainder-corrected so the three parts
-///   sum to exactly `produced` (same drift-correction discipline
-///   `ChannelMix::set_rebalanced` uses): `deposit_amt`, `body_amt`,
-///   `waste_amt`.
-/// - `deposit_amt + waste_amt` (both `r.element`) apply to terrain via
-///   `apportion` — two different bookkeeping reasons landing on the same
-///   layer, at the same cells. This add-side `apportion` call saturates
-///   exactly like the habitat-drawdown call above, and its actual-applied
-///   return value is captured the same way: any shortfall (a race's
-///   occupied cells already near `u16::MAX`) is banked in
-///   `Terrain`'s per-race `overflow` and retried on top of that race's own
-///   deposit every subsequent tick, rather than silently discarded — see
-///   `Terrain::overflow`'s own doc comment.
-/// - `body_amt` cannot be applied here: `terrain.rs` does not own `Entity`
-///   state. It comes back out through this function's `PerRace<u64>`
-///   return value for `World` to credit onto each living body's own
-///   `Entity.material` (see `World::phase_terrain`/`credit_body_material`).
-///   **Exception:** if `r` currently has zero living bodies (occupancy is
-///   empty — e.g. its last body died earlier this same tick, still
-///   charging an `OnDeath` draw), there is nothing to credit; that share is
-///   folded into the terrain deposit instead, via the same
-///   extinct-race uniform-fallback `apportion` already provides, so it is
-///   never simply lost.
-pub fn apply_conversion(
-    terrain: &mut Terrain,
-    occ: &Occupancy,
-    races: &PerRace<RaceAttrs>,
-    last_consume: &PerRace<Grant>,
-    seed: u64,
-    terrain_tick: u64,
-) -> PerRace<u64> {
-    let mut body_share: PerRace<u64> = PerRace::filled(0);
-    for r in Race::ALL {
-        let n = last_consume[r].granted;
-        let conv = races[r].conversion;
-
-        // This tick's own production -- all zero if there is nothing to
-        // convert (`n == 0`, no whole batch fits, or the habitat side
-        // couldn't actually deliver any stock). Deliberately *not* an early
-        // `continue` on any of these anymore (bug 2 fix): a race with zero
-        // production this tick can still be sitting on a banked overflow
-        // shortfall from a previous tick, and that shortfall must get a
-        // chance to be retried below regardless of today's demand.
-        let (mut deposit_amt, mut body_amt, mut waste_amt) = (0u64, 0u64, 0u64);
-        if n > 0 && conv.ratio_in > 0 {
-            let batches = n / conv.ratio_in as u64;
-            if batches > 0 {
-                let requested = batches * conv.ratio_out as u64;
-                // Net habitat drawdown -- see the doc comment above for why
-                // this is `requested`, not `n` or `batches * ratio_in`.
-                // `produced` is whatever `apportion` actually managed to
-                // remove -- capped by the real stock at this race's
-                // occupied cells, never the requested amount unconditionally
-                // (see the doc comment's note on why this matters for
-                // conservation).
-                let produced =
-                    apportion(terrain, r.element.habitat(), requested, &occ.weight[r], seed, terrain_tick, false, r);
-                if produced > 0 {
-                    deposit_amt = produced * conv.deposit_share as u64 / 1000;
-                    body_amt = produced * conv.body_share as u64 / 1000;
-                    // Remainder, not a third independent multiply --
-                    // guarantees the three shares sum to exactly `produced`
-                    // regardless of permille rounding, same discipline
-                    // `ChannelMix::set_rebalanced` uses.
-                    waste_amt = produced - deposit_amt - body_amt;
-                }
-            }
-        }
-
-        let alive: u32 = occ.weight[r].values().sum();
-        let terrain_bound = if alive == 0 {
-            // No living body of this race exists right now to grow -- fold
-            // its share into the terrain deposit rather than lose it.
-            deposit_amt + waste_amt + body_amt
-        } else {
-            *body_share.get_mut(r) = body_amt;
-            deposit_amt + waste_amt
-        };
-
-        // Bug 2 fix: fold in whatever this race's deposit/waste side failed
-        // to land on a previous tick (banked in `terrain.overflow`) before
-        // asking `apportion` for this tick's amount, and capture what
-        // `apportion` actually managed to apply this time -- it saturates
-        // per cell (Invariant II) and can silently write less than
-        // requested when a race's occupied cells are already near
-        // `u16::MAX`. Whatever is still short after this attempt is
-        // re-banked for next tick rather than discarded.
-        let requested_terrain = terrain_bound + terrain.overflow[r][r.element];
-        if requested_terrain > 0 {
-            let applied = apportion(terrain, r.element, requested_terrain, &occ.weight[r], seed, terrain_tick, true, r);
-            *terrain.overflow.get_mut(r).get_mut(r.element) = requested_terrain - applied;
-        }
-
-        // `deposit_at` gap fix: this race may also be sitting on banked
-        // shortfalls from single-cell deposits (`World::charge_death`'s
-        // carried/items return, `World::smelt`'s tailings, `World::
-        // break_item`'s returned quantity) on element channels other than
-        // its own -- `apportion`'s own doc comment/this struct's `overflow`
-        // doc comment. Retry every such channel here too, spread across
-        // this race's currently occupied cells exactly like its own-element
-        // retry just above (or the extinct-race uniform fallback if none of
-        // its bodies are alive right now), rather than only ever retrying
-        // through `deposit_at` itself -- which would need occupancy it
-        // doesn't have access to.
-        for e in Element::ALL {
-            if e == r.element {
-                continue; // handled above, together with this tick's own production
-            }
-            let banked = terrain.overflow[r][e];
-            if banked == 0 {
-                continue;
-            }
-            let applied = apportion(terrain, e, banked, &occ.weight[r], seed, terrain_tick, true, r);
-            *terrain.overflow.get_mut(r).get_mut(e) = banked - applied;
-        }
-    }
-    body_share
-}
-
 /// A direct, single-cell material return — unlike [`apportion`], which
 /// spreads a race's aggregate grant across every cell its living bodies
 /// occupy, this writes to exactly the one cell a specific body's material
 /// actually returns to. Used by `World::charge_death` (a corpse decomposes
 /// where it fell, not smeared across a race's entire territory),
-/// `World::smelt` (tailings) and `World::break_item` (a broken item's
-/// quantity).
+/// `World::smelt` (tailings), `World::break_item` (a broken item's
+/// quantity), and `World::decay_ground_items`.
 ///
 /// `race` is the body whose action produced this deposit -- the dying
 /// entity in `charge_death`, the smelter in `smelt`, the item's owner in
@@ -732,14 +552,16 @@ pub fn apply_conversion(
 ///
 /// Saturates like every other terrain write (Invariant II): `amount` can
 /// exceed both `u16::MAX` outright and this cell's actual remaining
-/// headroom below it. Either way the shortfall is not silently discarded --
-/// it is banked in `Terrain::overflow[race][e]` (see that field's own doc
-/// comment) and retried by `apply_conversion` every subsequent terrain
-/// tick, spread across `race`'s currently occupied cells, until it fully
-/// lands. This is the same discipline `apportion` already uses for
-/// `apply_conversion`'s own deposit/waste side (the bug 2 fix) — a
-/// near-saturated single target cell is exactly the shape that discipline
-/// exists for.
+/// headroom below it. Either way the shortfall is not silently discarded
+/// outright -- it is banked in `Terrain::overflow[race][e]` (see that
+/// field's own doc comment). **Known hole, not solved in this pass:** the
+/// action-map migration retired `apply_conversion`, which used to be the
+/// only code that ever retried a banked shortfall back out of `overflow`
+/// every subsequent terrain tick. Nothing drains `overflow` anymore -- a
+/// shortfall banked here now stays banked permanently rather than
+/// eventually landing. Still correctly *counted* (material is not lost from
+/// the conservation ledger), but ecologically inert until something gives
+/// `overflow` a retry pass again.
 pub fn deposit_at(terrain: &mut Terrain, race: Race, e: Element, amount: u64, pos: V2) {
     if amount == 0 {
         return;
@@ -1006,10 +828,6 @@ mod tests {
     use super::*;
     use crate::race::Kind;
 
-    fn grant(granted: u64) -> Grant {
-        Grant { granted, forced: 0, clipped: 0 }
-    }
-
     fn animal(e: Element) -> Race {
         Race { element: e, kind: Kind::Animal }
     }
@@ -1175,177 +993,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_conversion_draws_habitat_and_splits_produced_material_into_deposit_body_and_waste() {
-        // Wood-Plant: ratio_in=1, ratio_out=1 (a lossless conversion — see
-        // `RACES`'s own doc comment for why this row is clamped there), split
-        // 650/300/50 deposit/body/waste. habitat() = Wood.eats() = Water, so
-        // this body draws down Water and deposits/wastes onto Wood.
-        let race = Race { element: Element::Wood, kind: Kind::Plant };
-        let mut t = Terrain::new(4);
-        t.cell_mut(1, 1)[Element::Water] = 10_000;
-        let entities = vec![Entity::spawn(
-            1,
-            Element::Wood,
-            V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
-            0,
-            0,
-            crate::race::attrs(race),
-        )];
-        let occ = Occupancy::build(&entities, &t);
-        let mut granted = PerRace::filled(grant(0));
-        granted[race] = grant(100);
-
-        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
-
-        assert_eq!(
-            t.cell(1, 1)[Element::Water],
-            10_000 - 100,
-            "habitat drawdown is the produced amount, 100 at this 1:1 ratio"
-        );
-        assert_eq!(t.total(Element::Wood), 65 + 5, "deposit_share (650‰) + waste_share (50‰) of the 100 produced");
-        assert_eq!(*body_share.get(race), 30, "body_share (300‰) of the 100 produced, returned for World to credit");
-        for e in Element::ALL {
-            if e != Element::Water && e != Element::Wood {
-                assert_eq!(t.total(e), 0);
-            }
-        }
-    }
-
-    #[test]
-    fn apply_conversion_folds_an_extinct_races_body_share_into_terrain_deposit() {
-        // No living body of this race exists this tick (occupancy is empty)
-        // -- the whole produced amount, body_share included, must land on
-        // terrain rather than vanish. See `apply_conversion`'s own doc
-        // comment for why.
-        //
-        // Habitat stock is seeded across *every* cell, not just one --
-        // extinct-race apportionment spreads uniformly across the whole
-        // grid (`apportion`'s own fallback), and since Invariant VIII's
-        // production cap (`apply_conversion_caps_production_at_the_actual_
-        // available_habitat_stock`) now honours actual per-cell stock, a
-        // single seeded cell would starve every other cell's share of the
-        // draw and this test would be proving the cap, not the fold.
-        let race = Race { element: Element::Wood, kind: Kind::Plant };
-        let mut t = Terrain::new(4);
-        for y in 0..4 {
-            for x in 0..4 {
-                t.cell_mut(x, y)[Element::Water] = 1000;
-            }
-        }
-        let occ = Occupancy::build(&[], &t);
-        let mut granted = PerRace::filled(grant(0));
-        granted[race] = grant(100);
-
-        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
-
-        assert_eq!(*body_share.get(race), 0, "nothing alive to credit");
-        assert_eq!(t.total(Element::Wood), 100, "the whole produced amount folds into terrain deposit instead of being lost");
-    }
-
-    #[test]
-    fn apply_conversion_caps_production_at_the_actual_available_habitat_stock() {
-        // Regression: `apportion`'s per-cell subtraction saturates
-        // (Invariant II) and used to silently clip below what a race's
-        // governed grant requested, while the produced side was credited in
-        // full regardless of whether the habitat drawdown actually
-        // succeeded -- manufacturing `r.element` out of habitat the race
-        // never actually had. Granted draw (100) exceeds the occupied
-        // cell's actual Water stock (40); production must be capped to what
-        // was actually removed (40), not the requested 100.
-        let race = Race { element: Element::Wood, kind: Kind::Plant };
-        let mut t = Terrain::new(4);
-        t.cell_mut(1, 1)[Element::Water] = 40; // less than the granted draw below
-        let entities = vec![Entity::spawn(
-            1,
-            Element::Wood,
-            V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
-            0,
-            0,
-            crate::race::attrs(race),
-        )];
-        let occ = Occupancy::build(&entities, &t);
-        let mut granted = PerRace::filled(grant(0));
-        granted[race] = grant(100);
-
-        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
-
-        assert_eq!(t.cell(1, 1)[Element::Water], 0, "the cell's whole stock, and no more, is drawn down");
-        assert_eq!(
-            t.total(Element::Wood),
-            26 + 2,
-            "deposit_share (650‰) + waste_share (50‰) of the capped 40 actually produced, not the requested 100"
-        );
-        assert_eq!(*body_share.get(race), 12, "body_share (300‰) of the capped 40, not the requested 100");
-        // Conservation, directly: every unit that left the Water layer is
-        // traceable to the Wood layer (deposit + waste) or the returned
-        // body_share -- nothing more, regardless of what was requested.
-        assert_eq!(
-            40 - t.total(Element::Water),
-            t.total(Element::Wood) + *body_share.get(race),
-            "habitat lost must equal element produced across terrain deposit+waste and body_share"
-        );
-    }
-
-    #[test]
-    fn apply_conversion_banks_a_saturated_deposit_shortfall_instead_of_losing_it() {
-        // Bug 2 regression: the deposit/waste (add) side of `apply_conversion`
-        // used to discard `apportion`'s actual-applied return value, so a
-        // near-saturated target cell would silently clip the deposit with no
-        // accounting for the shortfall. Set the one occupied cell's Wood
-        // stock to within 5 of `u16::MAX`, so a much larger deposit+waste
-        // request (70, at this row's 650/300/50 split of a 100 produced) can
-        // only actually land 5 of it.
-        let race = Race { element: Element::Wood, kind: Kind::Plant };
-        let mut t = Terrain::new(4);
-        t.cell_mut(1, 1)[Element::Wood] = u16::MAX - 5;
-        t.cell_mut(1, 1)[Element::Water] = 10_000; // ample habitat stock to draw down
-        let entities = vec![Entity::spawn(
-            1,
-            Element::Wood,
-            V2::new(crate::fx::Fx::from_int(1), crate::fx::Fx::from_int(1)),
-            0,
-            0,
-            crate::race::attrs(race),
-        )];
-        let occ = Occupancy::build(&entities, &t);
-        let mut granted = PerRace::filled(grant(0));
-        granted[race] = grant(100); // produces 100 at this row's lossless 1:1 ratio
-
-        let body_share = apply_conversion(&mut t, &occ, &crate::race::RACES, &granted, 1, 1);
-
-        assert_eq!(t.cell(1, 1)[Element::Wood], u16::MAX, "the cell fills to exactly its ceiling, no more");
-        assert_eq!(*body_share.get(race), 30, "body_share is unaffected by the terrain-side saturation");
-        // The 65 (deposit) + 5 (waste) = 70 requested, only 5 of which could
-        // actually land (the cell's headroom) -- the missing 65 must be
-        // banked, not silently gone.
-        assert_eq!(t.overflow(race), 65, "the shortfall the saturated cell couldn't accept must be banked, not destroyed");
-
-        // A second terrain tick, with no *new* production (`granted` back to
-        // zero) and headroom reopened (diffusion or consumption elsewhere
-        // would ordinarily do this; simulated here directly) must still
-        // retry and land the banked shortfall -- proving it is genuinely
-        // "delayed", not merely recorded and forgotten.
-        t.cell_mut(1, 1)[Element::Wood] = 0;
-        let granted_zero = PerRace::filled(grant(0));
-        let occ2 = Occupancy::build(&entities, &t);
-        let body_share2 = apply_conversion(&mut t, &occ2, &crate::race::RACES, &granted_zero, 1, 2);
-
-        assert_eq!(t.cell(1, 1)[Element::Wood], 65, "the previously-banked shortfall lands once headroom exists");
-        assert_eq!(t.overflow(race), 0, "fully retried, nothing left banked");
-        assert_eq!(*body_share2.get(race), 0, "no new production this tick, so no new body_share");
-    }
-
-    #[test]
     fn deposit_at_banks_a_saturated_cells_shortfall_instead_of_losing_it() {
         // Round-2 regression: `deposit_at` (the single-cell material return
         // `World::charge_death`/`smelt`/`break_item` all call) used to clip
         // its incoming amount to the cell's remaining `u16` headroom via a
         // bare `saturating_add` and return nothing -- any shortfall above
         // what the cell could absorb simply vanished, with no accounting at
-        // all. Same shape as the `apply_conversion` bug 2 fix above, proved
-        // the same way: set a cell within 5 of `u16::MAX`, deposit far more
-        // than that headroom, and show the shortfall is banked rather than
-        // destroyed.
+        // all. Proved by setting a cell within 5 of `u16::MAX`, depositing
+        // far more than that headroom, and showing the shortfall is banked
+        // rather than destroyed.
         let race = Race { element: Element::Fire, kind: Kind::Animal };
         let mut t = Terrain::new(4);
         t.cell_mut(2, 2)[Element::Water] = u16::MAX - 5; // only 5 headroom
@@ -1362,26 +1018,17 @@ mod tests {
             68_000 - 5,
             "everything the cell couldn't absorb must be banked under (race, element), not destroyed"
         );
-
-        // Retried and landed exactly like `apply_conversion`'s own banked
-        // shortfall: a subsequent terrain tick, with headroom reopened and
-        // zero new production, must fully apply the banked amount.
-        t.cell_mut(2, 2)[Element::Water] = 0;
-        let occ = Occupancy::build(&[], &t); // no living bodies of `race` -- exercises the extinct-race uniform fallback
-        let granted_zero = PerRace::filled(grant(0));
-        apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, 9, 1);
-
-        assert_eq!(t.total(Element::Water), 68_000 - 5, "the previously-banked shortfall lands once headroom exists");
-        assert_eq!(t.overflow_of(race, Element::Water), 0, "fully retried, nothing left banked");
     }
 
     #[test]
-    fn deposit_at_shortfall_retries_spread_across_the_races_living_bodies_not_just_the_original_cell() {
-        // Same banking mechanism, but with a living body of `race` present
-        // elsewhere on the grid at retry time -- proving the retry actually
-        // goes through `apportion`'s occupancy-weighted spread (the same
-        // path `apply_conversion`'s own retry uses), not merely a hardcoded
-        // replay at the original deposit position.
+    fn deposit_at_shortfall_stays_banked_even_after_headroom_reopens() {
+        // Known hole from the action-recipe migration (see `deposit_at`'s
+        // own doc comment): `apply_conversion`, the only code that ever
+        // retried a banked `Terrain::overflow` shortfall back out, was
+        // retired along with `race::Conversion`. A shortfall banked here now
+        // stays banked permanently -- pinned here as the current, documented
+        // reality (not a regression waiting to be caught), not the old
+        // multi-tick-retry behavior this test used to assert.
         let race = Race { element: Element::Metal, kind: Kind::Plant };
         let mut t = Terrain::new(4);
         t.cell_mut(0, 0)[Element::Earth] = u16::MAX; // fully saturated, zero headroom
@@ -1390,75 +1037,11 @@ mod tests {
         deposit_at(&mut t, race, Element::Earth, 500, pos);
         assert_eq!(t.overflow_of(race, Element::Earth), 500, "zero headroom banks the whole amount");
 
-        // A living body of `race`, at a different, empty cell.
-        let entities = vec![Entity::spawn(
-            1,
-            Element::Metal,
-            V2::new(crate::fx::Fx::from_int(3), crate::fx::Fx::from_int(3)),
-            0,
-            0,
-            crate::race::attrs(race),
-        )];
-        let occ = Occupancy::build(&entities, &t);
-        let granted_zero = PerRace::filled(grant(0));
-        apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, 3, 1);
-
-        assert_eq!(t.overflow_of(race, Element::Earth), 0, "fully retried once a living body gives it somewhere to land");
-        assert_eq!(t.cell(3, 3)[Element::Earth], 500, "lands at the living body's own cell, not the original saturated one");
-        assert_eq!(t.cell(0, 0)[Element::Earth], u16::MAX, "the original cell is untouched by the retry");
-    }
-
-    #[test]
-    fn reviewer3_overflow_survives_many_saturated_retries_then_fully_drains_once_reopened() {
-        // Round-3 reviewer 3's own angle: read the retry path end to end
-        // and confirm it actually *drains* banked overflow over subsequent
-        // ticks rather than only ever recording it once. Unlike the other
-        // overflow tests above (which retry exactly once), this keeps the
-        // one occupied cell pinned at saturation across MANY separate
-        // `apply_conversion` calls -- each one an independent "terrain
-        // tick" attempting the retry and failing again -- accumulating more
-        // banked shortfall on top each time, before finally opening the
-        // cell up and confirming the *entire* accumulated bank, across all
-        // those failed attempts, lands exactly once headroom exists.
-        let race = Race { element: Element::Metal, kind: Kind::Animal };
-        let mut t = Terrain::new(4);
-        let pos = V2::new(crate::fx::Fx::from_int(2), crate::fx::Fx::from_int(2));
-        let entities = vec![Entity::spawn(1, Element::Metal, pos, 0, 0, crate::race::attrs(race))];
-        let occ = Occupancy::build(&entities, &t);
-        let granted_zero = PerRace::filled(grant(0));
-
-        let mut total_banked_expected = 0u64;
-        const RETRY_ATTEMPTS: u64 = 40;
-        for tick in 1..=RETRY_ATTEMPTS {
-            // Re-pin the cell to fully saturated before every attempt, as
-            // if some unrelated sustained producer kept refilling it the
-            // whole time -- and deposit a fresh shortfall on top of
-            // whatever is already banked, exactly like a steady trickle of
-            // deaths onto the same busy cell would.
-            t.cell_mut(2, 2)[Element::Earth] = u16::MAX;
-            deposit_at(&mut t, race, Element::Earth, 300, pos);
-            total_banked_expected += 300;
-
-            // A retry attempt against a cell that is still fully saturated
-            // must change nothing: not shrink the bank (material must not
-            // vanish) and not grow it beyond what was actually deposited
-            // (material must not be double-banked).
-            apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, tick, tick);
-            assert_eq!(
-                t.overflow_of(race, Element::Earth),
-                total_banked_expected,
-                "a retry against a still-saturated cell must neither lose nor double-bank the shortfall (attempt {tick})"
-            );
-            assert_eq!(t.cell(2, 2)[Element::Earth], u16::MAX, "the saturated cell itself is untouched by a failed retry");
-        }
-
-        // Now actually open the cell up and let the retry mechanism land
-        // the whole accumulated bank for real.
-        t.cell_mut(2, 2)[Element::Earth] = 0;
-        apply_conversion(&mut t, &occ, &crate::race::RACES, &granted_zero, RETRY_ATTEMPTS + 1, RETRY_ATTEMPTS + 1);
-
-        assert_eq!(t.overflow_of(race, Element::Earth), 0, "the entire bank accumulated over many failed retries fully drains the instant headroom reopens");
-        assert_eq!(t.cell(2, 2)[Element::Earth], total_banked_expected as u16, "every unit banked across all those attempts actually lands, exactly, none created or destroyed");
+        // Headroom reopens, but nothing in this crate ever revisits
+        // `overflow` to retry it -- the bank stays exactly where it was.
+        t.cell_mut(0, 0)[Element::Earth] = 0;
+        assert_eq!(t.overflow_of(race, Element::Earth), 500, "nothing drains the bank on its own");
+        assert_eq!(t.cell(0, 0)[Element::Earth], 0, "and the reopened cell stays untouched -- no automatic retry lands here either");
     }
 
     #[test]
@@ -1478,7 +1061,7 @@ mod tests {
     fn diffusion_never_moves_further_than_one_cell_per_call() {
         let mut t = Terrain::new(9);
         t.cell_mut(4, 4)[Element::Water] = 60_000;
-        let tuning = TerrainTuning { diffuse_rate: PerElement::filled(1000), diffuse_cap: PerElement::filled(60_000) };
+        let tuning = TerrainTuning { diffuse_rate: PerElement::filled(1000), diffuse_cap: PerElement::filled(60_000), ground_decay: crate::race::RateBand::new(1, 1, 1, 1) };
         apply_diffusion(&mut t, &tuning);
         for y in 0..9i32 {
             for x in 0..9i32 {
@@ -1498,7 +1081,7 @@ mod tests {
     fn diffusion_never_exceeds_the_flat_cap_per_edge() {
         let mut t = Terrain::new(4);
         t.cell_mut(0, 0)[Element::Wood] = 65_000;
-        let tuning = TerrainTuning { diffuse_rate: PerElement::filled(1000), diffuse_cap: PerElement::filled(10) };
+        let tuning = TerrainTuning { diffuse_rate: PerElement::filled(1000), diffuse_cap: PerElement::filled(10), ground_decay: crate::race::RateBand::new(1, 1, 1, 1) };
         apply_diffusion(&mut t, &tuning);
         // Every neighbour can gain at most `diffuse_cap` from this one source cell.
         assert!(t.cell(1, 0)[Element::Wood] <= 10);
@@ -1517,6 +1100,7 @@ mod tests {
         let tuning = TerrainTuning {
             diffuse_rate: PerElement::filled(u16::MAX),
             diffuse_cap: PerElement::filled(u16::MAX),
+            ground_decay: crate::race::RateBand::new(1, 1, 1, 1),
         };
         apply_diffusion(&mut t, &tuning); // must not panic
     }
@@ -1533,6 +1117,7 @@ mod tests {
         let tuning = TerrainTuning {
             diffuse_rate: PerElement::filled(1500),
             diffuse_cap: PerElement::filled(60_000),
+            ground_decay: crate::race::RateBand::new(1, 1, 1, 1),
         };
         apply_diffusion(&mut t, &tuning);
         assert_eq!(t.total(Element::Wood), before, "diffusion must not create mass even at rate > 1000‰");
@@ -1552,6 +1137,7 @@ mod tests {
         let tuning = TerrainTuning {
             diffuse_rate: PerElement::filled(1000),
             diffuse_cap: PerElement::filled(u16::MAX),
+            ground_decay: crate::race::RateBand::new(1, 1, 1, 1),
         };
         apply_diffusion(&mut t, &tuning);
         assert_eq!(t.total(Element::Water), before, "diffusion must not create mass across a cell's combined edges");
@@ -1569,6 +1155,7 @@ mod tests {
         let tuning = TerrainTuning {
             diffuse_rate: PerElement::filled(1000),
             diffuse_cap: PerElement::filled(40),
+            ground_decay: crate::race::RateBand::new(1, 1, 1, 1),
         };
         apply_diffusion(&mut t, &tuning);
         assert!(t.cell(1, 0)[Element::Metal] <= 40, "east neighbour exceeded the cap: {}", t.cell(1, 0)[Element::Metal]);
@@ -1597,7 +1184,7 @@ mod tests {
         t.cell_mut(2, 1)[Element::Fire] = u16::MAX;
         t.cell_mut(2, 3)[Element::Fire] = u16::MAX;
         let before = t.total(Element::Fire);
-        let tuning = TerrainTuning { diffuse_rate: PerElement::filled(1000), diffuse_cap: PerElement::filled(1000) };
+        let tuning = TerrainTuning { diffuse_rate: PerElement::filled(1000), diffuse_cap: PerElement::filled(1000), ground_decay: crate::race::RateBand::new(1, 1, 1, 1) };
 
         apply_diffusion(&mut t, &tuning);
 

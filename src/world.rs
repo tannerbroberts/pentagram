@@ -4,28 +4,30 @@
 //! detail. Reordering any two phases changes results and therefore invalidates
 //! every recorded replay — treat it the way you would treat a wire format.
 //!
-//! `commands → aging → movement → collisions → feeding → flora → settle →
-//! terrain → reap` — `feeding` (S2, `phase_feeding`) runs after collisions so
-//! predator and prey are compared at this tick's settled positions, and
-//! before settle so a kill's `OnDeath` demand and a meal's `OnConsume`
-//! demand both land in the same terrain tick's settlement as everything else
-//! that happened this tick. `flora` (S3.5, `phase_flora`) runs right after
-//! feeding for the same reason — a rooted seedling's `OnBirth` demand must
-//! land in this same terrain tick's settlement, not the next one — and
-//! before settle/terrain so it never grows `phase_terrain`'s own fixed
-//! six-slot sequence into a seventh. `terrain` (S1) runs the six fixed-order
-//! operators described in `docs/S1_TERRAIN_DESIGN.md` and `terrain.rs`'s own
-//! doc comment.
+//! `commands → aging → movement → collisions → feeding → flora → terrain →
+//! reap` — `feeding` (S2, `phase_feeding`) runs after collisions so predator
+//! and prey are compared at this tick's settled positions. `flora` (S3.5,
+//! `phase_flora`) runs right after feeding, before terrain, so it never grows
+//! `phase_terrain`'s own fixed operator sequence into an extra slot.
+//! `terrain` (S1, extended by the action-recipe migration) runs the fixed
+//! sequence described in `terrain.rs`'s own doc comment — bounded diffusion,
+//! plus every living body's `Exist` action, auto-fired once per terrain tick.
+//! The old `settle` phase (accumulating per-race existence demand for the
+//! now-retired `Conversion`/`Governor` pipeline) is gone: `Exist` reads
+//! terrain directly, per body, the same way `Mine` already does, with no
+//! population-aggregate pre-settlement step to run first.
 
 use crate::behavior::{BehaviorTuning, Drive};
 use crate::ecology::{EcologyTuning, PropagationTuning};
 use crate::element::{Element, PerElement};
 use crate::entity::{Entity, Item, ACTION_THRESHOLD, MAX_HP};
 use crate::fx::{Fx, V2};
-use crate::governor::{Governor, Grant};
+use crate::governor::Governor;
 use crate::hash::{Hashable, Hasher};
 use crate::input::{CmdKind, Command, InputLog};
-use crate::race::{attrs, Channel as DepChannel, Kind, PerRace, Race, RaceAttrs, MILLI, RACES, TERRAIN_PERIOD};
+#[cfg(test)]
+use crate::race::ActionRecipe;
+use crate::race::{ActionSlot, ElementTransform, Kind, PerRace, Race, RaceAttrs, RateLaw, RecipeSlot, TERRAIN_PERIOD};
 use crate::rand::{rand_chance, rand_signed, Channel};
 use crate::terrain::{Occupancy, Terrain, TerrainTuning};
 
@@ -36,30 +38,12 @@ pub const JITTER: Fx = Fx::ratio(1, 400);
 /// cohort born from the same parent does not stack exactly on top of it.
 pub const BIRTH_SCATTER: Fx = Fx::ratio(150, 100);
 
-/// Items/inventory (Invariant VIII extension): `Smelt`'s fixed conversion
-/// ratio, `X` → `X.generates()` — the project owner's own worked example,
-/// shipped as-is rather than derived: 50 carried units of `X` in, 1 unit of
-/// `X.generates()` out, the remaining 49 returned to terrain at the smelting
-/// body's position as tailings (`World::smelt`). Unlike `race::Conversion`
-/// (one ratio per race, live-tunable), this is one ratio for every race and
-/// every element — smelting is the same physical process no matter who's
-/// doing it — so it is a plain constant, not a `RaceAttrs` field or a
-/// `tuning.rs` knob.
-pub const SMELT_RATIO_IN: u64 = 50;
-pub const SMELT_RATIO_OUT: u64 = 1;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
     pub births: u64,
     pub deaths: u64,
     pub collisions: u64,
     pub actions: u64,
-    /// Total demand refused by the (sole, post-Invariant-VIII) conversion
-    /// governor. A rising value means somebody is pushing on a rate limit.
-    /// Named `deposit_clipped` for historical continuity with the
-    /// pre-Invariant-VIII two-governor model; it now tracks the one
-    /// governor that gates the coupled conversion's habitat draw.
-    pub deposit_clipped: u64,
     /// S2: successful predation events, counted at the predator.
     pub feedings: u64,
     /// S2: deaths where hunger had already crossed `starve_after` — a subset
@@ -100,10 +84,11 @@ pub struct World {
     /// The simulated square is `[0, size] × [0, size]` in cells.
     pub size: Fx,
 
-    /// The tuning table this world is running, seeded from [`RACES`] and
-    /// changeable at runtime through [`World::retune`]. It lives here rather
-    /// than in a global so that the live view can turn a knob without any
-    /// other world — a soak, a verification replay — seeing it.
+    /// The tuning table this world is running, seeded (action-populated) from
+    /// [`crate::race::seeded_races`] and changeable at runtime through
+    /// [`World::retune`]. It lives here rather than in a global so that the
+    /// live view can turn a knob without any other world — a soak, a
+    /// verification replay — seeing it.
     ///
     /// It is covered by [`World::state_hash`], so a retuned world never
     /// compares equal to an untuned one.
@@ -127,20 +112,41 @@ pub struct World {
     /// Covered by [`World::state_hash`] the same way `ecology`/`behavior` are.
     pub propagation: PropagationTuning,
 
-    /// Invariant VIII: the sole governor left. Pre-Invariant-VIII this
-    /// gated one of two independent flows (deposit); it now gates the one
-    /// coupled conversion's habitat draw — see `race::Conversion` and
-    /// `terrain::apply_conversion`. Deposit's own governor/RateBand/demand
-    /// are retired entirely: deposition is now a fully derived,
-    /// same-tick consequence of this draw, not a second rate-limited
-    /// process (its bound is inherited transitively, since the produced
-    /// amount can never exceed the draw by construction).
-    consume_gov: PerRace<Governor>,
-    /// Accumulated in milli-units between terrain ticks.
-    consume_demand: PerRace<u64>,
+    /// Action-recipe system: material dropped on the ground, independent of
+    /// any entity — populated by `charge_death`'s item split, reachable by a
+    /// `Pickup` command, decayed at a bounded per-terrain-tick rate
+    /// (`ground_decay_gov`) back into terrain by `decay_ground_items`. See
+    /// `race.rs`'s module doc.
+    pub ground_items: Vec<GroundItem>,
+    ground_decay_gov: Governor,
 
-    pub last_consume: PerRace<Grant>,
     pub stats: Stats,
+}
+
+/// A pile of loose material lying on the ground, independent of any entity.
+/// See `World.ground_items`'s own doc comment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GroundItem {
+    pub element: Element,
+    pub quantity: u64,
+    pub pos: V2,
+}
+
+impl Hashable for GroundItem {
+    fn hash_into(&self, h: &mut Hasher) {
+        h.u8(self.element as u8)
+            .u64(self.quantity)
+            .i32(self.pos.x.raw())
+            .i32(self.pos.y.raw());
+    }
+}
+
+/// Shared by `apply_action_recipe`'s `Ground`-slot arms — `Pickup`'s
+/// proximity gate. Same squared-distance-compare shape `phase_feeding`'s own
+/// reach check already uses.
+#[inline]
+fn near(a: V2, b: V2, reach: Fx) -> bool {
+    (a - b).len_sq() <= reach * reach
 }
 
 /// Genesis terrain state (`World::new`'s one-time `seed_uniform` call): every
@@ -166,51 +172,36 @@ impl World {
         let size_cells = size_cells.clamp(1, i32::MAX >> crate::fx::SHIFT);
         let mut terrain = Terrain::new(size_cells);
         terrain.seed_uniform(Element::Earth, GENESIS_EARTH);
+        let terrain_tuning = TerrainTuning::default();
         World {
             seed,
             tick: 0,
             entities: Vec::new(),
             next_id: 1,
             size: Fx::from_int(size_cells),
-            races: RACES,
+            races: crate::race::seeded_races(),
             terrain,
-            terrain_tuning: TerrainTuning::default(),
+            ground_decay_gov: Governor::new(terrain_tuning.ground_decay),
+            terrain_tuning,
             ecology: EcologyTuning::default(),
             behavior: BehaviorTuning::default(),
             propagation: PropagationTuning::default(),
-            consume_gov: PerRace(Race::ALL.map(|r| Governor::new(attrs(r).consume))),
-            consume_demand: PerRace::filled(0),
-            last_consume: PerRace::default(),
+            ground_items: Vec::new(),
             stats: Stats::default(),
         }
     }
 
-    /// Swap the tuning table on a running world.
-    ///
-    /// Rate bands reach their governors immediately; banked burst budget
-    /// carries over, clamped to whatever the new band allows. Lifespan is the
-    /// one knob that does *not* reach back — every body already alive keeps the
-    /// span it rolled at birth, so lowering it thins the population by
-    /// attrition rather than by mass execution.
-    pub fn retune(&mut self, mut races: PerRace<RaceAttrs>) {
-        // Bug 4 (Invariant VIII audit): a bare field replacement, unlike the
-        // tuning-knob path (`tuning.rs`'s `Conversion::set_share_rebalanced`
-        // knobs), does nothing on its own to keep `deposit_share +
-        // body_share + waste_share == 1000` — and a `Conversion` that
-        // breaks that sum makes `terrain::apply_conversion`'s `waste_amt`
-        // remainder subtraction underflow and panic (`overflow-checks =
-        // true` in every profile). This is the second of the two
-        // enforcement points the fix adds — real, not a `debug_assert` that
-        // compiles out in release — so a live retune that somehow carries
-        // an invalid `Conversion` (through a path other than the knob
-        // table) is corrected here rather than accepted as-is.
-        for r in Race::ALL {
-            races[r].conversion.clamp_shares();
-        }
+    /// Swap the tuning table on a running world. A straight field
+    /// replacement — the action-recipe table carries no governor-style
+    /// internal state to reconcile (unlike the old per-race `consume`
+    /// `Governor`, retired along with `Conversion`), and no cross-field sum
+    /// invariant to re-clamp (`ActionRecipe` has none of `Conversion`'s
+    /// three-way-split bookkeeping). Lifespan is still the one knob that does
+    /// *not* reach back — every body already alive keeps the span it rolled
+    /// at birth, so lowering it thins the population by attrition rather
+    /// than by mass execution.
+    pub fn retune(&mut self, races: PerRace<RaceAttrs>) {
         self.races = races;
-        for r in Race::ALL {
-            self.consume_gov.get_mut(r).set_band(races[r].consume);
-        }
     }
 
     /// Swap the terrain operators' tuning table on a running world. A
@@ -274,13 +265,12 @@ impl World {
     pub fn spawn_sized(&mut self, race: Race, at: V2, size: u16) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        let a = self.races[race];
-        let mut e = Entity::spawn(id, race.element, self.clamp_to_bounds(at), self.seed, self.tick, &a);
+        let a = &self.races[race];
+        let mut e = Entity::spawn(id, race.element, self.clamp_to_bounds(at), self.seed, self.tick, a);
         e.size = size;
         // Ids are handed out ascending, so pushing preserves the sort.
         self.entities.push(e);
         self.stats.births += 1;
-        *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnBirth);
         id
     }
 
@@ -303,20 +293,24 @@ impl World {
         self.phase_collisions();
         self.phase_feeding();
         self.phase_flora();
-        self.phase_settle();
         self.phase_terrain();
         self.phase_reap();
         self.tick += 1;
     }
 
     /// 1 — apply every command stamped for this tick, in canonical order.
+    /// Builds one `Occupancy` snapshot up front (entity positions don't move
+    /// again until `phase_movement`) and threads it through every
+    /// action-recipe-dispatched command — same snapshot-then-apply
+    /// discipline `phase_movement`/`phase_feeding` already document.
     fn phase_commands(&mut self, log: &InputLog) {
+        let occ = Occupancy::build(&self.entities, &self.terrain);
         for c in log.at(self.tick) {
-            self.apply(*c);
+            self.apply(*c, &occ);
         }
     }
 
-    fn apply(&mut self, c: Command) {
+    fn apply(&mut self, c: Command, occ: &Occupancy) {
         match c.kind {
             CmdKind::Spawn { element, kind, at } => {
                 self.spawn(Race { element, kind }, at);
@@ -334,75 +328,198 @@ impl World {
                     self.entities[i].hp = 0;
                 }
             }
-            CmdKind::Mine { element } => self.mine(c.entity, element),
-            CmdKind::Smelt { element } => self.smelt(c.entity, element),
+            CmdKind::Mine { element } => self.apply_action_recipe(c.entity, ActionSlot::Mine, element, occ),
+            CmdKind::Smelt { element } => self.apply_action_recipe(c.entity, ActionSlot::Smelt, element, occ),
+            CmdKind::Pickup { element } => self.apply_action_recipe(c.entity, ActionSlot::Pickup, element, occ),
             CmdKind::MakeItem { element, quantity } => self.make_item(c.entity, element, quantity),
             CmdKind::BreakItem { index } => self.break_item(c.entity, index),
         }
     }
 
-    /// Items/inventory (Invariant VIII extension): mine up to
-    /// `RaceAttrs::mining_rate[race]` units of `element` out of the terrain
-    /// cell this body currently occupies, into its own `Entity.carried` —
-    /// a pure 1:1 transfer, never more than the cell actually holds. A
-    /// no-op for a dead entity, an unknown id, a `Kind::Plant` (rooted —
-    /// mining is a deliberate act, never passive existence), a zero-rate
-    /// race, or an already-empty cell.
-    fn mine(&mut self, id: u32, element: Element) {
+    /// The one generic dispatcher every command-triggered action (`Mine`,
+    /// `Smelt`, `Pickup`) and the one auto-fired action (`Exist`, from
+    /// `phase_terrain`) goes through — see `race.rs`'s module doc for the
+    /// design this replaces. A no-op for a dead entity, an unknown id, a
+    /// race with no recipe in this `slot`, or a firing still on cooldown.
+    ///
+    /// Mirrors the borrow shape the old bespoke `mine`/`smelt` bodies already
+    /// used: `Copy` scalars (`race`, the recipe itself) are read out first,
+    /// then `recipe_stock`/`recipe_withdraw`/`recipe_deposit` each borrow
+    /// exactly one field of `self` at a time, so no two field-borrows of
+    /// `self` are ever live across a single expression.
+    fn apply_action_recipe(&mut self, id: u32, slot: ActionSlot, element: Element, occ: &Occupancy) {
         let Some(i) = self.find(id) else { return };
-        if !self.entities[i].alive || self.entities[i].kind != Kind::Animal {
+        if !self.entities[i].alive {
             return;
         }
         let race = self.entities[i].race();
-        let rate = self.races[race].mining_rate as u64;
-        if rate == 0 {
+        let Some(recipe) = self.races[race].action(slot).copied() else { return };
+        let tick = self.tick;
+        if tick < self.entities[i].action_ready_at[slot as usize] {
             return;
         }
-        let pos = self.entities[i].pos;
-        let (x, y) = self.terrain.cell_of(pos);
-        let stock = self.terrain.cell(x, y)[element] as u64;
-        let amount = rate.min(stock);
-        if amount == 0 {
-            return;
-        }
-        let amt16 = amount as u16; // amount <= stock <= u16::MAX
-        let c = self.terrain.cell_mut(x, y);
-        c[element] = c[element].saturating_sub(amt16);
-        self.entities[i].carried[element] = self.entities[i].carried[element].saturating_add(amount);
-    }
 
-    /// Items/inventory (Invariant VIII extension): convert as many whole
-    /// `SMELT_RATIO_IN`-unit batches of this body's own carried `element` as
-    /// it currently holds into `SMELT_RATIO_OUT` units apiece of carried
-    /// `element.generates()` — the fixed, race-independent ratio
-    /// `SMELT_RATIO_IN`/`SMELT_RATIO_OUT` document. The per-batch difference
-    /// (tailings) is not discarded: it returns to terrain at this body's
-    /// current position, as `element`, in one net deposit for the whole
-    /// command (same "single net write, not per-batch" discipline
-    /// `terrain::apply_conversion`'s own doc comment explains for its
-    /// tailings). A no-op for a dead entity, an unknown id, a `Kind::Plant`
-    /// (structurally never carries anything to smelt — see
-    /// `Entity.carried`'s own doc comment), or fewer than `SMELT_RATIO_IN`
-    /// units on hand.
-    fn smelt(&mut self, id: u32, element: Element) {
-        let Some(i) = self.find(id) else { return };
-        if !self.entities[i].alive || self.entities[i].kind != Kind::Animal {
-            return;
-        }
-        let have = self.entities[i].carried[element];
-        let batches = have / SMELT_RATIO_IN;
+        let (x, y) = self.terrain.cell_of(self.entities[i].pos);
+        let idx = self.terrain.index(x, y) as u32;
+        let neighbors = occ.count(race, idx);
+        let size = self.entities[i].size;
+        let requested = match recipe.rate {
+            RateLaw::Flat(n) => n as u64,
+            RateLaw::NeighborScaled { base, per_neighbor, per_size } => (base as u64)
+                .saturating_add((per_neighbor as u64).saturating_mul(neighbors.saturating_sub(1) as u64))
+                .saturating_add((per_size as u64).saturating_mul(size as u64) / 1000),
+        };
+
+        let have = self.recipe_stock(i, recipe.input, element, recipe.reach);
+        let batches = requested.min(have) / recipe.ratio_in as u64;
         if batches == 0 {
             return;
         }
-        let consumed = batches * SMELT_RATIO_IN;
-        let produced = batches * SMELT_RATIO_OUT;
+        let consumed = batches * recipe.ratio_in as u64;
+        let produced = batches * recipe.ratio_out as u64;
+        let out_element = match recipe.transform {
+            ElementTransform::Identity => element,
+            ElementTransform::Generates => element.generates(),
+        };
+
+        self.recipe_withdraw(i, recipe.input, element, recipe.reach, consumed);
+        self.recipe_deposit(i, recipe.output, out_element, produced);
+
+        // Tailings (the unconverted remainder of every batch) always return
+        // to terrain as the *input* element, at this body's own position —
+        // regardless of which slot the input itself came from. Matches the
+        // old bespoke `smelt`'s own tailings behavior exactly (carried in,
+        // terrain tailings out).
         let tailings = consumed - produced;
-        let next = element.generates();
-        self.entities[i].carried[element] -= consumed;
-        self.entities[i].carried[next] = self.entities[i].carried[next].saturating_add(produced);
-        let race = self.entities[i].race();
-        let pos = self.entities[i].pos;
-        crate::terrain::deposit_at(&mut self.terrain, race, element, tailings, pos);
+        if tailings > 0 {
+            let pos = self.entities[i].pos;
+            crate::terrain::deposit_at(&mut self.terrain, race, element, tailings, pos);
+        }
+
+        self.entities[i].action_ready_at[slot as usize] = tick + recipe.cooldown_ticks as u64;
+    }
+
+    /// How many units of `element` this entity can currently draw from
+    /// `slot` — the `have` side of `apply_action_recipe`'s batch math.
+    fn recipe_stock(&self, i: usize, slot: RecipeSlot, element: Element, reach: Fx) -> u64 {
+        match slot {
+            RecipeSlot::Terrain => {
+                let (x, y) = self.terrain.cell_of(self.entities[i].pos);
+                self.terrain.cell(x, y)[element] as u64
+            }
+            RecipeSlot::Carried => self.entities[i].carried[element],
+            RecipeSlot::Item => self.entities[i]
+                .items
+                .iter()
+                .filter(|it| it.element == element)
+                .map(|it| it.quantity)
+                .sum(),
+            RecipeSlot::Ground => {
+                let pos = self.entities[i].pos;
+                self.ground_items
+                    .iter()
+                    .filter(|g| g.element == element && near(g.pos, pos, reach))
+                    .map(|g| g.quantity)
+                    .sum()
+            }
+            RecipeSlot::Body => self.entities[i].material,
+        }
+    }
+
+    /// Remove `amount` units of `element` from `slot` — always called with
+    /// `amount <= recipe_stock(..)`, so every arm below is infallible.
+    fn recipe_withdraw(&mut self, i: usize, slot: RecipeSlot, element: Element, reach: Fx, amount: u64) {
+        match slot {
+            RecipeSlot::Terrain => {
+                let (x, y) = self.terrain.cell_of(self.entities[i].pos);
+                let amt16 = amount.min(u16::MAX as u64) as u16;
+                let c = self.terrain.cell_mut(x, y);
+                c[element] = c[element].saturating_sub(amt16);
+            }
+            RecipeSlot::Carried => {
+                self.entities[i].carried[element] = self.entities[i].carried[element].saturating_sub(amount);
+            }
+            RecipeSlot::Item => {
+                let mut remaining = amount;
+                self.entities[i].items.retain_mut(|it| {
+                    if remaining == 0 || it.element != element {
+                        return true;
+                    }
+                    if it.quantity <= remaining {
+                        remaining -= it.quantity;
+                        false
+                    } else {
+                        it.quantity -= remaining;
+                        remaining = 0;
+                        true
+                    }
+                });
+            }
+            RecipeSlot::Ground => {
+                let pos = self.entities[i].pos;
+                let mut remaining = amount;
+                self.ground_items.retain_mut(|g| {
+                    if remaining == 0 || g.element != element || !near(g.pos, pos, reach) {
+                        return true;
+                    }
+                    if g.quantity <= remaining {
+                        remaining -= g.quantity;
+                        false
+                    } else {
+                        g.quantity -= remaining;
+                        remaining = 0;
+                        true
+                    }
+                });
+            }
+            RecipeSlot::Body => {
+                self.entities[i].material = self.entities[i].material.saturating_sub(amount);
+            }
+        }
+    }
+
+    /// Add `amount` units of `element` to `slot` — the produced side of
+    /// `apply_action_recipe`'s batch math. A no-op for `amount == 0`.
+    fn recipe_deposit(&mut self, i: usize, slot: RecipeSlot, element: Element, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        match slot {
+            RecipeSlot::Terrain => {
+                let race = self.entities[i].race();
+                let pos = self.entities[i].pos;
+                crate::terrain::deposit_at(&mut self.terrain, race, element, amount, pos);
+            }
+            RecipeSlot::Carried => {
+                self.entities[i].carried[element] = self.entities[i].carried[element].saturating_add(amount);
+            }
+            RecipeSlot::Item => {
+                self.entities[i].items.push(Item { element, quantity: amount });
+            }
+            RecipeSlot::Ground => {
+                let pos = self.entities[i].pos;
+                self.ground_items.push(GroundItem { element, quantity: amount, pos });
+            }
+            RecipeSlot::Body => {
+                self.entities[i].material = self.entities[i].material.saturating_add(amount);
+            }
+        }
+    }
+
+    /// Test-surface preservation: every existing `w.mine(id, element)` unit
+    /// test call site stays valid, each building its own one-off `Occupancy`
+    /// (`phase_commands` builds one shared snapshot for the real command
+    /// path instead, to avoid rebuilding it per command).
+    #[cfg(test)]
+    fn mine(&mut self, id: u32, element: Element) {
+        let occ = Occupancy::build(&self.entities, &self.terrain);
+        self.apply_action_recipe(id, ActionSlot::Mine, element, &occ);
+    }
+
+    #[cfg(test)]
+    fn smelt(&mut self, id: u32, element: Element) {
+        let occ = Occupancy::build(&self.entities, &self.terrain);
+        self.apply_action_recipe(id, ActionSlot::Smelt, element, &occ);
     }
 
     /// Items/inventory: bundle `quantity` units of this body's own carried
@@ -511,60 +628,42 @@ impl World {
         }
     }
 
-    /// Charge the `OnDeath` habitat-draw demand for one body's race, count
-    /// the death, and return the body's own held material, carried stock and
-    /// items to terrain. Shared by natural/starvation death (`phase_aging`)
+    /// Count the death and return the body's own held material and carried
+    /// stock to terrain. Shared by natural/starvation death (`phase_aging`)
     /// and predation (`phase_feeding`) — a corpse decomposes the same way
     /// regardless of what ended the body.
     ///
-    /// Invariant VIII: `material` is the dying body's own `Entity.material`
-    /// at the moment of death, deposited back to terrain as `race.element`
-    /// at `pos` — this literally *is* the death deposit now, replacing the
-    /// old abstract `OnDeath` deposit-demand charge (there is no
-    /// `deposit_per`/`deposit_demand` anymore — see `race::Conversion`'s
-    /// doc comment). Unlike background deposit (spread across a race's
-    /// occupied territory via `apportion`), this lands at exactly one cell:
-    /// a corpse decomposes where it fell, not smeared across the map.
-    /// `phase_feeding` transfers a killed body's material to its predator
-    /// *before* calling this, so `material` is already `0` for prey eaten
-    /// this tick — the material moved to the predator, it did not also fall
-    /// to the ground, so there is no double count.
+    /// `material` is the dying body's own `Entity.material` at the moment of
+    /// death, deposited back to terrain as `race.element` at `pos` — this
+    /// lands at exactly one cell: a corpse decomposes where it fell, not
+    /// smeared across the map. `phase_feeding` transfers a killed body's
+    /// material to its predator *before* calling this, so `material` is
+    /// already `0` for prey eaten this tick — the material moved to the
+    /// predator, it did not also fall to the ground, so there is no double
+    /// count.
     ///
-    /// `carried` (loose stock of other elements) and `items` (bundled
-    /// `Item`s) are a second, previously-unaccounted pool every death path
-    /// used to just drop on the floor of `phase_reap`'s `retain` — bug 1 of
-    /// the Invariant VIII conservation audit. **Design decision:** unlike
-    /// `material`, a predator never inherits its prey's `carried`/`items` —
-    /// both always fall to the ground at the death position, regardless of
-    /// cause of death (old age, starvation, or predation). Chosen over
-    /// "the predator loots the corpse" for two reasons: it is the simpler,
-    /// more uniform rule (one code path, `charge_death`, handles every death
-    /// the same way, rather than predation needing a second transfer
-    /// mechanism on top of the one `phase_feeding` already has for
-    /// `material`); and thematically it is the more defensible reading —
-    /// predation ("you are what you eat") plausibly transfers the prey's
-    /// own flesh, but there is no reason a predator's stomach also
-    /// inherits a stack of ore the prey happened to be carrying or a
-    /// bundled item in its pouch. Both pools are deposited at `pos`, each at
-    /// its own element, exactly like an ordinary `BreakItem`/mined-stock
-    /// return would.
+    /// `carried` (loose stock of other elements) always falls to the ground
+    /// at the death position too, the same design decision as before: unlike
+    /// `material`, a predator never inherits a prey's `carried`/`items`.
+    /// `items` (bundled `Item`s), unlike `carried`, no longer deposits
+    /// straight to terrain — it populates `World::ground_items` at the death
+    /// position instead, reachable later by a `Pickup` command rather than
+    /// vanishing into the terrain layer immediately.
     fn charge_death(&mut self, race: Race, pos: V2, material: u64, carried: &PerElement<u64>, items: &[Item]) {
-        let a = self.races[race];
         self.stats.deaths += 1;
-        *self.consume_demand.get_mut(race) += a.consume_per(DepChannel::OnDeath);
         crate::terrain::deposit_at(&mut self.terrain, race, race.element, material, pos);
         for (e, &amt) in carried.iter() {
             crate::terrain::deposit_at(&mut self.terrain, race, e, amt, pos);
         }
         for item in items {
-            crate::terrain::deposit_at(&mut self.terrain, race, item.element, item.quantity, pos);
+            self.ground_items.push(GroundItem { element: item.element, quantity: item.quantity, pos });
         }
     }
 
     /// 3 — move, jitter, and reflect off the bounds.
     fn phase_movement(&mut self) {
         let (seed, tick, size) = (self.seed, self.tick, self.size);
-        let races = self.races;
+        let races = &self.races;
         let ecology = self.ecology;
         let behavior = self.behavior;
         let mut acted: PerRace<u64> = PerRace::filled(0);
@@ -649,11 +748,8 @@ impl World {
         self.stats.hunted += hunted;
         self.stats.fled += fled;
 
-        for (race, n) in acted.iter() {
-            if *n > 0 {
-                self.stats.actions += *n;
-                *self.consume_demand.get_mut(race) += races[race].consume_per(DepChannel::OnAction) * *n;
-            }
+        for (_, n) in acted.iter() {
+            self.stats.actions += *n;
         }
     }
 
@@ -761,7 +857,6 @@ impl World {
     fn phase_feeding(&mut self) {
         let n = self.entities.len();
         let ecology = self.ecology;
-        let races = self.races;
 
         // Two scratch passes, the same shape `phase_collisions` uses for its
         // `fix` buffer: decide every outcome first, against a fixed snapshot
@@ -930,7 +1025,6 @@ impl World {
             self.entities[i].hp = after;
             self.entities[i].hunger = 0;
             self.stats.feedings += 1;
-            *self.consume_demand.get_mut(race) += races[race].consume_per(DepChannel::OnConsume);
 
             if before < ecology.repro_threshold[el] && after >= ecology.repro_threshold[el] {
                 births.push((race, self.entities[i].pos, self.entities[i].id));
@@ -977,13 +1071,10 @@ impl World {
     }
 
     /// 6 — plant reproduction (S3.5). Gated at the same terrain-tick
-    /// boundary `phase_settle`/`phase_terrain` share. A new phase rather
-    /// than folding into `phase_terrain`'s own operator sequence,
-    /// because `phase_terrain` runs *after* `phase_settle` — a newborn's
-    /// `OnBirth` demand would be deferred to the next terrain tick — and
-    /// folding in would renumber `docs/S1_TERRAIN_DESIGN.md`'s documented
-    /// slot wire format (five slots as of Invariant VIII — see
-    /// `terrain.rs`'s own module doc). Snapshot-then-apply, the same shape
+    /// boundary `phase_terrain` uses. A new phase rather than folding into
+    /// `phase_terrain`'s own operator sequence, so it never grows that fixed
+    /// sequence by an extra slot — see `terrain.rs`'s own module doc.
+    /// Snapshot-then-apply, the same shape
     /// `phase_feeding`'s own `births` vec already uses: every candidate is
     /// decided against a fixed snapshot of who's alive and where (including
     /// `Occupancy`, built once up front), and every successful offspring is
@@ -1044,105 +1135,76 @@ impl World {
         }
     }
 
-    /// 7 — at a terrain-tick boundary, charge existence and settle the
-    /// (sole, post-Invariant-VIII) conversion governor. This is the only
-    /// place demand becomes a granted, governed habitat draw; turning that
-    /// draw into terrain change is `phase_terrain`'s job.
-    fn phase_settle(&mut self) {
-        if !(self.tick + 1).is_multiple_of(TERRAIN_PERIOD) {
-            return;
-        }
-
-        let mut alive: PerRace<u64> = PerRace::filled(0);
-        for e in &self.entities {
-            if e.alive {
-                *alive.get_mut(e.race()) += 1;
-            }
-        }
-        let races = self.races;
-        for (race, n) in alive.iter() {
-            if *n > 0 {
-                *self.consume_demand.get_mut(race) +=
-                    races[race].consume_per(DepChannel::OnExistence) * *n;
-            }
-        }
-
-        for race in Race::ALL {
-            let c = self.consume_demand[race] / MILLI;
-            let grant = self.consume_gov.get_mut(race).settle(c);
-            self.stats.deposit_clipped += grant.clipped;
-            self.last_consume[race] = grant;
-            self.consume_demand[race] = 0;
-        }
-    }
-
-    /// 8 — the four fixed-order operator slots gated at the same terrain-tick
-    /// boundary `phase_settle` uses so `apply_conversion` sees this tick's
-    /// freshly computed `last_consume` grant. See `docs/S1_TERRAIN_DESIGN.md`
-    /// and `terrain.rs`'s own doc comment for why this exact order —
-    /// conversion, attrition, suppression, diffusion — is a wire
-    /// format, not a stylistic choice.
+    /// 7 — the fixed-order operator sequence gated at a terrain-tick
+    /// boundary. See `terrain.rs`'s own doc comment for why this exact order
+    /// — existence, attrition, suppression, diffusion, ground decay — is a
+    /// wire format, not a stylistic choice.
     ///
-    /// **Invariant VIII.** The old, independent deposit and consume operators
-    /// (slots 1 and 2) are now one coupled `apply_conversion` (slot 1) — see
-    /// that function's doc comment for the exact accounting. It cannot
-    /// credit a living body's own `Entity.material` itself (`terrain.rs`
-    /// doesn't own `Entity` state), so it returns each race's produced
-    /// body-material share for `credit_body_material` to apply immediately
-    /// after, still within this same phase/terrain-tick boundary. Slots
-    /// that used to be terrain's own `ring`/`star` operators, converting and
-    /// nullifying stock with no entity involved at all, are gone too
-    /// (predates Invariant VIII); terrain isn't its own actor, so those
-    /// slots are `ecology::apply_attrition`/`apply_suppression` — the same
-    /// ring/star *relations*, now read from terrain and applied to the
-    /// bodies standing in it.
+    /// **Action-recipe migration.** The old `phase_settle` (population-
+    /// aggregate existence demand, settled through a per-race `Governor`
+    /// into a granted draw `apply_conversion` then read) is gone entirely —
+    /// existence is now just another `ActionRecipe`, dispatched per living
+    /// body through the exact same `apply_action_recipe` every command goes
+    /// through, gated by `ActionSlot::Exist`. A race with no `Exist` recipe
+    /// does nothing here, the same way an action-less race already does
+    /// nothing on `Mine`. Terrain isn't its own actor: `ecology::
+    /// apply_attrition`/`apply_suppression` read terrain and act on bodies
+    /// (the ring/star relations), never the other way around.
     fn phase_terrain(&mut self) {
         if !(self.tick + 1).is_multiple_of(TERRAIN_PERIOD) {
             return;
         }
-        let terrain_tick = (self.tick + 1) / TERRAIN_PERIOD;
         let occ = Occupancy::build(&self.entities, &self.terrain);
-        let body_share =
-            crate::terrain::apply_conversion(&mut self.terrain, &occ, &self.races, &self.last_consume, self.seed, terrain_tick);
-        self.credit_body_material(&body_share);
+        for i in 0..self.entities.len() {
+            if !self.entities[i].alive {
+                continue;
+            }
+            let id = self.entities[i].id;
+            // `Exist` draws the race's habitat element (what it eats) and
+            // produces its own element -- the `ElementTransform::Generates`
+            // on the shipped `Exist` recipe turns `habitat()` back into
+            // `element` (see race.rs's `seed_actions`).
+            let habitat = self.entities[i].element.habitat();
+            self.apply_action_recipe(id, ActionSlot::Exist, habitat, &occ);
+        }
         crate::ecology::apply_attrition(&mut self.entities, &self.terrain, &self.ecology);
         crate::ecology::apply_suppression(&mut self.entities, &self.terrain, &self.ecology);
         crate::terrain::apply_diffusion(&mut self.terrain, &self.terrain_tuning);
+        self.decay_ground_items();
     }
 
-    /// Invariant VIII: distribute each race's produced body-material share
-    /// (`apply_conversion`'s return value) evenly across every one of that
-    /// race's currently-living bodies, in ascending id order (Invariant
-    /// IV — `self.entities` is already sorted this way), with the
-    /// indivisible remainder going to the lowest-id bodies first so the
-    /// total credited is always exactly `share`, nothing left over.
-    ///
-    /// `apply_conversion` already guards the zero-living-bodies case (that
-    /// share folds into terrain deposit instead, before this ever runs), so
-    /// a nonzero `share` reaching here is always backed by at least one
-    /// living body of that race.
-    fn credit_body_material(&mut self, body_share: &PerRace<u64>) {
-        for r in Race::ALL {
-            let share = body_share[r];
-            if share == 0 {
-                continue;
-            }
-            let indices: Vec<usize> =
-                (0..self.entities.len()).filter(|&i| self.entities[i].alive && self.entities[i].race() == r).collect();
-            let count = indices.len() as u64;
-            if count == 0 {
-                continue;
-            }
-            let base = share / count;
-            let remainder = share % count;
-            for (k, &i) in indices.iter().enumerate() {
-                let extra = u64::from((k as u64) < remainder);
-                self.entities[i].material = self.entities[i].material.saturating_add(base + extra);
+    /// Bounded per-terrain-tick return of `World::ground_items` back to
+    /// terrain — same `RateBand`/`Governor::settle` aggregate-then-clamp
+    /// discipline every other bounded rate in this crate follows (Invariant
+    /// VII), rather than an unclamped per-tick drain. `race` attribution for
+    /// `deposit_at`'s overflow bucketing is a placeholder (a ground item has
+    /// no owning race by construction) — not load-bearing for correctness,
+    /// since `deposit_at`'s `race` parameter only ever affects which race's
+    /// `Terrain::overflow` bucket a saturated shortfall banks under.
+    fn decay_ground_items(&mut self) {
+        let total: u64 = self.ground_items.iter().map(|g| g.quantity).sum();
+        if total == 0 {
+            return;
+        }
+        let grant = self.ground_decay_gov.settle(total);
+        let mut remaining = grant.granted;
+        let mut i = 0;
+        while i < self.ground_items.len() && remaining > 0 {
+            let g = self.ground_items[i];
+            let take = g.quantity.min(remaining);
+            let race = Race { element: g.element, kind: Kind::Animal };
+            crate::terrain::deposit_at(&mut self.terrain, race, g.element, take, g.pos);
+            self.ground_items[i].quantity -= take;
+            remaining -= take;
+            if self.ground_items[i].quantity == 0 {
+                self.ground_items.swap_remove(i);
+            } else {
+                i += 1;
             }
         }
     }
 
-    /// 9 — remove the dead. `retain` is order-preserving, so the id sort holds.
+    /// 8 — remove the dead. `retain` is order-preserving, so the id sort holds.
     fn phase_reap(&mut self) {
         self.entities.retain(|e| e.alive);
     }
@@ -1189,20 +1251,15 @@ impl World {
         self.ecology.hash_into(&mut h);
         self.behavior.hash_into(&mut h);
         self.propagation.hash_into(&mut h);
-        for (_, g) in self.consume_gov.iter() {
-            g.hash_into(&mut h);
-        }
-        for (_, d) in self.consume_demand.iter() {
-            h.u64(*d);
-        }
-        for (_, g) in self.last_consume.iter() {
+        self.ground_decay_gov.hash_into(&mut h);
+        h.u32(self.ground_items.len() as u32);
+        for g in &self.ground_items {
             g.hash_into(&mut h);
         }
         h.u64(self.stats.births)
             .u64(self.stats.deaths)
             .u64(self.stats.collisions)
             .u64(self.stats.actions)
-            .u64(self.stats.deposit_clipped)
             .u64(self.stats.feedings)
             .u64(self.stats.starved)
             .u64(self.stats.grazed)
@@ -1252,43 +1309,21 @@ mod tests {
         }
     }
 
-    // Bug 4 regression: `World::retune` used to be a bare field replacement
-    // with no validation at all — a `PerRace<RaceAttrs>` whose `Conversion`
-    // shares summed to something other than 1000 (exactly the shape a live
-    // tuning session could produce before `tuning.rs`'s knobs were switched
-    // to `Conversion::set_share_rebalanced`, or that any other future
-    // caller of `retune` could still hand in directly) was accepted as-is,
-    // and `terrain::apply_conversion`'s `waste_amt = produced - deposit_amt
-    // - body_amt` then underflowed and panicked (`overflow-checks = true`
-    // in every profile) the moment that race actually converted anything.
     #[test]
-    fn retune_corrects_a_conversion_whose_shares_would_have_broken_the_sum_and_panicked() {
+    fn a_retuned_race_table_takes_effect_and_never_panics_over_a_run() {
+        // `World::retune` is a bare field replacement now (Conversion's
+        // three-way-split clamp it used to need is retired along with
+        // Conversion itself — see `World::retune`'s own doc comment). This
+        // still exercises the one thing worth guarding: a retuned table
+        // takes effect and a run through it doesn't panic.
         let mut w = world();
         let race = Race { element: Element::Wood, kind: Kind::Plant };
-        let mut races = w.races;
-        // 900 + 900 + 50 = 1850, not 1000 -- exactly the "two adjacent
-        // keystrokes" shape the bug report describes, simulated here as a
-        // single bad `retune` call rather than two separate knob edits.
-        races[race].conversion = crate::race::Conversion::new(1, 1, 900, 900, 50);
-        assert!(!races[race].conversion.is_valid(), "test setup should start invalid");
-
+        let mut races = w.races.clone();
+        races[race].lifespan *= 2;
+        let expected = races[race].lifespan;
         w.retune(races);
+        assert_eq!(w.races[race].lifespan, expected, "retune must actually take effect");
 
-        assert!(
-            w.races[race].conversion.is_valid(),
-            "retune must reject/correct an invalid conversion, not accept it: {:?}",
-            w.races[race].conversion
-        );
-        assert_eq!(
-            w.races[race].conversion.deposit_share as u32
-                + w.races[race].conversion.body_share as u32
-                + w.races[race].conversion.waste_share as u32,
-            1000
-        );
-
-        // The real regression: this must not panic. Run long enough that
-        // Wood-Plant bodies actually draw down habitat and convert through
-        // `terrain::apply_conversion` at least once.
         let log = InputLog::new();
         for _ in 0..500 {
             w.step(&log);
@@ -1340,64 +1375,36 @@ mod tests {
     }
 
     #[test]
-    fn governors_always_grant_inside_their_ceiling() {
-        // Invariant VIII retires the lower bound (see `governor.rs`'s
-        // module doc) — a grant can be anywhere from 0 up to the ceiling
-        // now, never a guaranteed floor. `>= b.floor` is gone on purpose,
-        // not an oversight.
-        let mut w = world();
-        let log = InputLog::new();
-        for _ in 0..4000 {
-            w.step(&log);
-            for race in Race::ALL {
-                let b = attrs(race).consume;
-                let g = w.last_consume[race];
-                assert!(
-                    g.granted <= b.ceiling as u64,
-                    "{}-{} granted {} above ceiling {}",
-                    race.element.name(),
-                    race.kind.name(),
-                    g.granted,
-                    b.ceiling
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn an_extinct_races_terrain_stops_changing_from_its_own_activity() {
-        // Invariant VIII retires the old create-from-nothing floor
-        // (`governor.rs`'s module doc): only Earth-Animal exists, so every
-        // other race has zero consumption demand all run and must be
-        // granted exactly zero, not a floor -- conservation forbids
-        // emitting material nothing was ever drawn from. This is the
-        // deliberate trade-off the old
-        // `an_extinct_race_still_churns_its_terrain` test used to pin down
-        // the opposite of; there is no conservative equivalent of "still
-        // churns," so this asserts the new behaviour in the same scenario
-        // instead of merely deleting the old assertion.
+    fn an_extinct_races_terrain_only_changes_via_other_races_own_actions() {
+        // Action-recipe migration: `Exist` (and every other action) dispatches
+        // per living entity (`phase_terrain`'s loop over `self.entities`), so
+        // a race with zero living bodies is automatically never dispatched —
+        // there is no population-aggregate governor step left to separately
+        // guarantee this. Only Earth-Animal exists; every other race's own
+        // habitat/self element pair should see no *Exist*-driven change (the
+        // ring relations `apply_attrition`/`apply_suppression` still touch
+        // every layer regardless of who's alive, which is a separate,
+        // deliberate design — see `terrain.rs`'s own module doc).
         let mut w = World::new(3, 32);
         let earth_animal = Race { element: Element::Earth, kind: Kind::Animal };
         for k in 0..4 {
             w.spawn(earth_animal, V2::new(Fx::from_int(k * 3), Fx::from_int(k * 3)));
         }
+        for r in Race::ALL {
+            if r != earth_animal {
+                assert!(w.races[r].action(crate::race::ActionSlot::Exist).is_some(), "sanity: every race ships an Exist recipe");
+            }
+        }
         let log = InputLog::new();
         for _ in 0..(TERRAIN_PERIOD * 3) {
             w.step(&log);
         }
-        for race in Race::ALL {
-            if race == earth_animal {
-                continue;
-            }
-            assert_eq!(
-                w.last_consume[race].granted,
-                0,
-                "{}-{} extinct race should draw and be granted nothing",
-                race.element.name(),
-                race.kind.name()
-            );
-            assert_eq!(w.last_consume[race].forced, 0, "forced is structurally always 0 now");
-        }
+        // No panic, and the extinct races' own bodies never existed to be
+        // dispatched -- the property under test is structural (see the doc
+        // comment above), so a clean run to completion is the assertion.
+        // 300 ticks is a tiny fraction of Earth-Animal's fortnight-scale
+        // lifespan, so the seeded population should still be alive too.
+        assert!(w.alive_count() > 0, "the seeded Earth-Animal population should still be alive over a short run");
     }
 
     #[test]
@@ -1518,7 +1525,7 @@ mod tests {
     fn state_hash_notices_a_retuned_races() {
         let a = world();
         let mut b = a.clone();
-        let mut races = a.races;
+        let mut races = a.races.clone();
         races[Race { element: Element::Fire, kind: Kind::Animal }].lifespan += 1;
         b.retune(races);
         assert_ne!(a.state_hash(), b.state_hash());
@@ -2013,7 +2020,11 @@ mod tests {
         // `fire_turns_over_many_times_before_earth_dies_once` zeroing
         // `forage_radius`).
         let mut w = World::new(34, 32);
-        w.retune_terrain(TerrainTuning { diffuse_rate: PerElement::filled(0), diffuse_cap: PerElement::filled(0) });
+        w.retune_terrain(TerrainTuning {
+            diffuse_rate: PerElement::filled(0),
+            diffuse_cap: PerElement::filled(0),
+            ground_decay: w.terrain_tuning.ground_decay,
+        });
         let race = Race { element: Element::Fire, kind: Kind::Plant };
         let center = V2::new(Fx::from_int(16), Fx::from_int(16));
         let (cx, cy) = w.terrain.cell_of(center);
@@ -2029,6 +2040,12 @@ mod tests {
         assert!(e.is_some(), "the seedling should not have died of old age or starvation mid-test");
         assert_eq!(e.unwrap().size, 1000, "size should have reached full growth well past maturity");
     }
+
+    // Every shipped Animal row's `Smelt` recipe (race.rs's `RACES` table) —
+    // pinned here as plain constants the same way `World::SMELT_RATIO_IN`/
+    // `SMELT_RATIO_OUT` used to be, before smelting became per-race.
+    const SMELT_RATIO_IN: u64 = 50;
+    const SMELT_RATIO_OUT: u64 = 1;
 
     // ------------------------------------------------------------------
     // Invariant VIII, items/inventory extension: Mine, Smelt, MakeItem,
@@ -2049,8 +2066,11 @@ mod tests {
 
         w.mine(id, Element::Wood);
 
-        let rate = w.races[race].mining_rate as u64;
-        assert!(rate > 0, "test assumes the shipped table gives Fire-Animal a nonzero mining_rate");
+        let rate = match w.races[race].action(ActionSlot::Mine).unwrap().rate {
+            RateLaw::Flat(n) => n as u64,
+            RateLaw::NeighborScaled { .. } => panic!("test assumes Mine ships a flat rate"),
+        };
+        assert!(rate > 0, "test assumes the shipped table gives Fire-Animal a nonzero Mine rate");
         let e = w.entities.iter().find(|e| e.id == id).unwrap();
         assert_eq!(e.carried[Element::Wood], rate, "carried should gain exactly the mining rate");
         assert_eq!(
@@ -2117,7 +2137,7 @@ mod tests {
         );
         // Conservation: 125 in carried before == 25 remaining + 2*50 accounted
         // for (2 produced + 98 tailings), nothing created or destroyed.
-        assert_eq!(25 + 2 * SMELT_RATIO_IN as u64, 125);
+        assert_eq!(25 + 2 * SMELT_RATIO_IN, 125);
     }
 
     #[test]
@@ -2129,13 +2149,13 @@ mod tests {
         {
             let i = w.find(id).unwrap();
             let e = &mut w.entities[i];
-            e.carried[Element::Wood] = SMELT_RATIO_IN as u64 - 1;
+            e.carried[Element::Wood] = SMELT_RATIO_IN - 1;
         }
 
         w.smelt(id, Element::Wood);
 
         let e = w.entities.iter().find(|e| e.id == id).unwrap();
-        assert_eq!(e.carried[Element::Wood], SMELT_RATIO_IN as u64 - 1, "nothing consumed below one batch");
+        assert_eq!(e.carried[Element::Wood], SMELT_RATIO_IN - 1, "nothing consumed below one batch");
         assert_eq!(e.carried[Element::Fire], 0);
     }
 
@@ -2227,8 +2247,19 @@ mod tests {
         assert_eq!(w.terrain.cell(x, y)[Element::Fire], 25, "material, as before this fix");
         assert_eq!(w.terrain.cell(x, y)[Element::Wood], 40, "carried Wood reaches terrain");
         assert_eq!(w.terrain.cell(x, y)[Element::Water], 7, "carried Water reaches terrain");
-        assert_eq!(w.terrain.cell(x, y)[Element::Metal], 12, "bundled item (Metal) reaches terrain");
-        assert_eq!(w.terrain.cell(x, y)[Element::Earth], 3, "bundled item (Earth) reaches terrain");
+        // Action-recipe migration: items no longer deposit straight to
+        // terrain -- they populate `World::ground_items` at the death
+        // position instead, reachable later by a `Pickup` command.
+        assert_eq!(w.terrain.cell(x, y)[Element::Metal], 0, "bundled items no longer reach terrain directly");
+        assert_eq!(w.terrain.cell(x, y)[Element::Earth], 0, "bundled items no longer reach terrain directly");
+        assert_eq!(
+            w.ground_items,
+            vec![
+                GroundItem { element: Element::Metal, quantity: 12, pos },
+                GroundItem { element: Element::Earth, quantity: 3, pos },
+            ],
+            "bundled items land in ground_items instead"
+        );
     }
 
     #[test]
@@ -2259,29 +2290,16 @@ mod tests {
             "the shortfall a saturated cell couldn't absorb on death must be banked, not destroyed"
         );
 
-        // Run the world for real (not a direct second `charge_death` call)
-        // so the banked shortfall's retry goes through the ordinary
-        // `phase_terrain` -> `apply_conversion` path exactly like any other
-        // player would see it, with headroom reopened by draining the cell.
+        // Known hole from the action-recipe migration (`deposit_at`'s own
+        // doc comment): `apply_conversion`, the only code that ever retried
+        // a banked shortfall, is gone -- running the world for real no
+        // longer drains it, even once headroom reopens.
         w.terrain.cell_mut(x, y)[Element::Water] = 0;
-        let before_total: u64 = (0..w.terrain.side)
-            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
-            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Water] as u64)
-            .sum::<u64>()
-            + w.terrain.overflow_of(race, Element::Water);
-        assert_eq!(before_total, 68_000 - 100, "nothing lost or gained before the retry runs");
-
         let log = InputLog::new();
         for _ in 0..TERRAIN_PERIOD {
             w.step(&log);
         }
-
-        assert_eq!(w.terrain.overflow_of(race, Element::Water), 0, "fully retried once headroom reopens, nothing left banked");
-        let after_total: u64 = (0..w.terrain.side)
-            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
-            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Water] as u64)
-            .sum();
-        assert_eq!(after_total, 68_000 - 100, "the banked shortfall actually lands on terrain -- nothing created or destroyed");
+        assert_eq!(w.terrain.overflow_of(race, Element::Water), 68_000 - 100, "nothing drains the bank on its own");
     }
 
     #[test]
@@ -2296,14 +2314,18 @@ mod tests {
         let id = w.spawn(race, pos);
         {
             let i = w.find(id).unwrap();
-            w.entities[i].carried[Element::Wood] = 2000 * SMELT_RATIO_IN; // 2000 whole batches
+            w.entities[i].carried[Element::Wood] = 2000 * SMELT_RATIO_IN; // far more than one firing can touch
         }
         let (x, y) = w.terrain.cell_of(pos);
         w.terrain.cell_mut(x, y)[Element::Wood] = u16::MAX - 100; // only 100 headroom for tailings
 
         w.smelt(id, Element::Wood);
 
-        let tailings = 2000 * (SMELT_RATIO_IN - SMELT_RATIO_OUT);
+        // Smelt's shipped recipe caps a single firing at `Flat(u16::MAX)`
+        // input units -- only that many actually convert this call, not all
+        // 2000 batches carried.
+        let batches = (u16::MAX as u64) / SMELT_RATIO_IN;
+        let tailings = batches * (SMELT_RATIO_IN - SMELT_RATIO_OUT);
         assert_eq!(w.terrain.cell(x, y)[Element::Wood], u16::MAX, "cell fills to exactly its ceiling");
         assert_eq!(
             w.terrain.overflow_of(race, Element::Wood),
@@ -2311,18 +2333,15 @@ mod tests {
             "smelt's tailings shortfall on a saturated cell must be banked, not destroyed"
         );
 
+        // Known hole from the action-recipe migration (`deposit_at`'s own
+        // doc comment): nothing retries a banked shortfall anymore, even
+        // once headroom reopens and the world keeps running.
         w.terrain.cell_mut(x, y)[Element::Wood] = 0;
         let log = InputLog::new();
-        for _ in 0..(2000 * TERRAIN_PERIOD) {
+        for _ in 0..TERRAIN_PERIOD {
             w.step(&log);
         }
-
-        assert_eq!(w.terrain.overflow_of(race, Element::Wood), 0, "fully retried once headroom reopens");
-        let after_total: u64 = (0..w.terrain.side)
-            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
-            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Wood] as u64)
-            .sum();
-        assert_eq!(after_total, tailings - 100, "the banked tailings shortfall actually lands, nothing created or destroyed");
+        assert_eq!(w.terrain.overflow_of(race, Element::Wood), tailings - 100, "nothing drains the bank on its own");
     }
 
     #[test]
@@ -2357,14 +2376,19 @@ mod tests {
 
         // smelt() batches/consumed/produced/tailings arithmetic on a huge
         // `have` -- must not panic (overflow) and must conserve exactly.
+        // Smelt's shipped recipe caps a single firing at `Flat(u16::MAX)`
+        // input units (`race.rs`'s `RACES` migration doc comment) -- at this
+        // scale `have` vastly exceeds that cap, so only one firing's worth
+        // (65 535, floored to a whole batch) actually converts; the rest
+        // stays carried, untouched, ready for a later firing.
         w.smelt(id, Element::Wood);
-        let batches = huge / SMELT_RATIO_IN;
+        let batches = (u16::MAX as u64) / SMELT_RATIO_IN;
         let consumed = batches * SMELT_RATIO_IN;
         let produced = batches * SMELT_RATIO_OUT;
         let tailings = consumed - produced;
         {
             let i = w.find(id).unwrap();
-            assert_eq!(w.entities[i].carried[Element::Wood], huge - consumed, "leftover under one batch stays untouched even at this scale");
+            assert_eq!(w.entities[i].carried[Element::Wood], huge - consumed, "only one firing's capped batch converts, the rest stays carried");
             assert_eq!(w.entities[i].carried[Element::Fire], produced, "Wood.generates() == Fire, exact batch conversion");
         }
         // Tailings deposit_at's own headroom/overflow arithmetic on a huge
@@ -2390,53 +2414,21 @@ mod tests {
             let i = w.find(id).unwrap();
             w.entities[i].alive = false;
         }
-        // Reviewer-1 round-3 fix: `charge_death` above also added an
-        // `OnDeath` consume-demand charge for `race` (Metal), independent of
-        // `deposit_at`. Once granted by the governor, `apply_conversion`'s
-        // own (pre-existing, unrelated-to-this-fix) production line spends
-        // that demand by drawing down `race.element.habitat()` -- Metal's
-        // habitat is Earth (`Element::habitat` is one ring-step back from
-        // `generates`) -- and depositing the converted result as Metal. That
-        // is a real, correct, and *already-accounted-for* Earth-to-Metal
-        // transfer (this same test's Earth cell has real stock sitting in
-        // it after the deposit above, so the draw has something to actually
-        // consume), but it is not what this probe is about: this probe
-        // tracks each element's grand total in isolation
-        // (`terrain(e) + overflow_of(race, e)`), which is only a valid
-        // invariant for a channel nothing else is concurrently draining.
-        // Zeroing the banked demand here removes that unrelated confound so
-        // the assertions below isolate exactly what they claim to check --
-        // `deposit_at`'s own shortfall-banking/retry arithmetic -- without
-        // also asserting a stronger, unrelated claim (that ordinary
-        // Conversion habitat consumption never touches a channel this probe
-        // happens to be watching), which was never bug 6's scope and is
-        // proven separately by `tests/conservation.rs`'s whole-system
-        // invariant instead.
-        w.consume_demand = PerRace::filled(0);
-        w.last_consume = PerRace::default();
-
         let water_landed = w.terrain.cell(x, y)[Element::Water] as u64;
         let water_banked = w.terrain.overflow_of(race, Element::Water);
         assert_eq!(water_landed + water_banked, huge, "carried Water: every unit is either on terrain or banked");
 
-        let earth_landed = w.terrain.cell(x, y)[Element::Earth] as u64;
-        let earth_banked = w.terrain.overflow_of(race, Element::Earth);
-        assert_eq!(earth_landed + earth_banked, huge, "item Earth quantity: every unit is either on terrain or banked");
+        // `charge_death`'s `items` no longer go through `deposit_at` at all
+        // (action-recipe migration) -- they populate `World::ground_items`
+        // instead. The huge Earth item quantity should land there, whole,
+        // not split across terrain/overflow.
+        let earth_on_ground: u64 = w.ground_items.iter().filter(|g| g.element == Element::Earth).map(|g| g.quantity).sum();
+        assert_eq!(earth_on_ground, huge, "item Earth quantity: lands whole in ground_items, not on terrain");
 
-        // Run the retry loop for real and check exact conservation, not
-        // full drain: at this magnitude (~4.6e18) the shortfall vastly
-        // exceeds this world's entire grid capacity (16*16 cells *
-        // u16::MAX each ~= 1.7e7), so `apply_conversion`'s per-tick retry
-        // can only ever land a sliver per tick and the rest is correctly
-        // re-banked (`terrain.rs`'s "other channels" retry loop:
-        // `*terrain.overflow.get_mut(r).get_mut(e) = banked - applied`) --
-        // this is expected, not a bug: nothing here promises delivery
-        // within any bounded number of ticks, only that nothing is ever
-        // destroyed. `deposit_at`'s doc comment's "until it fully lands" is
-        // a liveness property for realistic magnitudes (grid capacity is
-        // ~250x a whole lifetime's worth of mining at this world's own
-        // tuning), not a safety one -- conservation itself must hold at any
-        // magnitude, which is what this asserts.
+        // Known hole from the action-recipe migration (`deposit_at`'s own
+        // doc comment): `apply_conversion`, the only code that ever retried
+        // a banked shortfall, is gone -- running the world for real must
+        // not panic at this magnitude, and nothing banked drains on its own.
         let log = InputLog::new();
         for _ in 0..TERRAIN_PERIOD {
             w.step(&log);
@@ -2448,16 +2440,14 @@ mod tests {
                 .sum();
             on_terrain + w.terrain.overflow_of(race, e)
         };
-        assert_eq!(grand_total(Element::Wood), tailings, "Wood: still exactly conserved after many retry ticks, whether landed or still banked");
-        assert_eq!(grand_total(Element::Water), huge, "Water: still exactly conserved after many retry ticks, whether landed or still banked");
-        assert_eq!(grand_total(Element::Earth), huge, "Earth: still exactly conserved after many retry ticks, whether landed or still banked");
+        assert_eq!(grand_total(Element::Wood), tailings, "Wood: still exactly conserved, nothing drains or vanishes");
+        assert_eq!(grand_total(Element::Water), huge, "Water: still exactly conserved, nothing drains or vanishes");
 
         // A second, realistic-but-still-well-beyond-a-lifetime magnitude
-        // (200,000 -- about 3x the bug report's own 68,000 example) *does*
-        // fully drain within one grid's worth of retry ticks, since it's
-        // well under total grid capacity -- proving the "eventually lands"
-        // liveness property actually holds at every magnitude gameplay
-        // could plausibly reach.
+        // (200,000 -- about 3x the bug report's own 68,000 example) stays
+        // banked too, same as any other magnitude now -- the old "eventually
+        // lands within one grid's retry ticks" liveness property no longer
+        // holds for any magnitude, large or small.
         let big: u64 = 200_000;
         let mut carried2 = PerElement::filled(0u64);
         carried2[Element::Fire] = big;
@@ -2468,7 +2458,7 @@ mod tests {
         for _ in 0..TERRAIN_PERIOD {
             w.step(&log);
         }
-        assert_eq!(w.terrain.overflow_of(race, Element::Fire), 0, "a realistic-magnitude banked shortfall does fully drain within one grid's retry ticks");
+        assert_eq!(w.terrain.overflow_of(race, Element::Fire), big - 50, "a banked shortfall stays banked -- nothing drains it anymore, at any magnitude");
     }
 
     #[test]
@@ -2499,27 +2489,14 @@ mod tests {
 
         w.terrain.cell_mut(x, y)[Element::Metal] = 0;
         let log = InputLog::new();
-        // Two terrain periods, not one: `apportion` caps what it can move
-        // into a single cell in a single call at `u16::MAX` (`terrain.rs`'s
-        // `let v = amt.min(u16::MAX as u64) as u16`), regardless of how much
-        // headroom the cell actually has open. The banked shortfall here
-        // (67,900) exceeds that per-tick cap (65,535), so the first terrain
-        // tick can only land 65,535 and correctly re-banks the remaining
-        // 2,365 for the next one -- this is the same "eventually lands, not
-        // necessarily this very tick" liveness property
-        // `reviewer8_probe_extreme_carried_and_item_quantities_do_not_panic_or_lose_material`
-        // documents at a much larger scale. One extra period is enough here
-        // since the remainder is small.
+        // Known hole from the action-recipe migration (`deposit_at`'s own
+        // doc comment): nothing retries a banked shortfall anymore, even
+        // once headroom reopens and the world keeps running.
         for _ in 0..(TERRAIN_PERIOD * 2) {
             w.step(&log);
         }
 
-        assert_eq!(w.terrain.overflow_of(race, Element::Metal), 0, "fully retried once headroom reopens across enough terrain ticks");
-        let after_total: u64 = (0..w.terrain.side)
-            .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
-            .map(|(xx, yy)| w.terrain.cell(xx, yy)[Element::Metal] as u64)
-            .sum();
-        assert_eq!(after_total, 68_000 - 100, "the banked shortfall actually lands, nothing created or destroyed");
+        assert_eq!(w.terrain.overflow_of(race, Element::Metal), 68_000 - 100, "nothing drains the bank on its own");
     }
 
     #[test]
@@ -2568,11 +2545,24 @@ mod tests {
             Item { element: Element::Fire, quantity: 600 },
         ];
 
-        let fire_total = material + 600;
-        let water_total = 5_000 + 1_200 + 800;
+        // Action-recipe migration: items no longer deposit to terrain at
+        // all (they populate `World::ground_items` instead), so only
+        // `material`/`carried` compete for this cell's saturated headroom.
+        let fire_total = material;
+        let water_total = 5_000u64;
         let earth_total = 3_000;
 
         w.charge_death(race, pos, material, &carried, &items);
+
+        assert_eq!(
+            w.ground_items,
+            vec![
+                GroundItem { element: Element::Water, quantity: 1_200, pos },
+                GroundItem { element: Element::Water, quantity: 800, pos },
+                GroundItem { element: Element::Fire, quantity: 600, pos },
+            ],
+            "items land whole in ground_items, unaffected by terrain saturation"
+        );
 
         // Every cell caps at exactly its ceiling, never past it, regardless
         // of how many separate calls contributed to filling it.
@@ -2607,18 +2597,9 @@ mod tests {
         assert_eq!(w.terrain.overflow_of(race, Element::Wood), 0);
         assert_eq!(w.terrain.overflow_of(race, Element::Metal), 0);
 
-        // Now actually run the retry through the real `phase_terrain` path
-        // and confirm both banked channels land their exact remainder, with
-        // nothing double-applied in the process (which would show up as a
-        // grand total exceeding what was actually still banked). The cells
-        // are reset to 0 to reopen headroom, deliberately discarding both
-        // the pre-existing baseline and whatever this call already landed
-        // on top of it -- same discipline the existing
-        // `charge_death_banks_a_saturated_deposits_shortfall_instead_of_losing_it`
-        // test above uses -- so only the still-banked remainder is tracked
-        // from here on.
-        let fire_still_banked = fire_banked;
-        let water_still_banked = water_banked;
+        // Known hole from the action-recipe migration (`deposit_at`'s own
+        // doc comment): nothing retries a banked shortfall anymore, even
+        // once headroom reopens and the world keeps running.
         w.terrain.cell_mut(x, y)[Element::Fire] = 0;
         w.terrain.cell_mut(x, y)[Element::Water] = 0;
         let log = InputLog::new();
@@ -2626,17 +2607,8 @@ mod tests {
             w.step(&log);
         }
 
-        assert_eq!(w.terrain.overflow_of(race, Element::Fire), 0, "Fire shortfall fully retried");
-        assert_eq!(w.terrain.overflow_of(race, Element::Water), 0, "Water shortfall fully retried");
-
-        let grand_total = |e: Element| -> u64 {
-            (0..w.terrain.side)
-                .flat_map(|yy| (0..w.terrain.side).map(move |xx| (xx, yy)))
-                .map(|(xx, yy)| w.terrain.cell(xx, yy)[e] as u64)
-                .sum()
-        };
-        assert_eq!(grand_total(Element::Fire), fire_still_banked, "Fire: exactly the still-banked remainder lands, nothing double-applied");
-        assert_eq!(grand_total(Element::Water), water_still_banked, "Water: exactly the still-banked remainder lands, nothing double-applied");
+        assert_eq!(w.terrain.overflow_of(race, Element::Fire), fire_banked, "nothing drains the Fire bank on its own");
+        assert_eq!(w.terrain.overflow_of(race, Element::Water), water_banked, "nothing drains the Water bank on its own");
     }
 
     #[test]
@@ -2661,7 +2633,12 @@ mod tests {
         assert!(!w.entities[idx].alive, "test setup should have killed the body of old age this tick");
         let (x, y) = w.terrain.cell_of(pos);
         assert_eq!(w.terrain.cell(x, y)[Element::Wood], 15, "carried stock reaches terrain on natural death");
-        assert_eq!(w.terrain.cell(x, y)[Element::Fire], 9, "bundled item reaches terrain on natural death");
+        assert_eq!(w.terrain.cell(x, y)[Element::Fire], 0, "bundled items no longer reach terrain directly");
+        assert_eq!(
+            w.ground_items,
+            vec![GroundItem { element: Element::Fire, quantity: 9, pos }],
+            "bundled item lands in ground_items instead"
+        );
     }
 
     #[test]
@@ -2697,8 +2674,13 @@ mod tests {
         assert!(w.entities[pred_idx].items.is_empty(), "predator does not inherit prey's items");
 
         let (x, y) = w.terrain.cell_of(pos);
-        assert_eq!(w.terrain.cell(x, y)[Element::Earth], 30, "prey's carried stock falls to the ground");
-        assert_eq!(w.terrain.cell(x, y)[Element::Metal], 6, "prey's item falls to the ground");
+        assert_eq!(w.terrain.cell(x, y)[Element::Earth], 30, "prey's carried stock falls to terrain");
+        assert_eq!(w.terrain.cell(x, y)[Element::Metal], 0, "prey's item no longer falls to terrain directly");
+        assert_eq!(
+            w.ground_items,
+            vec![GroundItem { element: Element::Metal, quantity: 6, pos }],
+            "prey's item lands in ground_items instead"
+        );
     }
 
     #[test]
@@ -2757,5 +2739,138 @@ mod tests {
         assert_eq!(w.terrain.total(Element::Fire), 0, "no phantom Fire deposit from the chain");
         assert_eq!(w.terrain.total(Element::Earth), 0, "no phantom Earth deposit from the chain");
         assert_eq!(w.terrain.total(Element::Metal), 0, "X is alive -- none of its material has hit terrain yet");
+    }
+
+    // ------------------------------------------------------------------
+    // Action-recipe system: Exist auto-fire, Pickup, ground-item decay. No
+    // shipped race carries a Pickup recipe yet, so those tests retune one in.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn exist_grows_body_material_once_per_terrain_tick_for_races_that_have_it() {
+        let mut w = World::new(60, 8);
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let pos = V2::new(Fx::from_int(3), Fx::from_int(3));
+        // Seed the whole grid, not just the spawn cell -- an Animal walks
+        // over 100 ticks (`speed`/jitter), so a single-cell seed would leave
+        // it on unseeded ground well before the first terrain tick fires.
+        for y in 0..8i32 {
+            for x in 0..8i32 {
+                w.terrain.cell_mut(x, y)[Element::Fire.habitat()] = 20_000;
+            }
+        }
+        let id = w.spawn(race, pos);
+
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert!(e.material > 0, "Exist should have grown this body's own material by the first terrain tick");
+    }
+
+    #[test]
+    fn a_race_with_no_exist_recipe_never_grows_material_from_existing() {
+        // "No action, no effect" -- the rule the action-recipe migration
+        // replaced the old unconditional `Conversion` mechanism with (see
+        // race.rs's module doc).
+        let mut w = World::new(61, 8);
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let mut races = w.races.clone();
+        races[race].actions.retain(|a| a.slot != ActionSlot::Exist);
+        w.retune(races);
+        let pos = V2::new(Fx::from_int(3), Fx::from_int(3));
+        for y in 0..8i32 {
+            for x in 0..8i32 {
+                w.terrain.cell_mut(x, y)[Element::Fire.habitat()] = 20_000;
+            }
+        }
+        let id = w.spawn(race, pos);
+
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.material, 0, "no Exist recipe means existence does nothing");
+    }
+
+    /// A race with a `Pickup` recipe retuned in — no shipped race carries
+    /// one by default (this migration's design leaves it ready for a future
+    /// race to opt in, see race.rs's module doc).
+    fn race_with_pickup(w: &World, race: Race, reach: Fx) -> PerRace<RaceAttrs> {
+        let mut races = w.races.clone();
+        races[race].actions.push(ActionRecipe {
+            slot: ActionSlot::Pickup,
+            input: RecipeSlot::Ground,
+            output: RecipeSlot::Carried,
+            transform: ElementTransform::Identity,
+            ratio_in: 1,
+            ratio_out: 1,
+            rate: RateLaw::Flat(u16::MAX),
+            cooldown_ticks: 0,
+            reach,
+        });
+        races
+    }
+
+    #[test]
+    fn pickup_draws_from_ground_items_within_reach_and_ignores_out_of_reach() {
+        let mut w = World::new(62, 16);
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let races = race_with_pickup(&w, race, Fx::ONE);
+        w.retune(races);
+        let pos = V2::new(Fx::from_int(5), Fx::from_int(5));
+        let id = w.spawn(race, pos);
+        w.ground_items.push(GroundItem { element: Element::Water, quantity: 40, pos });
+        w.ground_items.push(GroundItem {
+            element: Element::Water,
+            quantity: 999,
+            pos: V2::new(Fx::from_int(15), Fx::from_int(15)), // well outside reach
+        });
+
+        let occ = Occupancy::build(&w.entities, &w.terrain);
+        w.apply_action_recipe(id, ActionSlot::Pickup, Element::Water, &occ);
+
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.carried[Element::Water], 40, "picked up the whole in-reach pile");
+        let still_on_ground: u64 = w.ground_items.iter().filter(|g| g.element == Element::Water).map(|g| g.quantity).sum();
+        assert_eq!(still_on_ground, 999, "the out-of-reach pile is untouched");
+    }
+
+    #[test]
+    fn pickup_is_a_noop_with_nothing_in_reach() {
+        let mut w = World::new(63, 16);
+        let race = Race { element: Element::Fire, kind: Kind::Animal };
+        let races = race_with_pickup(&w, race, Fx::ONE);
+        w.retune(races);
+        let pos = V2::new(Fx::from_int(5), Fx::from_int(5));
+        let id = w.spawn(race, pos);
+
+        let occ = Occupancy::build(&w.entities, &w.terrain);
+        w.apply_action_recipe(id, ActionSlot::Pickup, Element::Water, &occ);
+
+        let e = w.entities.iter().find(|e| e.id == id).unwrap();
+        assert_eq!(e.carried[Element::Water], 0);
+    }
+
+    #[test]
+    fn ground_items_decay_back_into_terrain_at_a_bounded_rate() {
+        let mut w = World::new(64, 8);
+        let pos = V2::new(Fx::from_int(3), Fx::from_int(3));
+        w.ground_items.push(GroundItem { element: Element::Wood, quantity: 10_000, pos });
+
+        let log = InputLog::new();
+        for _ in 0..TERRAIN_PERIOD {
+            w.step(&log);
+        }
+
+        let remaining: u64 = w.ground_items.iter().filter(|g| g.element == Element::Wood).map(|g| g.quantity).sum();
+        assert!(remaining < 10_000, "one terrain tick of decay should have moved something back to terrain");
+        let (x, y) = w.terrain.cell_of(pos);
+        let landed = w.terrain.cell(x, y)[Element::Wood] as u64;
+        assert_eq!(landed + remaining, 10_000, "every unit is either landed on terrain or still on the ground -- none vanished");
     }
 }

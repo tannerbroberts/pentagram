@@ -7,10 +7,10 @@
 use std::io::Write;
 
 use pentagram::element::{Element, PerElement};
-use pentagram::race::{Kind, PerRace, Race, RateBand};
+use pentagram::race::{ActionSlot, Kind, PerRace, Race, RateLaw};
 use pentagram::world::World;
 
-use pentagram::tuning::{abbrev, grouped, Axis, Tuning, PAGES, RGB};
+use pentagram::tuning::{grouped, Axis, Tuning, PAGES, RGB};
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Half-cell glyphs, indexed by how crowded the sampled cell is: a lone body
@@ -288,8 +288,7 @@ fn map(out: &mut impl Write, w: &World, h: usize, cols: usize) {
 fn races(out: &mut impl Write, v: &View, w: &World, t: &Tuning, _cols: usize) {
     let _ = writeln!(
         out,
-        "{DIM}race    alive  population        conversion draw: floor╵ nominal┊ granted▓ ceiling→ \
-         │      granted state{RESET}{CLEAR_EOL}"
+        "{DIM}race    alive  population        exist: rate  ratio in/out  state{RESET}{CLEAR_EOL}"
     );
 
     let peak = Element::ALL
@@ -305,54 +304,33 @@ fn races(out: &mut impl Write, v: &View, w: &World, t: &Tuning, _cols: usize) {
         // 5 rows at a time — not both kinds merged and not stacked to ten
         // rows. Press `x` to flip it.
         let race = Race { element: e, kind: v.kind };
-        // Invariant VIII: deposit's own governor/band is retired (see
-        // `race::Conversion`'s doc comment) — this panel now reads the one
-        // remaining governor, which gates the habitat draw the conversion
-        // runs on; `floor` is a spend reserve now, not a free minimum, so
-        // an extinct race's grant genuinely goes to zero rather than
-        // "still churning at its floor."
-        let g = w.last_consume[race];
-        let band = t.races[race].consume;
+        // Action-recipe system: there is no more population-aggregate
+        // governor to read (retired along with `race::Conversion`) — this
+        // panel reads the per-entity `Exist` recipe every race's own
+        // existence dispatches through instead.
+        let exist = t.races[race].action(ActionSlot::Exist);
+        let rate = exist.map_or(0, |a| match a.rate {
+            RateLaw::Flat(n) => n as i64,
+            RateLaw::NeighborScaled { base, .. } => base as i64,
+        });
         let c = col(RGB[e]);
         let state = if pop[e] == 0 {
-            format!("{DIM}extinct — no longer drawing or depositing{RESET}")
-        } else if g.clipped > 0 {
-            format!("{c}rate-limited{RESET}{DIM} — {} refused{RESET}", abbrev(g.clipped as i64))
+            format!("{DIM}extinct — no longer dispatched{RESET}")
         } else {
-            format!("{DIM}inside its band{RESET}")
+            format!("{DIM}alive{RESET}")
         };
         let _ = writeln!(
             out,
-            "{c}{:<7}{RESET}{:>5}  {c}{:<16}{RESET} {} {:>7}/{:<7} {}{CLEAR_EOL}",
+            "{c}{:<7}{RESET}{:>5}  {c}{:<16}{RESET} {:>6} {:>5}/{:<5} {}{CLEAR_EOL}",
             e.name(),
             pop[e],
             spark(&v.history[race], peak, 16),
-            gauge(g.granted, band, &c, 26),
-            g.granted,
-            band.ceiling,
+            rate,
+            exist.map_or(0, |a| a.ratio_in),
+            exist.map_or(0, |a| a.ratio_out),
             state
         );
     }
-}
-
-/// The band, drawn to scale from 0 to the ceiling: filled to `granted`, with
-/// the floor and nominal marked in place. This is the whole governor story in
-/// one line — where the rate is allowed to sit, and where it actually is.
-fn gauge(granted: u64, b: RateBand, c: &str, w: usize) -> String {
-    let ceil = b.ceiling.max(1) as u64;
-    let at = |x: u64| ((x * w as u64) / ceil).min(w as u64 - 1) as usize;
-    let fill = ((granted * w as u64) / ceil).min(w as u64) as usize;
-
-    let mut chars = vec!['░'; w];
-    for ch in chars.iter_mut().take(fill) {
-        *ch = '▓';
-    }
-    chars[at(b.floor as u64)] = '╵';
-    chars[at(b.nominal as u64)] = '┊';
-
-    let lit: String = chars[..fill].iter().collect();
-    let rest: String = chars[fill..].iter().collect();
-    format!("{DIM}│{c}{lit}{DIM}{rest}│{RESET}")
 }
 
 fn spark(h: &[u32], max: u32, w: usize) -> String {
@@ -411,30 +389,13 @@ fn grid(out: &mut impl Write, v: &View, t: &Tuning, cols: usize) {
         let _ = writeln!(out, "{line}{CLEAR_EOL}");
     }
 
-    // §3.1, computed rather than hoped for. `RaceAttrs::terraform_pressure`
-    // (produced-per-life, via the race's own `Conversion` ratio, divided by
-    // lifespan) is what keeps a race that lives eight minutes from reshaping
-    // the map faster than one that lives a fortnight, and it is the first
-    // thing a lifespan or conversion-ratio edit breaks.
-    let p: Vec<u64> = Element::ALL
-        .iter()
-        .map(|e| t.races[Race { element: *e, kind: v.kind }].terraform_pressure())
-        .collect();
-    let (lo, hi) = (
-        p.iter().copied().min().unwrap_or(1).max(1),
-        p.iter().copied().max().unwrap_or(1),
-    );
-    let spread = hi * 100 / lo;
-    let verdict = if spread <= 200 {
-        format!("{DIM}spread {}.{:02}× — inside parity{RESET}", spread / 100, spread % 100)
-    } else {
-        format!("{BRIGHT}spread {}.{:02}× — OUTSIDE the 2× parity band{RESET}", spread / 100, spread % 100)
-    };
-    let mut line = format!("{DIM}{:<18}{RESET}", "pressure");
-    for e in Element::ALL {
-        line.push_str(&format!("{DIM}{:>w$}{RESET}", p[e.index()], w = cw));
-    }
-    let _ = writeln!(out, "{line}  {verdict}{CLEAR_EOL}");
+    // The §3.1 "terraform pressure" parity display (produced-per-life vs.
+    // lifespan, via a race's own `Conversion` ratio) is retired along with
+    // `RaceAttrs::terraform_pressure` itself in the action-recipe migration
+    // -- there is no cross-race parity guarantee left to display (a
+    // documented hole, not solved in this pass: see the migration's own
+    // notes). No replacement metric here rather than a display that would
+    // silently imply a guarantee that no longer holds.
 }
 
 fn footer(out: &mut impl Write, v: &View, t: &Tuning, run: &Run, _cols: usize) {
