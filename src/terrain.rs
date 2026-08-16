@@ -41,10 +41,10 @@ use std::collections::BTreeMap;
 
 use crate::element::{Element, PerElement};
 use crate::entity::Entity;
-use crate::fx::V2;
 use crate::hash::{Hashable, Hasher};
 use crate::race::{PerRace, Race};
 use crate::rand::{rand_below, Channel};
+use crate::tile::Tile;
 
 /// Element colours. The single definition — `tuning::RGB` re-exports this
 /// rather than keeping its own copy, so the filmstrip renderer (`blend_rgb`,
@@ -169,16 +169,6 @@ impl Terrain {
         ((index as i32) % side, (index as i32) / side)
     }
 
-    /// Which cell a world position falls in — the same floor/clamp
-    /// `World::phase_movement` already performs on entity positions.
-    #[inline]
-    pub fn cell_of(&self, pos: V2) -> (i32, i32) {
-        (
-            pos.x.floor_int().clamp(0, self.side - 1),
-            pos.y.floor_int().clamp(0, self.side - 1),
-        )
-    }
-
     #[inline]
     pub fn cell(&self, x: i32, y: i32) -> &PerElement<u16> {
         &self.cells[self.index(x, y)]
@@ -279,8 +269,7 @@ impl Occupancy {
             if !e.alive {
                 continue;
             }
-            let (x, y) = terrain.cell_of(e.pos);
-            let idx = terrain.index(x, y) as u32;
+            let idx = terrain.index(e.pos.x, e.pos.y) as u32;
             let race = e.race();
             *weight.get_mut(race).entry(idx).or_insert(0) += 1;
         }
@@ -357,8 +346,7 @@ impl SpatialIndex {
             if !e.alive {
                 continue;
             }
-            let (x, y) = terrain.cell_of(e.pos);
-            offsets[terrain.index(x, y) + 1] += 1;
+            offsets[terrain.index(e.pos.x, e.pos.y) + 1] += 1;
         }
         for c in 1..offsets.len() {
             offsets[c] += offsets[c - 1];
@@ -369,8 +357,7 @@ impl SpatialIndex {
             if !e.alive {
                 continue;
             }
-            let (x, y) = terrain.cell_of(e.pos);
-            let c = terrain.index(x, y);
+            let c = terrain.index(e.pos.x, e.pos.y);
             packed[cursor[c] as usize] = i as u32;
             cursor[c] += 1;
         }
@@ -393,10 +380,9 @@ impl SpatialIndex {
     /// Every alive entity's original index whose cell lies within
     /// `radius_cells` (inclusive) of cell `(cx, cy)`, in ascending index
     /// order. The caller still owns the exact distance check -- this only
-    /// narrows which cells are worth looking in, exactly the same
-    /// broadphase-then-narrowphase split `phase_collisions`'s own bounding
-    /// check already performs per pair, just applied before the pair is
-    /// ever formed instead of after.
+    /// narrows which cells are worth looking in, the same
+    /// broadphase-then-narrowphase split every reach-gated pass in this
+    /// crate uses, just applied before the exact check runs instead of after.
     pub fn query_ring(&self, cx: i32, cy: i32, radius_cells: i32) -> Vec<u32> {
         let r = radius_cells.max(0);
         let mut out = Vec::new();
@@ -417,6 +403,15 @@ impl SpatialIndex {
         }
         out.sort_unstable();
         out
+    }
+
+    /// Whether cell `idx` (`Terrain::index`'s output) holds any alive body
+    /// as of this snapshot — O(1), the tile-occupancy-blocking primitive
+    /// `World::phase_movement` needs, reusing the same CSR ranges
+    /// `query_ring` already answers multi-cell queries from.
+    #[inline]
+    pub fn is_occupied(&self, idx: u32) -> bool {
+        self.offsets[idx as usize] != self.offsets[idx as usize + 1]
     }
 }
 
@@ -562,12 +557,11 @@ fn apportion(
 /// eventually landing. Still correctly *counted* (material is not lost from
 /// the conservation ledger), but ecologically inert until something gives
 /// `overflow` a retry pass again.
-pub fn deposit_at(terrain: &mut Terrain, race: Race, e: Element, amount: u64, pos: V2) {
+pub fn deposit_at(terrain: &mut Terrain, race: Race, e: Element, amount: u64, pos: Tile) {
     if amount == 0 {
         return;
     }
-    let (x, y) = terrain.cell_of(pos);
-    let c = terrain.cell_mut(x, y);
+    let c = terrain.cell_mut(pos.x, pos.y);
     let headroom = u64::from(u16::MAX - c[e]);
     let applied = amount.min(headroom);
     c[e] += applied as u16;

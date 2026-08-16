@@ -18,6 +18,9 @@ use crate::fx::Fx;
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
 pub enum Channel {
+    /// Retired: continuous-movement positional jitter, gone along with the
+    /// old physics-based `phase_movement`/`phase_collisions`. Kept, unread,
+    /// per this enum's own "never reuse a discriminant" rule.
     MoveJitter = 0,
     Wander = 1,
     Collision = 2,

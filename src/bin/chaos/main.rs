@@ -32,10 +32,10 @@ use std::time::{Duration, Instant};
 use pentagram::behavior::BehaviorTuning;
 use pentagram::ecology::PropagationTuning;
 use pentagram::element::Element;
-use pentagram::fx::{Fx, V2};
 use pentagram::input::{CmdKind, Command, InputLog};
 use pentagram::race::{Kind, PerRace, Race, TERRAIN_PERIOD};
-use pentagram::rand::{rand_below, rand_signed, Channel};
+use pentagram::rand::{rand_below, Channel};
+use pentagram::tile::Tile;
 use pentagram::world::World;
 
 use pentagram::tuning::{write_table, Tuning};
@@ -342,7 +342,7 @@ fn handle(
                 for _ in 0..t.restock[r] {
                     let x = rand_below(seed, w.tick, w.next_id, Channel::SpawnPlacement, size.max(1) as u32);
                     let y = rand_below(seed, w.tick, w.next_id ^ 0x5A5A, Channel::SpawnPlacement, size.max(1) as u32);
-                    w.spawn(r, V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)));
+                    w.spawn(r, Tile::new(x as i32, y as i32));
                 }
             }
             sim.ticked = 0;
@@ -368,7 +368,7 @@ fn handle(
 fn inputs(w: &World, t: &Tuning, wander_pct: u32, seed: u64, ticks: u64) -> InputLog {
     let mut log = InputLog::new();
     let tick = w.tick;
-    let size = w.size.floor_int().max(1) as u32;
+    let size = w.size.max(1) as u32;
 
     let mut pop: PerRace<u32> = PerRace::filled(0);
     for e in &w.entities {
@@ -390,28 +390,30 @@ fn inputs(w: &World, t: &Tuning, wander_pct: u32, seed: u64, ticks: u64) -> Inpu
                 kind: CmdKind::Spawn {
                     element: r.element,
                     kind: r.kind,
-                    at: V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)),
+                    at: Tile::new(x as i32, y as i32),
                 },
             });
         }
     }
 
     // Re-steer `wander_pct` of the population per second, spread across the
-    // ticks this frame covers. Without it bodies bounce between walls on rails.
+    // ticks this frame covers, toward a fresh random tile target. No longer
+    // load-bearing the way it was under continuous movement (Graze already
+    // re-rolls a random step every eligible tick on its own now), but still
+    // exercises `SetTarget` as ordinary player-shaped input, same as before.
     let n = w.entities.len() as u64;
     if wander_pct > 0 && n > 0 {
         let steers = (n * wander_pct as u64 * ticks / 100 / 100).max(1).min(n);
         for s in 0..steers {
             let at = rand_below(seed, tick, s as u32, Channel::Wander, n as u32) as usize;
+            let to = Tile::new(
+                rand_below(seed, tick, s as u32 + 1, Channel::Wander, size) as i32,
+                rand_below(seed, tick, s as u32 + 2, Channel::Wander, size) as i32,
+            );
             log.push(Command {
                 tick: tick + (s * ticks / steers.max(1)),
                 entity: w.entities[at].id,
-                kind: CmdKind::SetHeading {
-                    dir: V2::new(
-                        rand_signed(seed, tick, s as u32 + 1, Channel::Wander),
-                        rand_signed(seed, tick, s as u32 + 2, Channel::Wander),
-                    ),
-                },
+                kind: CmdKind::SetTarget { to: Some(to) },
             });
         }
     }

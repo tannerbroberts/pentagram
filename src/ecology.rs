@@ -64,7 +64,6 @@
 
 use crate::element::PerElement;
 use crate::entity::Entity;
-use crate::fx::Fx;
 use crate::hash::{Hashable, Hasher};
 use crate::race::{Kind, PerRace, Race};
 use crate::terrain::Terrain;
@@ -82,8 +81,9 @@ const HUNT_WEIGHT_DEFAULT: u16 = 150;
 /// does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EcologyTuning {
-    /// How far a body can reach to eat prey on its ring edge, in cells.
-    pub forage_radius: PerElement<Fx>,
+    /// How far a body can reach to eat prey on its ring edge, in tiles
+    /// (Chebyshev distance).
+    pub forage_radius: PerElement<i32>,
     /// Minimum ticks between one body's successful meals — read off `hunger`,
     /// so a body that just ate ignores prey in reach until this many ticks
     /// have passed. Without a cooldown, `phase_feeding` runs every tick and
@@ -143,7 +143,7 @@ impl Default for EcologyTuning {
             }
         }
         EcologyTuning {
-            forage_radius: PerElement::filled(Fx::ratio(400, 100)),
+            forage_radius: PerElement::filled(4),
             satiation: PerElement::filled(crate::race::RaceAttrs::FEED_PERIOD as u32),
             feed_gain: PerElement::filled(40),
             // Generous relative to `RaceAttrs::FEED_PERIOD` (200 ticks — the
@@ -180,7 +180,7 @@ impl Default for EcologyTuning {
 impl Hashable for EcologyTuning {
     fn hash_into(&self, h: &mut Hasher) {
         for (_, v) in self.forage_radius.iter() {
-            h.i32(v.raw());
+            h.i32(*v);
         }
         for (_, v) in self.satiation.iter() {
             h.u32(*v);
@@ -228,8 +228,7 @@ pub fn apply_attrition(entities: &mut [Entity], terrain: &Terrain, tuning: &Ecol
         if !e.alive {
             continue;
         }
-        let (x, y) = terrain.cell_of(e.pos);
-        let stock = terrain.cell(x, y)[e.element.eaten_by()] as u64;
+        let stock = terrain.cell(e.pos.x, e.pos.y)[e.element.eaten_by()] as u64;
         let rate = tuning.attrition_rate[e.element] as u64;
         let dmg = ((stock * rate) / 1000).min(e.hp.max(0) as u64) as i32;
         e.hp = e.hp.saturating_sub(dmg);
@@ -250,8 +249,7 @@ pub fn apply_suppression(entities: &mut [Entity], terrain: &Terrain, tuning: &Ec
         if !e.alive {
             continue;
         }
-        let (x, y) = terrain.cell_of(e.pos);
-        let stock = terrain.cell(x, y)[e.element.suppressed_by()] as u64;
+        let stock = terrain.cell(e.pos.x, e.pos.y)[e.element.suppressed_by()] as u64;
         let rate = tuning.suppression_rate[e.element] as u64;
         let extra = ((stock * rate) / 1000) as u32;
         e.hunger = e.hunger.saturating_add(extra);
@@ -282,8 +280,9 @@ pub struct PropagationTuning {
     /// rooting to succeed -- the same raw stock scale `EcologyTuning::
     /// attrition_rate` reads (up to `u16::MAX`), not a per-mille fraction.
     pub root_min: PerElement<u16>,
-    /// Max scatter offset from the parent, same shape as `world::BIRTH_SCATTER`.
-    pub dispersal: PerElement<Fx>,
+    /// Max scatter offset from the parent, in tiles — same shape as
+    /// `world::BIRTH_SCATTER`.
+    pub dispersal: PerElement<i32>,
     /// Max same-race bodies already occupying the candidate cell before
     /// rooting is refused -- the mitigation for the positive-feedback
     /// runaway risk named in section 7 of the design doc: more plants
@@ -309,7 +308,7 @@ impl Default for PropagationTuning {
             chance: PerElement::filled(200),
             offspring_size: PerElement::filled(200),
             root_min: PerElement::filled(300),
-            dispersal: PerElement::filled(Fx::ratio(300, 100)),
+            dispersal: PerElement::filled(3),
             crowd_max: PerElement::filled(3),
             growth_ref: PerElement::filled(1000),
         }
@@ -331,7 +330,7 @@ impl Hashable for PropagationTuning {
             h.u16(*v);
         }
         for (_, v) in self.dispersal.iter() {
-            h.i32(v.raw());
+            h.i32(*v);
         }
         for (_, v) in self.crowd_max.iter() {
             h.u16(*v);

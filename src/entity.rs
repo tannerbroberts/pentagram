@@ -7,15 +7,11 @@
 //! arrives at S5.
 
 use crate::element::{Element, PerElement};
-use crate::fx::{Fx, V2};
+use crate::fx::Fx;
 use crate::hash::{Hashable, Hasher};
-use crate::rand::{rand_range, rand_signed, Channel};
+use crate::rand::{rand_below, rand_range, Channel};
 use crate::race::{ActionSlot, Kind, Race, RaceAttrs};
-
-/// Displacement below which a tick does not count as an action for the
-/// `OnAction` deposition channel. Standing still must not terraform, or Water
-/// stops being action-dominant in practice.
-pub const ACTION_THRESHOLD: Fx = Fx::ratio(1, 100);
+use crate::tile::{Tile, NEIGHBOURS_8};
 
 /// The top of `hp`'s range — a fixed 0..=100 scale regardless of race, the
 /// same way every race's channel mix lives on a 0..1000 per-mille scale
@@ -50,9 +46,29 @@ pub struct Entity {
     pub id: u32,
     pub element: Element,
     pub kind: Kind,
-    pub pos: V2,
-    /// Unit vector. Movement is `heading * SPEED[element]`.
-    pub heading: V2,
+    /// Which tile this body occupies right now — the only position a body
+    /// ever has between ticks (no sub-tile fraction). Updated exactly once
+    /// per tick, by `World::phase_movement`'s occupancy-resolved apply pass.
+    pub pos: Tile,
+    /// One of the 8 fixed unit offsets in `tile::NEIGHBOURS_8` — the
+    /// direction this body last stepped (or was born facing, before its
+    /// first step). Cosmetic/facing bookkeeping only; nothing steers by
+    /// blending toward it the way the old continuous `heading` did.
+    pub facing: Tile,
+    /// Fractional tile-movement budget, banked every tick at this body's
+    /// race's `speed` and spent in whole-tile units by `phase_movement` —
+    /// the discrete-stepping replacement for continuous `pos += heading *
+    /// speed`. A step refused by tile-occupancy blocking leaves this
+    /// unspent, so contention never silently throttles a race's tuned speed.
+    /// Hashed (Invariant VI): it is real state that affects a future tick.
+    pub move_accum: Fx,
+    /// A committed movement goal, set by `CmdKind::SetTarget` and read by
+    /// `behavior::drive`'s Graze fallback (steps toward it instead of
+    /// wandering randomly). `None` means no goal — default wander. Phase-1
+    /// minimal semantics: a plain tile, no pathfinding around obstacles;
+    /// real click-to-walk pathing is layered on top of this same field
+    /// later without changing its shape.
+    pub move_target: Option<Tile>,
     pub age: u64,
     /// Rolled at birth from the race's base lifespan plus its variance, so a
     /// cohort born together does not die together.
@@ -67,10 +83,9 @@ pub struct Entity {
     pub hunger: u32,
     /// S3.5: current structural size, per-mille of full size. 1000 for
     /// everything except an in-progress Plant seedling -- see grown_size.
-    /// Read at exactly one place: World::phase_collisions' radius
-    /// calculation, so a seedling crowds less than a mature plant. Does NOT
-    /// scale deposit/consume demand -- a deliberate choice, see
-    /// docs/S3_ECOLOGY_LAYERS_DESIGN.md section 7.
+    /// Read by `apply_action_recipe`'s `NeighborScaled.per_size` rate-law
+    /// term. Does NOT scale deposit/consume demand -- a deliberate choice,
+    /// see docs/S3_ECOLOGY_LAYERS_DESIGN.md section 7.
     pub size: u16,
     /// Invariant VIII (material conservation): how many units of its own
     /// element (`self.element`) this specific body currently holds/embodies
@@ -116,13 +131,15 @@ pub struct Entity {
 impl Entity {
     /// `a` is the spawning world's *live* row for this element, not the shipped
     /// table — the live view can retune between one birth and the next.
-    pub fn spawn(id: u32, element: Element, pos: V2, seed: u64, tick: u64, a: &RaceAttrs) -> Entity {
+    pub fn spawn(id: u32, element: Element, pos: Tile, seed: u64, tick: u64, a: &RaceAttrs) -> Entity {
         Entity {
             id,
             element,
             kind: a.kind,
             pos,
-            heading: initial_heading(seed, tick, id),
+            facing: initial_facing(seed, tick, id),
+            move_accum: Fx::ZERO,
+            move_target: None,
             age: 0,
             lifespan: roll_lifespan(a, seed, tick, id),
             // Born at half strength, not full: `EcologyTuning::repro_threshold`
@@ -178,14 +195,20 @@ impl Entity {
 
 impl Hashable for Entity {
     fn hash_into(&self, h: &mut Hasher) {
-        h.u32(self.id)
-            .u8(self.element as u8)
-            .u8(self.kind as u8)
-            .i32(self.pos.x.raw())
-            .i32(self.pos.y.raw())
-            .i32(self.heading.x.raw())
-            .i32(self.heading.y.raw())
-            .u64(self.age)
+        h.u32(self.id).u8(self.element as u8).u8(self.kind as u8);
+        self.pos.hash_into(h);
+        self.facing.hash_into(h);
+        h.i32(self.move_accum.raw());
+        match self.move_target {
+            None => {
+                h.bool(false);
+            }
+            Some(t) => {
+                h.bool(true);
+                t.hash_into(h);
+            }
+        }
+        h.u64(self.age)
             .u64(self.lifespan)
             .i32(self.hp)
             .bool(self.alive)
@@ -271,15 +294,12 @@ pub fn roll_lifespan(a: &RaceAttrs, seed: u64, tick: u64, id: u32) -> u64 {
     scaled.max(1) as u64
 }
 
-/// A deterministic unit heading from the entity's birth coordinates.
-pub fn initial_heading(seed: u64, tick: u64, id: u32) -> V2 {
-    let x = rand_signed(seed, tick, id, Channel::Wander);
-    let y = rand_signed(seed, tick, id.wrapping_add(0x5EED), Channel::Wander);
-    let v = V2::new(x, y);
-    if v.len_sq().is_zero() {
-        V2::new(Fx::ONE, Fx::ZERO)
-    } else {
-        v.normalized()
-    }
+/// A deterministic initial facing from the entity's birth coordinates — one
+/// of the 8 fixed unit offsets in `tile::NEIGHBOURS_8`, the discrete
+/// replacement for the old continuous random unit heading.
+pub fn initial_facing(seed: u64, tick: u64, id: u32) -> Tile {
+    let i = rand_below(seed, tick, id, Channel::Wander, NEIGHBOURS_8.len() as u32) as usize;
+    let (dx, dy) = NEIGHBOURS_8[i];
+    Tile::new(dx, dy)
 }
 

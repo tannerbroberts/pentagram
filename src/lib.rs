@@ -60,6 +60,7 @@ pub mod race;
 pub mod rand;
 pub mod replay;
 pub mod terrain;
+pub mod tile;
 pub mod tuning;
 pub mod world;
 
@@ -72,4 +73,5 @@ pub use input::{CmdKind, Command, InputLog};
 pub use race::{attrs, RaceAttrs, RateBand, TERRAIN_PERIOD};
 pub use replay::{record, verify, Divergence, Trace};
 pub use terrain::{Terrain, TerrainTuning};
+pub use tile::Tile;
 pub use world::World;

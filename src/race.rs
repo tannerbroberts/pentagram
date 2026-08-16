@@ -286,9 +286,10 @@ pub struct ActionRecipe {
     /// Ticks after a firing before this entity may trigger this recipe
     /// again. `0` fires every tick/every command it is asked to.
     pub cooldown_ticks: u16,
-    /// Reach for a `Ground`-sourced recipe (`Pickup`); ignored otherwise —
-    /// conventionally `Fx::ZERO` on every other recipe.
-    pub reach: Fx,
+    /// Reach, in tiles (Chebyshev distance), for a `Ground`-sourced recipe
+    /// (`Pickup`); ignored otherwise — conventionally `0` on every other
+    /// recipe.
+    pub reach: i32,
 }
 
 impl ActionRecipe {
@@ -313,7 +314,7 @@ impl Hashable for ActionRecipe {
                 h.u8(1).u16(base).u16(per_neighbor).u16(per_size);
             }
         }
-        h.u16(self.cooldown_ticks).i32(self.reach.raw());
+        h.u16(self.cooldown_ticks).i32(self.reach);
     }
 }
 
@@ -337,7 +338,10 @@ pub struct RaceAttrs {
     /// and it is not where intuition puts it. Change this expecting the whole
     /// world to reorganise.
     pub speed: Fx,
-    /// Collision radius in cells.
+    /// No longer gates any gameplay collision — tile-occupancy blocking
+    /// (`World::phase_movement`) replaced the old pairwise physics
+    /// separation this field used to size. Kept only for `body_is_valid`'s
+    /// sanity check below and the windowed client's cosmetic render circle.
     pub radius: Fx,
 
     /// This race's action map — every way it writes to, or draws from,
@@ -364,8 +368,10 @@ impl RaceAttrs {
     /// assumption: an Animal must actually move, a Plant must actually not —
     /// `phase_movement`'s structural skip for `Kind::Plant` (`world.rs`) only
     /// makes sense if the table itself is honest about which rows are rooted.
-    /// Both kinds still need a body that crowds neighbours, so `radius` is
-    /// unconditional. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4.
+    /// `radius` stays unconditionally positive regardless of Kind, even
+    /// though it no longer gates collision, purely as a sanity floor on the
+    /// table (a zero-radius body renders as nothing). See
+    /// `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4.
     fn body_is_valid(&self) -> bool {
         let speed_ok = match self.kind {
             Kind::Animal => self.speed > Fx::ZERO,
@@ -552,7 +558,7 @@ fn seed_actions(mut a: RaceAttrs) -> RaceAttrs {
         ratio_out,
         rate: RateLaw::Flat(nominal),
         cooldown_ticks: 0,
-        reach: Fx::ZERO,
+        reach: 0,
     });
     if a.kind == Kind::Animal {
         a.actions.push(ActionRecipe {
@@ -564,7 +570,7 @@ fn seed_actions(mut a: RaceAttrs) -> RaceAttrs {
             ratio_out: 1,
             rate: RateLaw::Flat(40), // first-guess, uniform across every Animal row
             cooldown_ticks: 0,
-            reach: Fx::ZERO,
+            reach: 0,
         });
         a.actions.push(ActionRecipe {
             slot: ActionSlot::Smelt,
@@ -575,7 +581,7 @@ fn seed_actions(mut a: RaceAttrs) -> RaceAttrs {
             ratio_out: 1,
             rate: RateLaw::Flat(u16::MAX), // "convert everything held" — see caveat in RaceAttrs::action's callers
             cooldown_ticks: 0,
-            reach: Fx::ZERO,
+            reach: 0,
         });
     }
     a

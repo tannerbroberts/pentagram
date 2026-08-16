@@ -13,7 +13,7 @@
 //! (see `Cargo.toml`'s own comment). The simulation library underneath
 //! remains zero-dependency and never sees a float — this file reads sim
 //! state and submits ordinary input commands (`CmdKind::Spawn`,
-//! `CmdKind::SetHeading`), exactly the way the terminal client does.
+//! `CmdKind::SetTarget`), exactly the way the terminal client does.
 
 #![allow(clippy::float_arithmetic)]
 
@@ -24,11 +24,11 @@ use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use pentagram::element::{Element, PerElement};
 use pentagram::entity::Entity;
-use pentagram::fx::{Fx, V2};
 use pentagram::input::{CmdKind, Command, InputLog};
 use pentagram::race::{Kind, PerRace, Race, TERRAIN_PERIOD};
-use pentagram::rand::{rand_below, rand_signed, Channel};
+use pentagram::rand::{rand_below, Channel};
 use pentagram::terrain::blend_rgb;
+use pentagram::tile::Tile;
 use pentagram::tuning::{abbrev, grouped, write_table, Axis, Knob, Tuning, PAGES, RGB};
 use pentagram::world::World;
 
@@ -232,7 +232,7 @@ impl App {
     fn inputs(&mut self, ticks: u64) -> InputLog {
         let mut log = InputLog::new();
         let tick = self.w.tick;
-        let size = self.w.size.floor_int().max(1) as u32;
+        let size = self.w.size.max(1) as u32;
 
         let mut pop: PerRace<u32> = PerRace::filled(0);
         for e in &self.w.entities {
@@ -254,27 +254,30 @@ impl App {
                     kind: CmdKind::Spawn {
                         element: r.element,
                         kind: r.kind,
-                        at: V2::new(Fx::from_int(x as i32), Fx::from_int(y as i32)),
+                        at: Tile::new(x as i32, y as i32),
                     },
                 });
             }
         }
 
+        // No longer load-bearing the way it was under continuous movement
+        // (Graze already re-rolls a random step every eligible tick on its
+        // own now), but still exercises `SetTarget` as ordinary
+        // player-shaped input, same as before.
         let n = self.w.entities.len() as u64;
         if self.wander_pct > 0 && n > 0 {
             let steers = (n * self.wander_pct as u64 * ticks / 100 / 100).max(1).min(n);
             for s in 0..steers {
                 let at = rand_below(self.seed, tick, s as u32, Channel::Wander, n as u32) as usize;
                 let id = self.w.entities[at].id;
+                let to = Tile::new(
+                    rand_below(self.seed, tick, s as u32 + 1, Channel::Wander, size) as i32,
+                    rand_below(self.seed, tick, s as u32 + 2, Channel::Wander, size) as i32,
+                );
                 log.push(Command {
                     tick: tick + (s * ticks / steers.max(1)),
                     entity: id,
-                    kind: CmdKind::SetHeading {
-                        dir: V2::new(
-                            rand_signed(self.seed, tick, s as u32 + 1, Channel::Wander),
-                            rand_signed(self.seed, tick, s as u32 + 2, Channel::Wander),
-                        ),
-                    },
+                    kind: CmdKind::SetTarget { to: Some(to) },
                 });
             }
         }
@@ -659,7 +662,9 @@ impl App {
                     if !ent.alive || !self.vis.body(ent) {
                         continue;
                     }
-                    let p = to_screen(ent.pos.x.to_f32_render(), ent.pos.y.to_f32_render());
+                    // +0.5: centre the sprite within its tile rather than
+                    // pinning it to the tile's top-left corner.
+                    let p = to_screen(ent.pos.x as f32 + 0.5, ent.pos.y as f32 + 0.5);
                     let full_r = (self.t.races[ent.race()].radius.to_f32_render() * scale * 0.6).clamp(1.5, 8.0);
                     let grow = (ent.size as f32 / 1000.0).clamp(0.15, 1.0);
                     let r = full_r * grow;

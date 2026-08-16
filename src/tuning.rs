@@ -190,7 +190,7 @@ static BODY: [Knob; 9] = [
           |t, e| (t.races[e].speed.raw() as i64 * 100 + 32_768) / 65_536,
           |t, e, v| t.races[e].speed = Fx::ratio(v as i32, 100)),
     knob!("radius", Fmt::Cells, Step::Add(5), 1, 2_000,
-          "collision radius in cells; bigger bodies crowd each other out of a region sooner",
+          "no longer gates collision (tile-occupancy blocking replaced it) — cosmetic render size only",
           |t, e| (t.races[e].radius.raw() as i64 * 100 + 32_768) / 65_536,
           |t, e, v| t.races[e].radius = Fx::ratio(v as i32, 100)),
     knob!("restock to", Fmt::Int, Step::Add(5), 0, 250,
@@ -281,10 +281,10 @@ static TERRAIN: [Knob; 2] = [
 /// for why the shipped defaults are a first guess rather than a promised
 /// balance.
 static ECOLOGY: [Knob; 8] = [
-    knob!("forage radius", Fmt::Cells, Step::Add(20), 0, 4_000,
-          "how far a body can reach to eat prey on the ring edge it eats",
-          |t, e| (t.ecology.forage_radius[e.element].raw() as i64 * 100 + 32_768) / 65_536,
-          |t, e, v| t.ecology.forage_radius[e.element] = Fx::ratio(v as i32, 100)),
+    knob!("forage radius", Fmt::Int, Step::Add(1), 0, 40,
+          "how far, in tiles (Chebyshev distance), a body can reach to eat prey on the ring edge it eats",
+          |t, e| t.ecology.forage_radius[e.element] as i64,
+          |t, e, v| t.ecology.forage_radius[e.element] = v as i32),
     knob!("satiation", Fmt::Ticks, Step::Scale, 1, TICKS_PER_DAY as i64,
           "minimum ticks between one body's successful meals",
           |t, e| t.ecology.satiation[e.element] as i64,
@@ -332,29 +332,25 @@ static PROPAGATION: [Knob; 6] = [
           "minimum terrain stock of the plant's own element required at the candidate cell",
           |t, e| t.propagation.root_min[e.element] as i64,
           |t, e, v| t.propagation.root_min[e.element] = v as u16),
-    knob!("dispersal", Fmt::Cells, Step::Add(5), 0, 2000,
-          "max scatter offset from the parent, in cells",
-          |t, e| (t.propagation.dispersal[e.element].raw() as i64 * 100 + 32_768) / 65_536,
-          |t, e, v| t.propagation.dispersal[e.element] = Fx::ratio(v as i32, 100)),
+    knob!("dispersal", Fmt::Int, Step::Add(1), 0, 20,
+          "max scatter offset from the parent, in tiles",
+          |t, e| t.propagation.dispersal[e.element] as i64,
+          |t, e, v| t.propagation.dispersal[e.element] = v as i32),
     knob!("crowd max", Fmt::Int, Step::Add(1), 0, 1000,
           "max same-race bodies already occupying the candidate cell",
           |t, e| t.propagation.crowd_max[e.element] as i64,
           |t, e, v| t.propagation.crowd_max[e.element] = v as u16),
 ];
 
-static BEHAVIOR: [Knob; 3] = [
+static BEHAVIOR: [Knob; 2] = [
     knob!("flee threshold", Fmt::Int, Step::Add(200), 0, u16::MAX as i64,
           "terrain stock of what eats this race, at its own cell, above which it flees",
           |t, e| t.behavior.flee_threshold[e] as i64,
           |t, e, v| t.behavior.flee_threshold[e] = v as u16),
-    knob!("sense radius", Fmt::Cells, Step::Add(20), 0, 4_000,
-          "how far a body can sense prey, in cells -- larger than forage radius on purpose",
-          |t, e| (t.behavior.sense_radius[e].raw() as i64 * 100 + 32_768) / 65_536,
-          |t, e, v| t.behavior.sense_radius[e] = Fx::ratio(v as i32, 100)),
-    knob!("turn rate", Fmt::Permille, Step::Add(25), 0, 1000,
-          "per-tick steering blend toward the desired heading; 0 never turns, 1000 snaps",
-          |t, e| (t.behavior.turn_rate[e].raw() as i64 * 1000) / 65_536,
-          |t, e, v| t.behavior.turn_rate[e] = Fx::ratio(v as i32, 1000)),
+    knob!("sense radius", Fmt::Int, Step::Add(1), 0, 40,
+          "how far, in tiles (Chebyshev distance), a body can sense prey -- larger than forage radius on purpose",
+          |t, e| t.behavior.sense_radius[e] as i64,
+          |t, e, v| t.behavior.sense_radius[e] = v as i32),
 ];
 
 pub static PAGES: &[Page] = &[
@@ -492,8 +488,7 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
     let _ = write!(
         s,
         "pub const ECOLOGY_TUNING: EcologyTuning = EcologyTuning {{\n    \
-         forage_radius: PerElement([Fx::ratio({}, 100), Fx::ratio({}, 100), Fx::ratio({}, 100), \
-         Fx::ratio({}, 100), Fx::ratio({}, 100)]),\n    \
+         forage_radius: PerElement([{}, {}, {}, {}, {}]),\n    \
          satiation: PerElement([{}, {}, {}, {}, {}]),\n    \
          feed_gain: PerElement([{}, {}, {}, {}, {}]),\n    \
          starve_after: PerElement([{}, {}, {}, {}, {}]),\n    \
@@ -501,9 +496,9 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
          repro_threshold: PerElement([{}, {}, {}, {}, {}]),\n    \
          attrition_rate: PerElement([{}, {}, {}, {}, {}]),\n    \
          suppression_rate: PerElement([{}, {}, {}, {}, {}]),\n}};\n",
-        cells(ec.forage_radius[Element::ALL[0]]), cells(ec.forage_radius[Element::ALL[1]]),
-        cells(ec.forage_radius[Element::ALL[2]]), cells(ec.forage_radius[Element::ALL[3]]),
-        cells(ec.forage_radius[Element::ALL[4]]),
+        ec.forage_radius[Element::ALL[0]], ec.forage_radius[Element::ALL[1]],
+        ec.forage_radius[Element::ALL[2]], ec.forage_radius[Element::ALL[3]],
+        ec.forage_radius[Element::ALL[4]],
         ec.satiation[Element::ALL[0]], ec.satiation[Element::ALL[1]], ec.satiation[Element::ALL[2]],
         ec.satiation[Element::ALL[3]], ec.satiation[Element::ALL[4]],
         ec.feed_gain[Element::ALL[0]], ec.feed_gain[Element::ALL[1]], ec.feed_gain[Element::ALL[2]],
@@ -528,8 +523,7 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
          chance: PerElement([{}, {}, {}, {}, {}]),\n    \
          offspring_size: PerElement([{}, {}, {}, {}, {}]),\n    \
          root_min: PerElement([{}, {}, {}, {}, {}]),\n    \
-         dispersal: PerElement([Fx::ratio({}, 100), Fx::ratio({}, 100), Fx::ratio({}, 100), \
-         Fx::ratio({}, 100), Fx::ratio({}, 100)]),\n    \
+         dispersal: PerElement([{}, {}, {}, {}, {}]),\n    \
          crowd_max: PerElement([{}, {}, {}, {}, {}]),\n}};\n",
         pt.period[Element::ALL[0]], pt.period[Element::ALL[1]], pt.period[Element::ALL[2]],
         pt.period[Element::ALL[3]], pt.period[Element::ALL[4]],
@@ -539,9 +533,9 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
         pt.offspring_size[Element::ALL[3]], pt.offspring_size[Element::ALL[4]],
         pt.root_min[Element::ALL[0]], pt.root_min[Element::ALL[1]], pt.root_min[Element::ALL[2]],
         pt.root_min[Element::ALL[3]], pt.root_min[Element::ALL[4]],
-        cells(pt.dispersal[Element::ALL[0]]), cells(pt.dispersal[Element::ALL[1]]),
-        cells(pt.dispersal[Element::ALL[2]]), cells(pt.dispersal[Element::ALL[3]]),
-        cells(pt.dispersal[Element::ALL[4]]),
+        pt.dispersal[Element::ALL[0]], pt.dispersal[Element::ALL[1]],
+        pt.dispersal[Element::ALL[2]], pt.dispersal[Element::ALL[3]],
+        pt.dispersal[Element::ALL[4]],
         pt.crowd_max[Element::ALL[0]], pt.crowd_max[Element::ALL[1]], pt.crowd_max[Element::ALL[2]],
         pt.crowd_max[Element::ALL[3]], pt.crowd_max[Element::ALL[4]],
     );
@@ -552,38 +546,20 @@ pub fn write_table(t: &Tuning) -> std::io::Result<String> {
     let bt = &t.behavior;
     let mut flee = String::new();
     let mut sense = String::new();
-    let mut turn = String::new();
     for race in Race::ALL {
         let _ = writeln!(flee, "        {}, // {} {}", bt.flee_threshold[race], race.element.name(), race.kind.name());
-        let _ = writeln!(
-            sense,
-            "        Fx::ratio({}, 100), // {} {}",
-            cells(bt.sense_radius[race]), race.element.name(), race.kind.name()
-        );
-        let _ = writeln!(
-            turn,
-            "        Fx::ratio({}, 1000), // {} {}",
-            (bt.turn_rate[race].raw() as i64 * 1000) / 65_536, race.element.name(), race.kind.name()
-        );
+        let _ = writeln!(sense, "        {}, // {} {}", bt.sense_radius[race], race.element.name(), race.kind.name());
     }
     let _ = write!(
         s,
         "\npub const BEHAVIOR_TUNING: BehaviorTuning = BehaviorTuning {{\n    \
          flee_threshold: PerRace([\n{}    ]),\n    \
-         sense_radius: PerRace([\n{}    ]),\n    \
-         turn_rate: PerRace([\n{}    ]),\n}};\n",
-        flee, sense, turn,
+         sense_radius: PerRace([\n{}    ]),\n}};\n",
+        flee, sense,
     );
 
     std::fs::write(&path, s)?;
     Ok(path)
-}
-
-/// Whole cells, one fractional digit lost to the same rounding `write_table`
-/// already accepts for `speed`/`radius` — this file round-trips for a human
-/// to copy by hand, not bit-for-bit.
-fn cells(v: Fx) -> i64 {
-    (v.raw() as i64 * 100 + 32_768) / 65_536
 }
 
 /// One `ActionRecipe` as a pasteable Rust literal — `write_table`'s
@@ -598,7 +574,7 @@ fn action_recipe_src(a: &ActionRecipe) -> String {
     format!(
         "ActionRecipe {{ slot: ActionSlot::{:?}, input: RecipeSlot::{:?}, output: RecipeSlot::{:?}, \
          transform: ElementTransform::{:?}, ratio_in: {}, ratio_out: {}, rate: {}, cooldown_ticks: {}, \
-         reach: Fx::ratio({}, 100) }}",
-        a.slot, a.input, a.output, a.transform, a.ratio_in, a.ratio_out, rate, a.cooldown_ticks, cells(a.reach),
+         reach: {} }}",
+        a.slot, a.input, a.output, a.transform, a.ratio_in, a.ratio_out, rate, a.cooldown_ticks, a.reach,
     )
 }

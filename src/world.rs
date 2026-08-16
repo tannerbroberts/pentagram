@@ -4,37 +4,40 @@
 //! detail. Reordering any two phases changes results and therefore invalidates
 //! every recorded replay — treat it the way you would treat a wire format.
 //!
-//! `commands → aging → movement → collisions → feeding → flora → terrain →
-//! reap` — `feeding` (S2, `phase_feeding`) runs after collisions so predator
-//! and prey are compared at this tick's settled positions. `flora` (S3.5,
-//! `phase_flora`) runs right after feeding, before terrain, so it never grows
-//! `phase_terrain`'s own fixed operator sequence into an extra slot.
-//! `terrain` (S1, extended by the action-recipe migration) runs the fixed
-//! sequence described in `terrain.rs`'s own doc comment — bounded diffusion,
-//! plus every living body's `Exist` action, auto-fired once per terrain tick.
-//! The old `settle` phase (accumulating per-race existence demand for the
-//! now-retired `Conversion`/`Governor` pipeline) is gone: `Exist` reads
-//! terrain directly, per body, the same way `Mine` already does, with no
-//! population-aggregate pre-settlement step to run first.
+//! `commands → aging → movement → feeding → flora → terrain → reap` —
+//! `movement` (tile-grid rewrite) is discrete tile-stepping with built-in
+//! occupancy blocking (decide → resolve conflicts → apply), replacing the
+//! old separate `movement`/`collisions` pair — a body simply cannot step
+//! onto an already-occupied tile, so there is no longer a pairwise
+//! push-apart pass to run after it. `feeding` (S2, `phase_feeding`) runs
+//! after movement so predator and prey are compared at this tick's settled
+//! positions. `flora` (S3.5, `phase_flora`) runs right after feeding, before
+//! terrain, so it never grows `phase_terrain`'s own fixed operator sequence
+//! into an extra slot. `terrain` (S1, extended by the action-recipe
+//! migration) runs the fixed sequence described in `terrain.rs`'s own doc
+//! comment — bounded diffusion, plus every living body's `Exist` action,
+//! auto-fired once per terrain tick. The old `settle` phase (accumulating
+//! per-race existence demand for the now-retired `Conversion`/`Governor`
+//! pipeline) is gone: `Exist` reads terrain directly, per body, the same way
+//! `Mine` already does, with no population-aggregate pre-settlement step to
+//! run first.
 
 use crate::behavior::{BehaviorTuning, Drive};
 use crate::ecology::{EcologyTuning, PropagationTuning};
 use crate::element::{Element, PerElement};
-use crate::entity::{Entity, Item, ACTION_THRESHOLD, MAX_HP};
-use crate::fx::{Fx, V2};
+use crate::entity::{Entity, Item, MAX_HP};
+use crate::fx::Fx;
 use crate::governor::Governor;
 use crate::hash::{Hashable, Hasher};
 use crate::input::{CmdKind, Command, InputLog};
 use crate::race::{ActionSlot, ElementTransform, Kind, PerRace, Race, RaceAttrs, RateLaw, RecipeSlot, TERRAIN_PERIOD};
-use crate::rand::{rand_chance, rand_signed, Channel};
+use crate::rand::{rand_chance, rand_range, Channel};
 use crate::terrain::{Occupancy, Terrain, TerrainTuning};
+use crate::tile::{chebyshev_dist, Tile};
 
-/// Per-tick positional noise, so entities do not travel on perfect rails.
-pub const JITTER: Fx = Fx::ratio(1, 400);
-
-/// Positional spread for an offspring spawned by `phase_feeding`, so a
+/// Max per-axis tile offset for an offspring spawned by `phase_feeding`, so a
 /// cohort born from the same parent does not stack exactly on top of it.
-pub const BIRTH_SCATTER: Fx = Fx::ratio(150, 100);
+pub const BIRTH_SCATTER: i32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Stats {
@@ -79,8 +82,9 @@ pub struct World {
     /// touches this vector must preserve that ordering.
     pub entities: Vec<Entity>,
     pub next_id: u32,
-    /// The simulated square is `[0, size] × [0, size]` in cells.
-    pub size: Fx,
+    /// The simulated square is `[0, size) × [0, size)` in tiles — always
+    /// equal to `terrain.side`.
+    pub size: i32,
 
     /// The tuning table this world is running, seeded (action-populated) from
     /// [`crate::race::seeded_races`] and changeable at runtime through
@@ -127,24 +131,22 @@ pub struct World {
 pub struct GroundItem {
     pub element: Element,
     pub quantity: u64,
-    pub pos: V2,
+    pub pos: Tile,
 }
 
 impl Hashable for GroundItem {
     fn hash_into(&self, h: &mut Hasher) {
-        h.u8(self.element as u8)
-            .u64(self.quantity)
-            .i32(self.pos.x.raw())
-            .i32(self.pos.y.raw());
+        h.u8(self.element as u8).u64(self.quantity);
+        self.pos.hash_into(h);
     }
 }
 
 /// Shared by `apply_action_recipe`'s `Ground`-slot arms — `Pickup`'s
-/// proximity gate. Same squared-distance-compare shape `phase_feeding`'s own
+/// proximity gate. Same Chebyshev-tile-distance shape `phase_feeding`'s own
 /// reach check already uses.
 #[inline]
-fn near(a: V2, b: V2, reach: Fx) -> bool {
-    (a - b).len_sq() <= reach * reach
+fn near(a: Tile, b: Tile, reach: i32) -> bool {
+    chebyshev_dist(a, b) <= reach
 }
 
 /// Genesis terrain state (`World::new`'s one-time `seed_uniform` call): every
@@ -161,13 +163,10 @@ const GENESIS_EARTH: u16 = 1000;
 
 impl World {
     pub fn new(seed: u64, size_cells: i32) -> World {
-        // `size` is an `Fx`, which saturates past `i32::MAX >> Fx::SHIFT`
-        // cells — clamping here, once, before it reaches `Fx::from_int` or
-        // `Terrain::new`, keeps both in agreement. Leaving `Terrain` free to
-        // construct at a raw, unclamped size that `Fx` would have silently
-        // shrunk would desync the terrain grid from the entity coordinate
-        // space the design's 1:1 resolution decision depends on.
-        let size_cells = size_cells.clamp(1, i32::MAX >> crate::fx::SHIFT);
+        // `size` is a plain tile count now, so the only floor is "at least
+        // one cell" — `Terrain::new` clamps the same way internally, this
+        // just keeps `World.size` in agreement with it.
+        let size_cells = size_cells.max(1);
         let mut terrain = Terrain::new(size_cells);
         terrain.seed_uniform(Element::Earth, GENESIS_EARTH);
         let terrain_tuning = TerrainTuning::default();
@@ -176,7 +175,7 @@ impl World {
             tick: 0,
             entities: Vec::new(),
             next_id: 1,
-            size: Fx::from_int(size_cells),
+            size: size_cells,
             races: crate::race::seeded_races(),
             terrain,
             ground_decay_gov: Governor::new(terrain_tuning.ground_decay),
@@ -236,23 +235,16 @@ impl World {
                 let salt = (r.index() as u32) * 7919 + k;
                 let x = self.scatter(salt, 0);
                 let y = self.scatter(salt, 1);
-                self.spawn(r, V2::new(x, y));
+                self.spawn(r, Tile::new(x, y));
             }
         }
     }
 
-    fn scatter(&self, salt: u32, axis: u32) -> Fx {
-        let r = crate::rand::rand_below(
-            self.seed,
-            u64::from(axis),
-            salt,
-            Channel::SpawnPlacement,
-            (self.size.floor_int().max(1)) as u32,
-        );
-        Fx::from_int(r as i32)
+    fn scatter(&self, salt: u32, axis: u32) -> i32 {
+        crate::rand::rand_below(self.seed, u64::from(axis), salt, Channel::SpawnPlacement, self.size.max(1) as u32) as i32
     }
 
-    pub fn spawn(&mut self, race: Race, at: V2) -> u32 {
+    pub fn spawn(&mut self, race: Race, at: Tile) -> u32 {
         self.spawn_sized(race, at, 1000)
     }
 
@@ -260,7 +252,7 @@ impl World {
     /// full size) is set explicitly rather than defaulting to fully grown;
     /// only `phase_flora`'s plant offspring (S3.5) ever pass anything but
     /// 1000 -- see `Entity.size`'s own doc comment.
-    pub fn spawn_sized(&mut self, race: Race, at: V2, size: u16) -> u32 {
+    pub fn spawn_sized(&mut self, race: Race, at: Tile, size: u16) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         let a = &self.races[race];
@@ -272,8 +264,8 @@ impl World {
         id
     }
 
-    fn clamp_to_bounds(&self, p: V2) -> V2 {
-        V2::new(p.x.clamp(Fx::ZERO, self.size), p.y.clamp(Fx::ZERO, self.size))
+    fn clamp_to_bounds(&self, p: Tile) -> Tile {
+        p.clamp(self.size)
     }
 
     fn find(&mut self, id: u32) -> Option<usize> {
@@ -288,7 +280,6 @@ impl World {
         self.phase_commands(log);
         self.phase_aging();
         self.phase_movement();
-        self.phase_collisions();
         self.phase_feeding();
         self.phase_flora();
         self.phase_terrain();
@@ -313,12 +304,9 @@ impl World {
             CmdKind::Spawn { element, kind, at } => {
                 self.spawn(Race { element, kind }, at);
             }
-            CmdKind::SetHeading { dir } => {
+            CmdKind::SetTarget { to } => {
                 if let Some(i) = self.find(c.entity) {
-                    let n = dir.normalized();
-                    if !n.len_sq().is_zero() {
-                        self.entities[i].heading = n;
-                    }
+                    self.entities[i].move_target = to;
                 }
             }
             CmdKind::Kill => {
@@ -357,8 +345,8 @@ impl World {
             return;
         }
 
-        let (x, y) = self.terrain.cell_of(self.entities[i].pos);
-        let idx = self.terrain.index(x, y) as u32;
+        let pos = self.entities[i].pos;
+        let idx = self.terrain.index(pos.x, pos.y) as u32;
         let neighbors = occ.count(race, idx);
         let size = self.entities[i].size;
         let requested = match recipe.rate {
@@ -399,11 +387,11 @@ impl World {
 
     /// How many units of `element` this entity can currently draw from
     /// `slot` — the `have` side of `apply_action_recipe`'s batch math.
-    fn recipe_stock(&self, i: usize, slot: RecipeSlot, element: Element, reach: Fx) -> u64 {
+    fn recipe_stock(&self, i: usize, slot: RecipeSlot, element: Element, reach: i32) -> u64 {
         match slot {
             RecipeSlot::Terrain => {
-                let (x, y) = self.terrain.cell_of(self.entities[i].pos);
-                self.terrain.cell(x, y)[element] as u64
+                let pos = self.entities[i].pos;
+                self.terrain.cell(pos.x, pos.y)[element] as u64
             }
             RecipeSlot::Carried => self.entities[i].carried[element],
             RecipeSlot::Item => self.entities[i]
@@ -426,12 +414,12 @@ impl World {
 
     /// Remove `amount` units of `element` from `slot` — always called with
     /// `amount <= recipe_stock(..)`, so every arm below is infallible.
-    fn recipe_withdraw(&mut self, i: usize, slot: RecipeSlot, element: Element, reach: Fx, amount: u64) {
+    fn recipe_withdraw(&mut self, i: usize, slot: RecipeSlot, element: Element, reach: i32, amount: u64) {
         match slot {
             RecipeSlot::Terrain => {
-                let (x, y) = self.terrain.cell_of(self.entities[i].pos);
+                let pos = self.entities[i].pos;
                 let amt16 = amount.min(u16::MAX as u64) as u16;
-                let c = self.terrain.cell_mut(x, y);
+                let c = self.terrain.cell_mut(pos.x, pos.y);
                 c[element] = c[element].saturating_sub(amt16);
             }
             RecipeSlot::Carried => {
@@ -584,8 +572,7 @@ impl World {
                     // Animal's ceiling stays a flat 1000, unchanged.
                     let birth_size = if e.kind == Kind::Plant { propagation.offspring_size[e.element] } else { 1000 };
                     let ceiling = if e.kind == Kind::Plant {
-                        let (x, y) = self.terrain.cell_of(e.pos);
-                        let stock = self.terrain.cell(x, y)[e.element];
+                        let stock = self.terrain.cell(e.pos.x, e.pos.y)[e.element];
                         crate::entity::growth_ceiling(stock, propagation.growth_ref[e.element])
                     } else {
                         1000
@@ -637,7 +624,7 @@ impl World {
     /// straight to terrain — it populates `World::ground_items` at the death
     /// position instead, reachable later by a `Pickup` command rather than
     /// vanishing into the terrain layer immediately.
-    fn charge_death(&mut self, race: Race, pos: V2, material: u64, carried: &PerElement<u64>, items: &[Item]) {
+    fn charge_death(&mut self, race: Race, pos: Tile, material: u64, carried: &PerElement<u64>, items: &[Item]) {
         self.stats.deaths += 1;
         crate::terrain::deposit_at(&mut self.terrain, race, race.element, material, pos);
         for (e, &amt) in carried.iter() {
@@ -648,88 +635,150 @@ impl World {
         }
     }
 
-    /// 3 — move, jitter, and reflect off the bounds.
+    /// 3 — discrete tile-stepping movement with built-in occupancy blocking
+    /// (the OSRS-style tile-grid rewrite). Replaces the old separate
+    /// movement/collision pair entirely: a body simply cannot step onto an
+    /// already-occupied tile, so there is no push-apart pass to run after
+    /// this one. Three fully-materialized, textually separate passes —
+    /// decide, resolve conflicts, apply — the same discipline
+    /// `phase_feeding`'s own `eaten`/`fed`/`ate` scratch vectors already use,
+    /// so no borrow of `self.entities` is ever held both immutably
+    /// (deciding/resolving) and mutably (applying) at once.
+    ///
+    /// **Movement cadence.** Each eligible non-Plant entity banks
+    /// `races[race].speed` into `Entity.move_accum` every tick (a
+    /// Bresenham/DDA-style fractional-tile accumulator — pure `Fx`, no
+    /// floats) and is eligible for one tile step this tick once that reaches
+    /// `Fx::ONE`; the accumulator is clamped to a small ceiling (4 tiles'
+    /// worth) purely as a defensive bound against a pathological >1-tile/tick
+    /// tuning value, since every shipped race's speed keeps it far below
+    /// that ceiling in practice. `Fx::ONE` is spent only on a step that
+    /// actually lands — a step refused by occupancy blocking leaves the
+    /// banked fraction untouched, so contention never silently throttles a
+    /// race's tuned `speed` (an explicitly load-bearing ecology knob, see
+    /// `race.rs`'s own doc comment on `speed`). Phase 1 applies at most one
+    /// step per entity per tick even if more than one tile's worth is
+    /// banked — a deliberate simplification (no shipped race can bank enough
+    /// in realistic contention to need more), flagged for revisit only if
+    /// soak-testing shows otherwise.
+    ///
+    /// **Occupancy blocking.** One `SpatialIndex` snapshot of pre-tick
+    /// positions serves both Hunt-sensing (via `behavior::drive`) and the
+    /// occupancy check — its CSR ranges answer "is this tile occupied," with
+    /// the lowest-id occupant already first per cell, for free. Desired
+    /// destinations are grouped by target tile via a sort over just this
+    /// tick's movers (not a full-grid table — the map can be far larger than
+    /// the live population); a tile the snapshot shows occupied blocks every
+    /// mover that wants it, and a contested empty tile goes to the lowest
+    /// entity id (Invariant IV — the same tie-break `phase_feeding`/Hunt
+    /// sensing already use). A body vacating tile T1 for T2 while another
+    /// wants to step into T1 is resolved against the *pre-tick* snapshot —
+    /// the second body waits one tick rather than being cycle-resolved
+    /// within the same tick. Deliberate phase-1 simplification, not solved
+    /// here — flagged for revisit only if soak-testing shows it materially
+    /// throttles movement. Full one-body-per-tile exclusion (including
+    /// permanently-occupied Plant tiles) is a materially different regime
+    /// from the old soft radius-based push-apart, especially at high
+    /// population — expect emergent traffic-jam dynamics; this is the
+    /// direct, intended consequence of tile-grid navigation, not a defect.
     fn phase_movement(&mut self) {
-        let (seed, tick, size) = (self.seed, self.tick, self.size);
+        let (seed, tick) = (self.seed, self.tick);
         let races = &self.races;
         let ecology = self.ecology;
         let behavior = self.behavior;
         let mut acted: PerRace<u64> = PerRace::filled(0);
         let (mut grazed, mut hunted, mut fled) = (0u64, 0u64, 0u64);
 
-        // S3.4: snapshot-then-apply. Every Animal's desired heading is
-        // derived from an immutable read of this tick's pre-movement
-        // positions, before any body in this same phase has moved —
-        // otherwise steering would depend on iteration order rather than
-        // only on (seed, tick, ids), the same reasoning phase_feeding's own
-        // snapshot-then-apply already documents. See
-        // `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §6.
         let n = self.entities.len();
-        // Built once, shared across every Animal's Hunt scan this phase —
-        // see `SpatialIndex`'s own doc comment for why it can't be reused
-        // past this phase (positions move again in phase_collisions).
+        // Snapshot of pre-tick positions — see this phase's own doc comment.
         let index = crate::terrain::SpatialIndex::build(&self.entities, &self.terrain);
-        let mut drives: Vec<Option<(Drive, Option<V2>)>> = vec![None; n];
-        for i in 0..n {
-            if self.entities[i].alive && self.entities[i].kind == Kind::Animal {
-                drives[i] = Some(crate::behavior::drive(&self.entities, &self.terrain, &index, &ecology, &behavior, i));
-            }
-        }
 
+        // Decide: every eligible entity's desired destination tile, derived
+        // only from the frozen pre-tick snapshot above — never from another
+        // entity's already-applied move this same tick (S3.4's own
+        // snapshot-then-apply reasoning, unchanged by this rewrite).
+        let mut eligible = vec![false; n];
+        let mut desired: Vec<Option<Tile>> = vec![None; n];
+        let mut drive_of: Vec<Option<Drive>> = vec![None; n];
+        const MAX_BANKED: Fx = Fx::from_int(4);
         for i in 0..n {
-            if !self.entities[i].alive {
-                continue;
-            }
-            if self.entities[i].kind == Kind::Plant {
-                // Rooted: a structural skip, not `speed == 0` alone — the
-                // jitter term below would still random-walk a zero-speed
-                // body if this ran. See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4.
+            if !self.entities[i].alive || self.entities[i].kind == Kind::Plant {
+                // Rooted: a structural skip. See
+                // `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §4.
                 continue;
             }
             let race = self.entities[i].race();
+            let accum = (self.entities[i].move_accum + races[race].speed).min(MAX_BANKED);
+            self.entities[i].move_accum = accum;
+            if accum < Fx::ONE {
+                continue;
+            }
+            eligible[i] = true;
 
-            if let Some((d, desired)) = drives[i] {
+            let (d, target) =
+                crate::behavior::drive(&self.entities, &self.terrain, &index, &ecology, &behavior, seed, tick, i);
+            drive_of[i] = Some(d);
+            if let Some(t) = target {
+                let t = t.clamp(self.size);
+                if t != self.entities[i].pos {
+                    desired[i] = Some(t);
+                }
+            }
+        }
+
+        // Resolve conflicts: group this tick's movers by desired destination
+        // tile via a sort (not a full-grid table — `side` can be far larger
+        // than the live population), lowest id first within a group.
+        let mut movers: Vec<(u32, u32, usize)> = Vec::new(); // (dest_idx, id, entity index)
+        // Indexes both `desired` and `self.entities` by the same `i` — not a
+        // single-collection iteration `enumerate()` would simplify.
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..n {
+            if let Some(t) = desired[i] {
+                let dest_idx = self.terrain.index(t.x, t.y) as u32;
+                movers.push((dest_idx, self.entities[i].id, i));
+            }
+        }
+        movers.sort_unstable();
+        let mut winner = vec![false; n];
+        let mut k = 0;
+        while k < movers.len() {
+            let dest_idx = movers[k].0;
+            let mut end = k + 1;
+            while end < movers.len() && movers[end].0 == dest_idx {
+                end += 1;
+            }
+            if !index.is_occupied(dest_idx) {
+                // `movers` is sorted by `(dest_idx, id)`, so `movers[k]` is
+                // this group's lowest id.
+                winner[movers[k].2] = true;
+            }
+            k = end;
+        }
+
+        // Apply: only now does any borrow of `self.entities` become mutable.
+        for i in 0..n {
+            if !eligible[i] {
+                continue;
+            }
+            if let Some(d) = drive_of[i] {
                 match d {
                     Drive::Graze => grazed += 1,
                     Drive::Hunt => hunted += 1,
                     Drive::Flee => fled += 1,
                 }
-                if let Some(target) = desired {
-                    let heading = self.entities[i].heading;
-                    self.entities[i].heading = crate::behavior::steer(heading, target, behavior.turn_rate[race]);
-                }
             }
-
-            let e = &mut self.entities[i];
-            let step = e.heading.scale(races[race].speed);
-            let jitter = V2::new(
-                rand_signed(seed, tick, e.id, Channel::MoveJitter) * JITTER,
-                rand_signed(seed, tick, e.id.wrapping_add(0x9E37), Channel::MoveJitter) * JITTER,
-            );
-            let delta = step + jitter;
-            let mut p = e.pos + delta;
-
-            // Reflect rather than clamp, so a body never sticks to an edge.
-            if p.x < Fx::ZERO {
-                p.x = -p.x;
-                e.heading.x = -e.heading.x;
-            } else if p.x > size {
-                p.x = size + size - p.x;
-                e.heading.x = -e.heading.x;
+            if !winner[i] {
+                continue;
             }
-            if p.y < Fx::ZERO {
-                p.y = -p.y;
-                e.heading.y = -e.heading.y;
-            } else if p.y > size {
-                p.y = size + size - p.y;
-                e.heading.y = -e.heading.y;
-            }
-            e.pos = V2::new(p.x.clamp(Fx::ZERO, size), p.y.clamp(Fx::ZERO, size));
-
-            if delta.len_sq() > ACTION_THRESHOLD * ACTION_THRESHOLD {
-                e.acted = true;
-                *acted.get_mut(race) += 1;
-            }
+            let race = self.entities[i].race();
+            let from = self.entities[i].pos;
+            let to = desired[i].expect("winner[i] implies desired[i] is Some");
+            self.entities[i].pos = to;
+            self.entities[i].facing = Tile::new((to.x - from.x).signum(), (to.y - from.y).signum());
+            self.entities[i].move_accum -= Fx::ONE;
+            self.entities[i].acted = true;
+            *acted.get_mut(race) += 1;
         }
 
         self.stats.grazed += grazed;
@@ -741,75 +790,7 @@ impl World {
         }
     }
 
-    /// 4 — pairwise separation. O(n²) is correct and fast enough for Stage 0;
-    /// a uniform-grid broadphase arrives with the terrain field at S1, and it
-    /// must iterate cells in index order to stay deterministic.
-    fn phase_collisions(&mut self) {
-        let n = self.entities.len();
-        let mut fix = vec![V2::ZERO; n];
-
-        // Broadphase: the same unordered-pair set a brute-force `for j in
-        // (i+1)..n` scan would find, just without visiting every other
-        // entity to find it. `fix`'s accumulation and `stats.collisions`
-        // are both order-independent (every qualifying pair contributes
-        // exactly once, and addition commutes), so — unlike phase_feeding
-        // just below — this rewire only needs the *set* of pairs to match,
-        // not the visiting order. `max_radius` bounds how far any race's
-        // collision footprint can reach, so `a_radius + max_radius` is a
-        // safe upper bound on `min` for every possible `b`, regardless of
-        // which race `b` turns out to be — `SpatialIndex` doesn't know
-        // about per-race radii, only cells.
-        let index = crate::terrain::SpatialIndex::build(&self.entities, &self.terrain);
-        let max_radius = self.races.iter().map(|(_, a)| a.radius).max().unwrap_or(Fx::ZERO);
-
-        for i in 0..n {
-            if !self.entities[i].alive {
-                continue;
-            }
-            let a = &self.entities[i];
-            let a_race = a.race();
-            let a_radius = self.races[a_race].radius * Fx::ratio(a.size as i32, 1000);
-            let (cx, cy) = self.terrain.cell_of(a.pos);
-            let r = crate::terrain::SpatialIndex::radius_cells(a_radius + max_radius);
-            for j in index.query_ring(cx, cy, r) {
-                let j = j as usize;
-                if j <= i || !self.entities[j].alive {
-                    continue;
-                }
-                let b = &self.entities[j];
-                let d = b.pos - self.entities[i].pos;
-                let b_race = b.race();
-                // S3.5: a seedling's collision footprint scales with its
-                // current growth (Entity.size, per-mille of full size) --
-                // the one place size is read. Animals and mature/unrooted
-                // Plants are always at size 1000, so this is a no-op for
-                // them (radius times 1.0 equals radius).
-                let b_radius = self.races[b_race].radius * Fx::ratio(b.size as i32, 1000);
-                let min = a_radius + b_radius;
-                let dist_sq = d.len_sq();
-                if dist_sq >= min * min || dist_sq.is_zero() {
-                    continue;
-                }
-                let dist = d.len();
-                let overlap = (min - dist) * Fx::HALF;
-                let push = d.normalized().scale(overlap);
-                fix[i] = fix[i] - push;
-                fix[j] = fix[j] + push;
-                self.stats.collisions += 1;
-            }
-        }
-
-        let size = self.size;
-        for (i, e) in self.entities.iter_mut().enumerate() {
-            if !e.alive || fix[i] == V2::ZERO {
-                continue;
-            }
-            let p = e.pos + fix[i];
-            e.pos = V2::new(p.x.clamp(Fx::ZERO, size), p.y.clamp(Fx::ZERO, size));
-        }
-    }
-
-    /// 5 — feeding (S2). A body whose `hunger` has reached `ecology.satiation`
+    /// 4 — feeding (S2). A body whose `hunger` has reached `ecology.satiation`
     /// and which is within `ecology.forage_radius` of prey it can pair
     /// against consumes it outright: the prey dies exactly as it would from
     /// age or starvation (`charge_death`), and the predator's `hp` rises and
@@ -830,9 +811,8 @@ impl World {
     /// predation ring is a hard balance problem, and nothing here promises
     /// the shipped numbers converge to a stable population on their own.
     ///
-    /// Pairwise, same O(n²) shape as `phase_collisions` and for the same
-    /// reason — correct and fast enough here, and a future uniform-grid
-    /// broadphase would want to serve both passes at once. At most one
+    /// Pairwise, broadphase-accelerated the same way `phase_movement`'s
+    /// occupancy check is. At most one
     /// direction of any pair can be a predation match: for a same-element
     /// Animal/Plant pair only the Animal side is ever eligible to be
     /// predator (the Kind check below), and for an Animal/Animal pair
@@ -846,10 +826,11 @@ impl World {
         let n = self.entities.len();
         let ecology = self.ecology;
 
-        // Two scratch passes, the same shape `phase_collisions` uses for its
-        // `fix` buffer: decide every outcome first, against a fixed snapshot
-        // of who is alive, then apply — so which pairs are found never
-        // depends on the order mutations happened to land in.
+        // Two scratch passes, the same decide-then-apply shape
+        // `phase_movement`'s own `desired`/`winner` buffers use: decide
+        // every outcome first, against a fixed snapshot of who is alive,
+        // then apply — so which pairs are found never depends on the order
+        // mutations happened to land in.
         let mut eaten = vec![false; n];
         let mut fed = vec![false; n];
         // Invariant VIII: which prey index (if any) each predator index
@@ -860,26 +841,25 @@ impl World {
         // mapping.
         let mut ate: Vec<Option<usize>> = vec![None; n];
 
-        // Broadphase: unlike phase_collisions, this scan's result genuinely
-        // depends on visiting order (a body can only feed once per tick,
-        // enforced by `eaten`/`fed` flags checked mid-scan — see this
-        // function's own doc comment on Invariant IV), so `query_ring`'s
-        // ascending-index guarantee is load-bearing here, not just a nicety.
-        // Which of `(i, j)` ends up `pred` isn't known until the Kind/element
-        // match below runs, so the reach bound has to cover *either*
-        // direction: `max_forage`, the largest `forage_radius` any element
-        // ships, dominates whichever `ecology.forage_radius[pred_el]` this
-        // pair actually resolves to.
+        // Broadphase: this scan's result genuinely depends on visiting order
+        // (a body can only feed once per tick, enforced by `eaten`/`fed`
+        // flags checked mid-scan — see this function's own doc comment on
+        // Invariant IV), so `query_ring`'s ascending-index guarantee is
+        // load-bearing here, not just a nicety. Which of `(i, j)` ends up
+        // `pred` isn't known until the Kind/element match below runs, so the
+        // reach bound has to cover *either* direction: `max_forage`, the
+        // largest `forage_radius` any element ships (already tiles, no
+        // conversion needed), dominates whichever `ecology.forage_radius
+        // [pred_el]` this pair actually resolves to.
         let index = crate::terrain::SpatialIndex::build(&self.entities, &self.terrain);
-        let max_forage = ecology.forage_radius.iter().map(|(_, r)| *r).max().unwrap_or(Fx::ZERO);
-        let search_r = crate::terrain::SpatialIndex::radius_cells(max_forage);
+        let max_forage = ecology.forage_radius.iter().map(|(_, r)| *r).max().unwrap_or(0);
 
         for i in 0..n {
             if !self.entities[i].alive || eaten[i] {
                 continue;
             }
-            let (cx, cy) = self.terrain.cell_of(self.entities[i].pos);
-            for j in index.query_ring(cx, cy, search_r) {
+            let pos = self.entities[i].pos;
+            for j in index.query_ring(pos.x, pos.y, max_forage) {
                 let j = j as usize;
                 if j <= i {
                     continue;
@@ -935,9 +915,9 @@ impl World {
                 if self.entities[pred].hunger < ecology.satiation[pred_el] {
                     continue;
                 }
-                let d = self.entities[prey].pos - self.entities[pred].pos;
+                let d = chebyshev_dist(self.entities[prey].pos, self.entities[pred].pos);
                 let reach = ecology.forage_radius[pred_el];
-                if d.len_sq() > reach * reach {
+                if d > reach {
                     continue;
                 }
                 // S3.3: the final, kind-specific gate. Grazing (Plant prey) is
@@ -1001,7 +981,7 @@ impl World {
             }
         }
 
-        let mut births: Vec<(Race, V2, u32)> = Vec::new();
+        let mut births: Vec<(Race, Tile, u32)> = Vec::new();
         for (i, &was_fed) in fed.iter().enumerate() {
             if !was_fed {
                 continue;
@@ -1045,20 +1025,18 @@ impl World {
         // Newborns join by the normal `spawn` path (ascending id, so the
         // sort invariant holds) after every kill and every meal from this
         // tick is already resolved — a body born from feeding does not
-        // itself get to move, collide or eat again until its own next tick.
-        // An offspring is the same race as its parent — same element and
-        // same kind.
+        // itself get to move or eat again until its own next tick. An
+        // offspring is the same race as its parent — same element and same
+        // kind.
         let (seed, tick) = (self.seed, self.tick);
         for (race, pos, parent_id) in births {
-            let jitter = V2::new(
-                rand_signed(seed, tick, parent_id, Channel::Forage) * BIRTH_SCATTER,
-                rand_signed(seed, tick, parent_id.wrapping_add(0x0F0D), Channel::Forage) * BIRTH_SCATTER,
-            );
-            self.spawn(race, pos + jitter);
+            let dx = rand_range(seed, tick, parent_id, Channel::Forage, -BIRTH_SCATTER, BIRTH_SCATTER + 1);
+            let dy = rand_range(seed, tick, parent_id.wrapping_add(0x0F0D), Channel::Forage, -BIRTH_SCATTER, BIRTH_SCATTER + 1);
+            self.spawn(race, pos.offset(dx, dy));
         }
     }
 
-    /// 6 — plant reproduction (S3.5). Gated at the same terrain-tick
+    /// 5 — plant reproduction (S3.5). Gated at the same terrain-tick
     /// boundary `phase_terrain` uses. A new phase rather than folding into
     /// `phase_terrain`'s own operator sequence, so it never grows that fixed
     /// sequence by an extra slot — see `terrain.rs`'s own module doc.
@@ -1078,7 +1056,7 @@ impl World {
         let propagation = self.propagation;
         let occ = Occupancy::build(&self.entities, &self.terrain);
 
-        let mut offspring: Vec<(Race, V2)> = Vec::new();
+        let mut offspring: Vec<(Race, Tile)> = Vec::new();
         for e in &self.entities {
             if !e.alive || e.kind != Kind::Plant {
                 continue;
@@ -1092,21 +1070,21 @@ impl World {
                 continue;
             }
 
-            let dx = rand_signed(self.seed, self.tick, e.id, Channel::Disperse) * propagation.dispersal[el];
-            let dy = rand_signed(self.seed, self.tick, e.id.wrapping_add(0x0D15), Channel::Disperse) * propagation.dispersal[el];
-            let candidate = self.clamp_to_bounds(e.pos + V2::new(dx, dy));
+            let max = propagation.dispersal[el];
+            let dx = rand_range(self.seed, self.tick, e.id, Channel::Disperse, -max, max + 1);
+            let dy = rand_range(self.seed, self.tick, e.id.wrapping_add(0x0D15), Channel::Disperse, -max, max + 1);
+            let candidate = self.clamp_to_bounds(e.pos.offset(dx, dy));
 
-            let (cx, cy) = self.terrain.cell_of(candidate);
             // S3.8: root_min gates on the candidate cell's stock of the
             // Plant's *habitat* element (what it draws down from terrain to
             // sustain itself), not its own element -- terrain rich in what
             // this plant consumes is good habitat for it.
-            let stock = self.terrain.cell(cx, cy)[el.habitat()];
+            let stock = self.terrain.cell(candidate.x, candidate.y)[el.habitat()];
             if (stock as u32) < propagation.root_min[el] as u32 {
                 self.stats.rooted_rejected += 1;
                 continue;
             }
-            let idx = self.terrain.index(cx, cy) as u32;
+            let idx = self.terrain.index(candidate.x, candidate.y) as u32;
             let race = e.race();
             if occ.count(race, idx) >= propagation.crowd_max[el] as u32 {
                 self.stats.rooted_rejected += 1;
@@ -1123,7 +1101,7 @@ impl World {
         }
     }
 
-    /// 7 — the fixed-order operator sequence gated at a terrain-tick
+    /// 6 — the fixed-order operator sequence gated at a terrain-tick
     /// boundary. See `terrain.rs`'s own doc comment for why this exact order
     /// — existence, attrition, suppression, diffusion, ground decay — is a
     /// wire format, not a stylistic choice.
@@ -1192,7 +1170,7 @@ impl World {
         }
     }
 
-    /// 8 — remove the dead. `retain` is order-preserving, so the id sort holds.
+    /// 7 — remove the dead. `retain` is order-preserving, so the id sort holds.
     fn phase_reap(&mut self) {
         self.entities.retain(|e| e.alive);
     }
@@ -1220,7 +1198,7 @@ impl World {
         h.u64(self.seed)
             .u64(self.tick)
             .u32(self.next_id)
-            .i32(self.size.raw())
+            .i32(self.size)
             .u32(self.entities.len() as u32);
 
         for e in &self.entities {

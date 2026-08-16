@@ -6,10 +6,10 @@
 //! which is the difference between a afternoon and a fortnight.
 
 use crate::element::Element;
-use crate::fx::{Fx, V2};
 use crate::input::{CmdKind, Command, InputLog};
 use crate::race::Kind;
-use crate::rand::{rand_below, rand_signed, Channel};
+use crate::rand::{rand_below, Channel};
+use crate::tile::Tile;
 use crate::world::World;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,18 +89,17 @@ pub fn verify(trace: &Trace, log: &InputLog) -> Result<(), Divergence> {
 pub fn scripted_log(seed: u64, ticks: u64, live_ids: u32) -> InputLog {
     let mut log = InputLog::new();
     for t in 0..ticks {
-        // Steer somebody roughly every third tick.
+        // Commit somebody to a movement goal roughly every third tick.
         if rand_below(seed, t, 0, Channel::Wander, 3) == 0 {
             let target = 1 + rand_below(seed, t, 1, Channel::Wander, live_ids.max(1));
+            let to = Tile::new(
+                rand_below(seed, t, 2, Channel::Wander, 60) as i32,
+                rand_below(seed, t, 3, Channel::Wander, 60) as i32,
+            );
             log.push(Command {
                 tick: t,
                 entity: target,
-                kind: CmdKind::SetHeading {
-                    dir: V2::new(
-                        rand_signed(seed, t, 2, Channel::Wander),
-                        rand_signed(seed, t, 3, Channel::Wander),
-                    ),
-                },
+                kind: CmdKind::SetTarget { to: Some(to) },
             });
         }
         // Occasional incarnation. Kind is hardcoded to Animal here — the
@@ -116,9 +115,9 @@ pub fn scripted_log(seed: u64, ticks: u64, live_ids: u32) -> InputLog {
                 kind: CmdKind::Spawn {
                     element: e,
                     kind: Kind::Animal,
-                    at: V2::new(
-                        Fx::from_int(rand_below(seed, t, 6, Channel::SpawnPlacement, 60) as i32),
-                        Fx::from_int(rand_below(seed, t, 7, Channel::SpawnPlacement, 60) as i32),
+                    at: Tile::new(
+                        rand_below(seed, t, 6, Channel::SpawnPlacement, 60) as i32,
+                        rand_below(seed, t, 7, Channel::SpawnPlacement, 60) as i32,
                     ),
                 },
             });

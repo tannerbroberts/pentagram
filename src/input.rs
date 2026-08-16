@@ -10,8 +10,8 @@
 //! apply them identically.
 
 use crate::element::Element;
-use crate::fx::{Fx, V2};
 use crate::race::Kind;
+use crate::tile::Tile;
 
 pub const MAGIC: u32 = 0x5047_494C; // "PGIL"
 /// v1 (pre-S3) `Spawn` had no `Kind` byte. v2 adds one; `from_bytes` still
@@ -33,17 +33,31 @@ pub const MAGIC: u32 = 0x5047_494C; // "PGIL"
 /// v4 (the generic action-recipe system) adds one more variant, `Pickup`
 /// (tag 7) — same story as v3: no existing tag's byte layout changes, so
 /// every v1/v2/v3 log stays fully readable *and* hash-reproducing under v4.
-/// The version is still bumped rather than silently widening `VERSION`'s own
-/// meaning, so an *old* reader handed a *new* log (one that actually uses a
-/// tag past what it knows) fails fast with a clean `BadVersion` at the
-/// header instead of a confusing mid-stream `BadTag`.
-pub const VERSION: u32 = 4;
+///
+/// v5 (the OSRS-style tile-grid rewrite) changes what tag 0 and tag 1's
+/// *existing* payload bytes mean — the first version bump that is a genuine
+/// semantic break, not just an added tag. `SetHeading{dir: V2}` (a
+/// continuous steering direction) becomes `SetTarget{to: Option<Tile>}` (an
+/// absolute tile-grid movement goal); tag 1's trailing two `i32`s stop being
+/// raw `Fx` bits and become plain tile integers. Both stay *readable* under
+/// v5 — a v1-v4 log decodes tag 1's old raw-`Fx` position by flooring it into
+/// a tile (`raw >> Fx::SHIFT`, matching `Fx::floor_int`'s own arithmetic),
+/// and tag 0's old direction decodes to `SetTarget { to: None }` (resume
+/// default wander) rather than attempting to reconstruct an absolute tile
+/// target from a bare direction with no entity position in scope at decode
+/// time — but neither is **hash-reproducing**: the simulation itself
+/// changed (continuous physics → discrete tile-stepping), the same honest
+/// admission v1's own note above already makes for its `Kind` gap.
+pub const VERSION: u32 = 5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmdKind {
-    /// Steer. The vector is normalised on application, not on submission.
-    SetHeading { dir: V2 },
-    Spawn { element: Element, kind: Kind, at: V2 },
+    /// Commit to a tile-grid movement goal (`Some`), or clear it and resume
+    /// default wander (`None`). Phase-1 minimal interpretation: Graze's
+    /// fallback steps toward the goal instead of a random neighbour; real
+    /// multi-tile pathfinding lands later without changing this wire shape.
+    SetTarget { to: Option<Tile> },
+    Spawn { element: Element, kind: Kind, at: Tile },
     Kill,
     /// Invariant VIII / items: an `Animal` (never a `Plant` — rooted bodies
     /// don't mine) draws up to this race's `Mine` `ActionRecipe`'s rate-law
@@ -80,7 +94,7 @@ impl CmdKind {
     #[inline]
     fn tag(&self) -> u8 {
         match self {
-            CmdKind::SetHeading { .. } => 0,
+            CmdKind::SetTarget { .. } => 0,
             CmdKind::Spawn { .. } => 1,
             CmdKind::Kill => 2,
             CmdKind::Mine { .. } => 3,
@@ -172,15 +186,19 @@ impl InputLog {
             out.extend_from_slice(&c.entity.to_le_bytes());
             out.push(c.kind.tag());
             match c.kind {
-                CmdKind::SetHeading { dir } => {
-                    out.extend_from_slice(&dir.x.raw().to_le_bytes());
-                    out.extend_from_slice(&dir.y.raw().to_le_bytes());
-                }
+                CmdKind::SetTarget { to } => match to {
+                    None => out.push(0),
+                    Some(t) => {
+                        out.push(1);
+                        out.extend_from_slice(&t.x.to_le_bytes());
+                        out.extend_from_slice(&t.y.to_le_bytes());
+                    }
+                },
                 CmdKind::Spawn { element, kind, at } => {
                     out.push(element as u8);
                     out.push(kind as u8);
-                    out.extend_from_slice(&at.x.raw().to_le_bytes());
-                    out.extend_from_slice(&at.y.raw().to_le_bytes());
+                    out.extend_from_slice(&at.x.to_le_bytes());
+                    out.extend_from_slice(&at.y.to_le_bytes());
                 }
                 CmdKind::Kill => {}
                 CmdKind::Mine { element } => {
@@ -213,9 +231,11 @@ impl InputLog {
         // v1 predates the `Kind` byte on `Spawn` — still readable, decoded
         // as `Kind::Animal` below, but not hash-reproducing against an S3
         // world (see `VERSION`'s own doc comment). v2/v3/v4 all share an
-        // identical byte layout for every tag that existed in v2, so all
-        // three are fully readable *and* hash-reproducing.
-        if v != VERSION && v != 1 && v != 2 && v != 3 {
+        // identical byte layout for every tag that existed in v2. v5 changes
+        // what tag 0/1's existing bytes *mean* (see `VERSION`'s own doc
+        // comment) — every version below is still readable, none but v5
+        // itself is hash-reproducing under v5 code.
+        if v != VERSION && v != 1 && v != 2 && v != 3 && v != 4 {
             return Err(LogError::BadVersion(v));
         }
         let n = r.u64()? as usize;
@@ -224,9 +244,25 @@ impl InputLog {
             let tick = r.u64()?;
             let entity = r.u32()?;
             let cmd_kind = match r.u8()? {
-                0 => CmdKind::SetHeading {
-                    dir: V2::new(Fx::from_raw(r.i32()?), Fx::from_raw(r.i32()?)),
-                },
+                0 => {
+                    if v == VERSION {
+                        match r.u8()? {
+                            0 => CmdKind::SetTarget { to: None },
+                            1 => CmdKind::SetTarget { to: Some(Tile::new(r.i32()?, r.i32()?)) },
+                            f => return Err(LogError::BadTag(f)),
+                        }
+                    } else {
+                        // Pre-v5: a continuous steering direction, not an
+                        // absolute tile. There is no entity position in
+                        // scope at decode time to project it into a target
+                        // tile, so it decodes to "clear/resume default
+                        // wander" — readable, not hash-reproducing, per
+                        // `VERSION`'s own doc comment.
+                        r.i32()?;
+                        r.i32()?;
+                        CmdKind::SetTarget { to: None }
+                    }
+                }
                 1 => {
                     let element = r.element()?;
                     let kind = if v == 1 {
@@ -238,11 +274,15 @@ impl InputLog {
                             k => return Err(LogError::BadKind(k)),
                         }
                     };
-                    CmdKind::Spawn {
-                        element,
-                        kind,
-                        at: V2::new(Fx::from_raw(r.i32()?), Fx::from_raw(r.i32()?)),
-                    }
+                    let (rx, ry) = (r.i32()?, r.i32()?);
+                    let at = if v == VERSION {
+                        Tile::new(rx, ry)
+                    } else {
+                        // Pre-v5: raw `Fx` bits — floor into a tile the same
+                        // way `Fx::floor_int` does (`raw >> Fx::SHIFT`).
+                        Tile::new(rx >> crate::fx::SHIFT, ry >> crate::fx::SHIFT)
+                    };
+                    CmdKind::Spawn { element, kind, at }
                 }
                 2 => CmdKind::Kill,
                 3 => CmdKind::Mine { element: r.element()? },

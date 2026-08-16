@@ -187,13 +187,13 @@ fn map(out: &mut impl Write, w: &World, h: usize, cols: usize) {
     let mw = (h * 2).min(cols.saturating_sub(4));
     let mh = h * 2;
     let mut counts = vec![[0u16; Element::COUNT]; mw * mh];
-    let size = w.size.floor_int().max(1) as usize;
+    let size = w.size.max(1) as usize;
     for e in &w.entities {
         if !e.alive {
             continue;
         }
-        let x = ((e.pos.x.floor_int().max(0) as usize) * mw / size).min(mw - 1);
-        let y = ((e.pos.y.floor_int().max(0) as usize) * mh / size).min(mh - 1);
+        let x = ((e.pos.x.max(0) as usize) * mw / size).min(mw - 1);
+        let y = ((e.pos.y.max(0) as usize) * mh / size).min(mh - 1);
         counts[y * mw + x][e.element.index()] += 1;
     }
 
