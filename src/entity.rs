@@ -62,13 +62,27 @@ pub struct Entity {
     /// unspent, so contention never silently throttles a race's tuned speed.
     /// Hashed (Invariant VI): it is real state that affects a future tick.
     pub move_accum: Fx,
-    /// A committed movement goal, set by `CmdKind::SetTarget` and read by
-    /// `behavior::drive`'s Graze fallback (steps toward it instead of
-    /// wandering randomly). `None` means no goal — default wander. Phase-1
-    /// minimal semantics: a plain tile, no pathfinding around obstacles;
-    /// real click-to-walk pathing is layered on top of this same field
-    /// later without changing its shape.
+    /// A committed movement goal, set by `CmdKind::SetTarget`. Read two
+    /// ways, depending on who this body is: `behavior::player_decide_move`
+    /// (the entity named by `World.player_id`, if any) treats it as the
+    /// *entire* movement decision — no goal means standing still, not
+    /// wandering. `behavior::ai_decide_move`'s Graze fallback (every other
+    /// entity) treats it as a lower-priority wander target, still subject
+    /// to Flee/Hunt preemption. `None` means no committed goal. A plain
+    /// tile, no pathfinding around obstacles yet; real click-to-walk
+    /// pathing is layered on top of this same field later without changing
+    /// its shape.
     pub move_target: Option<Tile>,
+    /// A committed predation intent, set by `CmdKind::Attack` and read by
+    /// `World::phase_feeding`'s player-predator guard — see that function's
+    /// own doc comment. Only meaningful for the entity named by
+    /// `World.player_id`; an AI predator's decision is its own automatic
+    /// per-tick scan, unaffected by this field regardless of its value.
+    /// Commit-until-changed, the same semantics as `move_target`: not
+    /// cleared by a failed attempt, an out-of-reach or dead target, or a
+    /// successful kill — it stays inert (matching nothing) until the player
+    /// issues a new `Attack` or explicitly clears it with `target: None`.
+    pub attack_target: Option<u32>,
     pub age: u64,
     /// Rolled at birth from the race's base lifespan plus its variance, so a
     /// cohort born together does not die together.
@@ -140,6 +154,7 @@ impl Entity {
             facing: initial_facing(seed, tick, id),
             move_accum: Fx::ZERO,
             move_target: None,
+            attack_target: None,
             age: 0,
             lifespan: roll_lifespan(a, seed, tick, id),
             // Born at half strength, not full: `EcologyTuning::repro_threshold`
@@ -206,6 +221,15 @@ impl Hashable for Entity {
             Some(t) => {
                 h.bool(true);
                 t.hash_into(h);
+            }
+        }
+        match self.attack_target {
+            None => {
+                h.bool(false);
+            }
+            Some(id) => {
+                h.bool(true);
+                h.u32(id);
             }
         }
         h.u64(self.age)

@@ -33,14 +33,26 @@
 //!   discrete equivalent of the old continuous wander, using the same
 //!   `Channel::Wander` `entity::initial_facing` already draws from.
 //!
-//! `drive()` returns a concrete destination `Tile` to step toward, not a
-//! direction to blend — movement is discrete tile-hopping
+//! `ai_decide_move()` returns a concrete destination `Tile` to step toward,
+//! not a direction to blend — movement is discrete tile-hopping
 //! (`World::phase_movement`), so there is no continuous heading to steer.
 //!
-//! `drive`'s signature adds one parameter beyond the design doc's own
-//! illustrative sketch (§6): an `&EcologyTuning` is required to read
+//! `ai_decide_move`'s signature adds one parameter beyond the design doc's
+//! own illustrative sketch (§6): an `&EcologyTuning` is required to read
 //! `satiation`, the same gate `phase_feeding` already uses — the doc's
 //! pseudocode elided this as `{ ... }`, not as a real omission.
+//!
+//! **Player/AI symmetry.** This function is one half of a pair —
+//! `player_decide_move` (below) is the other. `World.player_id` names at
+//! most one entity whose movement this tick comes from the player's own
+//! `Entity.move_target` instead of this FSM; every other entity's movement
+//! decision is this function, unchanged. Both halves return the identical
+//! `Option<Tile>` shape `World::phase_movement`'s decide→resolve→apply
+//! pipeline consumes — the asymmetry is entirely in *who decides*, never in
+//! how the decision is resolved once made. See that function's own doc
+//! comment for why it does not fall back to a random wander the way Graze
+//! does: a player who has not committed a goal is standing still on
+//! purpose, not idling.
 //!
 //! See `docs/S3_ECOLOGY_LAYERS_DESIGN.md` §6 for the full design account.
 
@@ -67,11 +79,11 @@ pub enum Drive {
 const FLEE_THRESHOLD_DEFAULT: u16 = 8_000;
 const SENSE_RADIUS_DEFAULT: i32 = 8;
 
-/// The rate/reach knobs `behavior::drive` and `World::phase_movement` read.
-/// `PerRace`-shaped like `EcologyTuning::hunt_weight`, and for the same
+/// The rate/reach knobs `behavior::ai_decide_move` and `World::phase_movement`
+/// read. `PerRace`-shaped like `EcologyTuning::hunt_weight`, and for the same
 /// reason: Plant rows are unread (`World::phase_movement` never calls
-/// `drive` for a `Kind::Plant` body — it skips them structurally, S3.2) —
-/// their entries exist only so `PerRace` stays uniformly 10-wide, not
+/// `ai_decide_move` for a `Kind::Plant` body — it skips them structurally,
+/// S3.2) — their entries exist only so `PerRace` stays uniformly 10-wide, not
 /// because anything consults them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BehaviorTuning {
@@ -114,15 +126,17 @@ impl Hashable for BehaviorTuning {
 /// Pure — testable against a bare `&[Entity]` + `&Terrain` (+ a `SpatialIndex`
 /// built from that same pair) with no `World` involved, the same shape
 /// `ecology::apply_attrition` already uses. Caller (`World::phase_movement`)
-/// must only call this for an alive `Kind::Animal` entity at `i`; that
-/// contract is asserted, not silently assumed. `index` is a caller-owned
-/// broadphase, not built here, so `phase_movement` can build it once and
-/// share it across every Animal's Hunt scan this tick rather than paying an
-/// `O(n)` build per candidate — see `SpatialIndex`'s own doc comment for why
-/// it can't just be cached across ticks. `seed`/`tick` are needed only for
-/// Graze's random-wander roll.
+/// must only call this for an alive `Kind::Animal` entity at `i` that is
+/// *not* `World.player_id` — that contract is asserted, not silently
+/// assumed. `index` is a caller-owned broadphase, not built here, so
+/// `phase_movement` can build it once and share it across every Animal's
+/// Hunt scan this tick rather than paying an `O(n)` build per candidate —
+/// see `SpatialIndex`'s own doc comment for why it can't just be cached
+/// across ticks. `seed`/`tick` are needed only for Graze's random-wander
+/// roll. The "AI" half of the player/AI symmetry this module's own doc
+/// comment describes — see `player_decide_move` for the other half.
 #[allow(clippy::too_many_arguments)]
-pub fn drive(
+pub fn ai_decide_move(
     entities: &[Entity],
     terrain: &Terrain,
     index: &crate::terrain::SpatialIndex,
@@ -133,7 +147,7 @@ pub fn drive(
     i: usize,
 ) -> (Drive, Option<Tile>) {
     let e = &entities[i];
-    debug_assert!(e.alive && e.kind == Kind::Animal, "drive() called for a non-Animal or dead entity");
+    debug_assert!(e.alive && e.kind == Kind::Animal, "ai_decide_move() called for a non-Animal or dead entity");
     let race = e.race();
 
     // Flee — highest priority. Reuses apply_attrition's own danger signal.
@@ -216,4 +230,20 @@ pub fn drive(
         e.pos.offset(dx, dy)
     };
     (Drive::Graze, Some(target))
+}
+
+/// The "player" half of the player/AI symmetry this module's own doc
+/// comment describes. Derived purely from `Entity.move_target` — no danger
+/// sensing, no hunt sensing, no random wander. Unlike Graze's own
+/// `move_target` fallback (above), there is no "otherwise re-roll a random
+/// neighbour" case: a player with no committed goal is standing still
+/// because that *is* the player's decision, not because nothing else fired.
+/// `World::phase_movement` calls this instead of `ai_decide_move` for
+/// exactly the one entity named by `World.player_id`, if any — everyone
+/// else's movement is unconditionally `ai_decide_move`, unchanged.
+pub fn player_decide_move(e: &Entity) -> Option<Tile> {
+    match e.move_target {
+        Some(goal) if goal != e.pos => Some(step_toward(e.pos, goal)),
+        _ => None,
+    }
 }

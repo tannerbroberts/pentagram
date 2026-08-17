@@ -86,6 +86,19 @@ pub struct World {
     /// equal to `terrain.side`.
     pub size: i32,
 
+    /// Which entity, if any, is the player-controlled body. Not a special
+    /// `Kind`/struct — a normal entity spawned through the ordinary
+    /// `World::spawn` path, subject to every rule any AI body is (`Exist`,
+    /// aging, starvation, death). The *only* thing this pointer changes is
+    /// which of `phase_movement`/`phase_feeding`'s two decision functions
+    /// supplies this one entity's action each tick — see those phases' own
+    /// doc comments. A stale id (naming a dead/reaped entity) is harmless:
+    /// it simply never matches anything, the same silent-no-op discipline
+    /// every other id-addressed command in this crate already has. Covered
+    /// by [`World::state_hash`] — which entity is the player changes future
+    /// ticks' outcomes.
+    pub player_id: Option<u32>,
+
     /// The tuning table this world is running, seeded (action-populated) from
     /// [`crate::race::seeded_races`] and changeable at runtime through
     /// [`World::retune`]. It lives here rather than in a global so that the
@@ -176,6 +189,7 @@ impl World {
             entities: Vec::new(),
             next_id: 1,
             size: size_cells,
+            player_id: None,
             races: crate::race::seeded_races(),
             terrain,
             ground_decay_gov: Governor::new(terrain_tuning.ground_decay),
@@ -186,6 +200,15 @@ impl World {
             ground_items: Vec::new(),
             stats: Stats::default(),
         }
+    }
+
+    /// Name (or clear, with `None`) the player-controlled entity. No
+    /// validation that `id` names a live entity — see `player_id`'s own doc
+    /// comment. Spawning the body itself is an ordinary `World::spawn` call;
+    /// this is a separate step precisely because nothing about spawning is
+    /// player-specific, only this pointer is.
+    pub fn set_player(&mut self, id: Option<u32>) {
+        self.player_id = id;
     }
 
     /// Swap the tuning table on a running world. A straight field
@@ -307,6 +330,11 @@ impl World {
             CmdKind::SetTarget { to } => {
                 if let Some(i) = self.find(c.entity) {
                     self.entities[i].move_target = to;
+                }
+            }
+            CmdKind::Attack { target } => {
+                if let Some(i) = self.find(c.entity) {
+                    self.entities[i].attack_target = target;
                 }
             }
             CmdKind::Kill => {
@@ -696,6 +724,7 @@ impl World {
         let races = &self.races;
         let ecology = self.ecology;
         let behavior = self.behavior;
+        let player_id = self.player_id;
         let mut acted: PerRace<u64> = PerRace::filled(0);
         let (mut grazed, mut hunted, mut fled) = (0u64, 0u64, 0u64);
 
@@ -725,9 +754,27 @@ impl World {
             }
             eligible[i] = true;
 
-            let (d, target) =
-                crate::behavior::drive(&self.entities, &self.terrain, &index, &ecology, &behavior, seed, tick, i);
-            drive_of[i] = Some(d);
+            // Player/AI symmetry (`behavior.rs`'s own doc comment): the one
+            // entity named by `player_id`, if any, decides its own movement
+            // via `player_decide_move` — no Flee/Hunt/Graze FSM involvement,
+            // so game state can never preempt what the player chose. Every
+            // other entity is unconditionally `ai_decide_move`, unchanged.
+            let (d, target) = if player_id == Some(self.entities[i].id) {
+                (None, crate::behavior::player_decide_move(&self.entities[i]))
+            } else {
+                let (d, t) = crate::behavior::ai_decide_move(
+                    &self.entities,
+                    &self.terrain,
+                    &index,
+                    &ecology,
+                    &behavior,
+                    seed,
+                    tick,
+                    i,
+                );
+                (Some(d), t)
+            };
+            drive_of[i] = d;
             if let Some(t) = target {
                 let t = t.clamp(self.size);
                 if t != self.entities[i].pos {
@@ -824,6 +871,13 @@ impl World {
     /// predation ring is a hard balance problem, and nothing here promises
     /// the shipped numbers converge to a stable population on their own.
     ///
+    /// Player/AI symmetry (see `phase_movement`'s own doc comment for the
+    /// movement half): `World.player_id`'s entity, if any, only ever tries
+    /// the one pair matching its own committed `Entity.attack_target`
+    /// (`CmdKind::Attack`) instead of every qualifying pair in reach — a
+    /// single guard clause inside the scan below, everything else identical
+    /// for both.
+    ///
     /// Pairwise, broadphase-accelerated the same way `phase_movement`'s
     /// occupancy check is. At most one
     /// direction of any pair can be a predation match: for a same-element
@@ -838,6 +892,7 @@ impl World {
     fn phase_feeding(&mut self) {
         let n = self.entities.len();
         let ecology = self.ecology;
+        let player_id = self.player_id;
 
         // Two scratch passes, the same decide-then-apply shape
         // `phase_movement`'s own `desired`/`winner` buffers use: decide
@@ -914,6 +969,21 @@ impl World {
                 // in this exact scan could still hunt and "eat" something
                 // else before the eaten-pass below ever reaps it.
                 if eaten[pred] || eaten[prey] || fed[pred] {
+                    continue;
+                }
+                // Player/AI symmetry: an AI predator tries every qualifying
+                // pair in reach automatically, unchanged. The one entity
+                // named `player_id`, if it's `pred` here, only ever tries
+                // the single pair matching its own explicitly committed
+                // `attack_target` (`CmdKind::Attack`) — everything below
+                // this guard (reach, the grazing/hunting gate, eaten/fed/ate
+                // bookkeeping, `resolve_material`'s chain walk) is the exact
+                // same code either way. The player stays fully vulnerable as
+                // prey: this only ever narrows candidates where the player
+                // is `pred`, never where it's `prey`.
+                if player_id == Some(self.entities[pred].id)
+                    && self.entities[pred].attack_target != Some(self.entities[prey].id)
+                {
                     continue;
                 }
                 let pred_el = self.entities[pred].element;
@@ -1219,8 +1289,17 @@ impl World {
         h.u64(self.seed)
             .u64(self.tick)
             .u32(self.next_id)
-            .i32(self.size)
-            .u32(self.entities.len() as u32);
+            .i32(self.size);
+        match self.player_id {
+            None => {
+                h.bool(false);
+            }
+            Some(id) => {
+                h.bool(true);
+                h.u32(id);
+            }
+        }
+        h.u32(self.entities.len() as u32);
 
         for e in &self.entities {
             e.hash_into(&mut h);

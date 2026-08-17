@@ -48,7 +48,13 @@ pub const MAGIC: u32 = 0x5047_494C; // "PGIL"
 /// time — but neither is **hash-reproducing**: the simulation itself
 /// changed (continuous physics → discrete tile-stepping), the same honest
 /// admission v1's own note above already makes for its `Kind` gap.
-pub const VERSION: u32 = 5;
+///
+/// v6 (the unified AI/player decision architecture) adds one more variant,
+/// `Attack` (tag 8) — the player's committed predation intent, read by
+/// `World::phase_feeding`'s player-predator guard. Same story as v3/v4: no
+/// existing tag's byte layout changes, so every v1-v5 log stays fully
+/// readable *and* hash-reproducing under v6 code too.
+pub const VERSION: u32 = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmdKind {
@@ -88,6 +94,12 @@ pub enum CmdKind {
     /// current position, into its own `Entity.carried`. See
     /// `World::apply_action_recipe`.
     Pickup { element: Element },
+    /// Commit to a predation intent (`Some(id)`), or clear it (`None`) —
+    /// the player half of `World::phase_feeding`'s player/AI symmetry. Only
+    /// meaningful for the entity named `World.player_id`; harmless no-op
+    /// state on any other entity. See `Entity.attack_target`'s own doc
+    /// comment for exactly how it's read and cleared.
+    Attack { target: Option<u32> },
 }
 
 impl CmdKind {
@@ -102,6 +114,7 @@ impl CmdKind {
             CmdKind::MakeItem { .. } => 5,
             CmdKind::BreakItem { .. } => 6,
             CmdKind::Pickup { .. } => 7,
+            CmdKind::Attack { .. } => 8,
         }
     }
 }
@@ -217,6 +230,13 @@ impl InputLog {
                 CmdKind::Pickup { element } => {
                     out.push(element as u8);
                 }
+                CmdKind::Attack { target } => match target {
+                    None => out.push(0),
+                    Some(id) => {
+                        out.push(1);
+                        out.extend_from_slice(&id.to_le_bytes());
+                    }
+                },
             }
         }
         out
@@ -233,9 +253,10 @@ impl InputLog {
         // world (see `VERSION`'s own doc comment). v2/v3/v4 all share an
         // identical byte layout for every tag that existed in v2. v5 changes
         // what tag 0/1's existing bytes *mean* (see `VERSION`'s own doc
-        // comment) — every version below is still readable, none but v5
-        // itself is hash-reproducing under v5 code.
-        if v != VERSION && v != 1 && v != 2 && v != 3 && v != 4 {
+        // comment) — every version below is still readable, none but v5/v6
+        // is hash-reproducing under current code (v6 adds no new-meaning
+        // bytes to any existing tag, so it inherits v5's exact readability).
+        if v != VERSION && v != 1 && v != 2 && v != 3 && v != 4 && v != 5 {
             return Err(LogError::BadVersion(v));
         }
         let n = r.u64()? as usize;
@@ -245,7 +266,12 @@ impl InputLog {
             let entity = r.u32()?;
             let cmd_kind = match r.u8()? {
                 0 => {
-                    if v == VERSION {
+                    // `>= 5`, not `== VERSION`: this tag's format changed
+                    // exactly once, at v5, and stays the same shape in
+                    // every version since — tying this to whatever
+                    // `VERSION` currently is would silently misdecode v5
+                    // logs the moment `VERSION` moves past 5 again.
+                    if v >= 5 {
                         match r.u8()? {
                             0 => CmdKind::SetTarget { to: None },
                             1 => CmdKind::SetTarget { to: Some(Tile::new(r.i32()?, r.i32()?)) },
@@ -275,7 +301,8 @@ impl InputLog {
                         }
                     };
                     let (rx, ry) = (r.i32()?, r.i32()?);
-                    let at = if v == VERSION {
+                    // Same `>= 5`, not `== VERSION`, reasoning as tag 0 above.
+                    let at = if v >= 5 {
                         Tile::new(rx, ry)
                     } else {
                         // Pre-v5: raw `Fx` bits — floor into a tile the same
@@ -290,6 +317,11 @@ impl InputLog {
                 5 => CmdKind::MakeItem { element: r.element()?, quantity: r.u64()? },
                 6 => CmdKind::BreakItem { index: r.u32()? },
                 7 => CmdKind::Pickup { element: r.element()? },
+                8 => match r.u8()? {
+                    0 => CmdKind::Attack { target: None },
+                    1 => CmdKind::Attack { target: Some(r.u32()?) },
+                    f => return Err(LogError::BadTag(f)),
+                },
                 t => return Err(LogError::BadTag(t)),
             };
             cmds.push(Command { tick, entity, kind: cmd_kind });
